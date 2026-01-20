@@ -1,0 +1,21 @@
+[package]
+name = "voxelicous-nvidia"
+description = "Nvidia RTX optimizations for the Voxelicous engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = []
+nvidia = ["voxelicous-shaders/ray_tracing"]
+
+[dependencies]
+voxelicous-core.workspace = true
+voxelicous-gpu.workspace = true
+voxelicous-render.workspace = true
+voxelicous-shaders.workspace = true
+ash.workspace = true
+bytemuck.workspace = true
+gpu-allocator.workspace = true
+tracing.workspace = true

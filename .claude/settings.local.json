@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "Bash(cargo check:*)",
+      "Bash(cargo test:*)",
+      "Bash(done)",
+      "Bash(cargo build:*)",
+      "Bash(where:*)",
+      "Bash(cargo clippy:*)",
+      "Bash(find:*)",
+      "Bash(dir /s \"C:\\\\github\\\\voxelicous-engine-rs\\\\crates\\\\voxelicous-world\\\\src\")",
+      "Bash(dir /s \"C:\\\\github\\\\voxelicous-engine-rs\\\\crates\\\\voxelicous-voxel\\\\src\")",
+      "Bash(dir /s \"C:\\\\github\\\\voxelicous-engine-rs\\\\crates\\\\voxelicous-render\\\\src\")",
+      "Bash(cargo run:*)",
+      "Bash(set RUST_BACKTRACE=1)",
+      "Bash(cmd /c \"set RUST_BACKTRACE=1 && cargo run -p voxelicous-viewer 2>&1\")",
+      "Bash($env:RUST_BACKTRACE=1)",
+      "Bash(cargo fmt:*)",
+      "Bash(set VOXELICOUS_FORCE_COMPUTE=1:*)",
+      "Bash(cmd /c \"set VOXELICOUS_FORCE_COMPUTE=1 && cargo run -p voxelicous-viewer --features nvidia -- -S -f 0 -o compute_frame_{}.png --exit-after\")"
+    ]
+  }
+}

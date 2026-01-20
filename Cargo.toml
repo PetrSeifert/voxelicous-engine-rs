@@ -1,0 +1,117 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/voxelicous-core",
+    "crates/voxelicous-voxel",
+    "crates/voxelicous-gpu",
+    "crates/voxelicous-render",
+    "crates/voxelicous-nvidia",
+    "crates/voxelicous-platform",
+    "crates/voxelicous-world",
+    "crates/voxelicous-physics",
+    "crates/voxelicous-audio",
+    "crates/voxelicous-entity",
+    "crates/voxelicous-shaders",
+    "crates/voxelicous-app",
+    "crates/voxelicous-test",
+    "apps/voxelicous-editor",
+    "apps/voxelicous-viewer",
+    "apps/voxelicous-benchmark",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/voxelicous/voxelicous-engine-rs"
+
+[workspace.dependencies]
+# Vulkan
+ash = "0.38"
+ash-window = "0.13"
+gpu-allocator = "0.27"
+
+# Windowing
+winit = "0.30"
+raw-window-handle = "0.6"
+
+# Math
+glam = { version = "0.29", features = ["bytemuck"] }
+bytemuck = { version = "1.18", features = ["derive"] }
+
+# Utilities
+anyhow = "1.0"
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+parking_lot = "0.12"
+rayon = "1.10"
+crossbeam = "0.8"
+hashbrown = "0.15"
+bitflags = "2.6"
+
+# ECS
+hecs = "0.10"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+bincode = "1.3"
+
+# Noise generation
+noise = "0.9"
+simdnoise = "3.1"
+
+# Physics
+rapier3d = "0.22"
+
+# Audio
+kira = "0.9"
+
+# Scripting
+mlua = { version = "0.10", features = ["lua54", "vendored"] }
+
+# Testing
+insta = { version = "1.40", features = ["yaml"] }
+image = "0.25"
+approx = "0.5"
+criterion = "0.5"
+
+# Internal crates
+voxelicous-core = { path = "crates/voxelicous-core" }
+voxelicous-voxel = { path = "crates/voxelicous-voxel" }
+voxelicous-gpu = { path = "crates/voxelicous-gpu" }
+voxelicous-render = { path = "crates/voxelicous-render" }
+voxelicous-nvidia = { path = "crates/voxelicous-nvidia" }
+voxelicous-platform = { path = "crates/voxelicous-platform" }
+voxelicous-world = { path = "crates/voxelicous-world" }
+voxelicous-physics = { path = "crates/voxelicous-physics" }
+voxelicous-audio = { path = "crates/voxelicous-audio" }
+voxelicous-entity = { path = "crates/voxelicous-entity" }
+voxelicous-shaders = { path = "crates/voxelicous-shaders" }
+voxelicous-app = { path = "crates/voxelicous-app" }
+voxelicous-test = { path = "crates/voxelicous-test" }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+# Allow some pedantic lints that are too noisy
+module_name_repetitions = "allow"
+too_many_lines = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+
+[profile.dev]
+opt-level = 1  # Enable some optimization for playable framerates
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[profile.bench]
+inherits = "release"
+debug = true

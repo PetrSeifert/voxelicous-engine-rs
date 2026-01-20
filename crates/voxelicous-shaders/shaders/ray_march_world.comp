@@ -1,0 +1,339 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_ARB_gpu_shader_int64 : require
+
+// GpuOctreeNode matches Rust struct (48 bytes)
+struct GpuOctreeNode {
+    uint children[8];
+    uint flags;
+    uint _padding[3];
+};
+
+// Buffer reference for SVO-DAG nodes
+layout(buffer_reference, scalar, buffer_reference_align = 4) readonly buffer NodeBuffer {
+    GpuOctreeNode nodes[];
+};
+
+// GpuChunkInfo matches Rust struct (32 bytes)
+struct GpuChunkInfo {
+    uint64_t node_buffer_address;  // 8 bytes
+    uint root_index;               // 4 bytes
+    uint octree_depth;             // 4 bytes
+    float world_offset_x;          // 4 bytes
+    float world_offset_y;          // 4 bytes
+    float world_offset_z;          // 4 bytes
+    float _padding;                // 4 bytes
+};
+
+// Buffer reference for chunk info array
+layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer ChunkInfoBuffer {
+    GpuChunkInfo chunks[];
+};
+
+// Push constants (24 bytes) - matches WorldRenderPushConstants
+layout(push_constant) uniform PushConstants {
+    uvec2 screen_size;             // 8 bytes
+    uint max_steps;                // 4 bytes
+    uint chunk_count;              // 4 bytes
+    uint64_t chunk_info_address;   // 8 bytes
+} pc;
+
+// Camera uniforms (must match CameraUniforms in Rust)
+layout(set = 0, binding = 0) uniform CameraData {
+    mat4 view;
+    mat4 projection;
+    mat4 inverse_view;
+    mat4 inverse_projection;
+    vec4 position;
+    vec4 direction;
+} camera;
+
+// Output image
+layout(set = 0, binding = 1, rgba8) writeonly uniform image2D output_image;
+
+// Workgroup size: 8x8 threads
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+uint get_valid_mask(GpuOctreeNode node) {
+    return node.flags & 0xFFu;
+}
+
+uint get_leaf_mask(GpuOctreeNode node) {
+    return (node.flags >> 8) & 0xFFu;
+}
+
+bool has_child(GpuOctreeNode node, uint index) {
+    return (get_valid_mask(node) & (1u << index)) != 0u;
+}
+
+bool is_leaf(GpuOctreeNode node, uint index) {
+    return (get_leaf_mask(node) & (1u << index)) != 0u;
+}
+
+uint get_child_index(vec3 rel_pos, float half_size) {
+    uint xi = rel_pos.x >= half_size ? 1u : 0u;
+    uint yi = rel_pos.y >= half_size ? 1u : 0u;
+    uint zi = rel_pos.z >= half_size ? 1u : 0u;
+    return xi | (yi << 1) | (zi << 2);
+}
+
+vec3 get_child_offset(uint child_index, float half_size) {
+    return vec3(
+        (child_index & 1u) != 0u ? half_size : 0.0,
+        (child_index & 2u) != 0u ? half_size : 0.0,
+        (child_index & 4u) != 0u ? half_size : 0.0
+    );
+}
+
+bool ray_aabb_intersect(vec3 ray_origin, vec3 ray_dir_inv,
+                        vec3 box_min, vec3 box_max,
+                        out float t_near, out float t_far) {
+    vec3 t1 = (box_min - ray_origin) * ray_dir_inv;
+    vec3 t2 = (box_max - ray_origin) * ray_dir_inv;
+
+    vec3 t_min_v = min(t1, t2);
+    vec3 t_max_v = max(t1, t2);
+
+    t_near = max(max(t_min_v.x, t_min_v.y), t_min_v.z);
+    t_far = min(min(t_max_v.x, t_max_v.y), t_max_v.z);
+
+    return t_near <= t_far && t_far >= 0.0;
+}
+
+vec3 calculate_normal(vec3 hit_point, vec3 box_min, vec3 box_max) {
+    vec3 center = (box_min + box_max) * 0.5;
+    vec3 half_size = (box_max - box_min) * 0.5;
+    vec3 rel = hit_point - center;
+    vec3 abs_rel = abs(rel) / half_size;
+
+    if (abs_rel.x > abs_rel.y && abs_rel.x > abs_rel.z) {
+        return vec3(sign(rel.x), 0.0, 0.0);
+    } else if (abs_rel.y > abs_rel.z) {
+        return vec3(0.0, sign(rel.y), 0.0);
+    } else {
+        return vec3(0.0, 0.0, sign(rel.z));
+    }
+}
+
+// ============================================================================
+// Ray Tracing
+// ============================================================================
+
+struct RayHit {
+    bool hit;
+    uint block_id;
+    vec3 position;
+    vec3 normal;
+    float t;
+};
+
+struct StackEntry {
+    uint node_index;
+    vec3 box_min;
+    float size;
+};
+
+// Trace ray through a single chunk (in chunk-local coordinates)
+RayHit trace_ray_chunk(vec3 ray_origin, vec3 ray_dir, GpuChunkInfo chunk_info, float max_t) {
+    RayHit result;
+    result.hit = false;
+    result.block_id = 0u;
+    result.t = max_t;
+    result.position = vec3(0.0);
+    result.normal = vec3(0.0);
+
+    // Early exit if empty octree
+    if (chunk_info.root_index == 0u) {
+        return result;
+    }
+
+    NodeBuffer nodes = NodeBuffer(chunk_info.node_buffer_address);
+
+    float octree_size = float(1u << chunk_info.octree_depth);
+    vec3 ray_dir_inv = 1.0 / ray_dir;
+
+    // Check if ray intersects octree bounds
+    float t_entry, t_exit;
+    if (!ray_aabb_intersect(ray_origin, ray_dir_inv,
+                            vec3(0.0), vec3(octree_size),
+                            t_entry, t_exit)) {
+        return result;
+    }
+
+    // Skip if chunk is entirely behind current best hit
+    if (t_entry > max_t) {
+        return result;
+    }
+
+    // Stack-based DFS traversal
+    StackEntry stack[32];
+    int stack_ptr = 0;
+
+    stack[stack_ptr].node_index = chunk_info.root_index;
+    stack[stack_ptr].box_min = vec3(0.0);
+    stack[stack_ptr].size = octree_size;
+    stack_ptr++;
+
+    uint steps = 0u;
+
+    while (stack_ptr > 0 && steps < pc.max_steps) {
+        steps++;
+
+        stack_ptr--;
+        StackEntry entry = stack[stack_ptr];
+
+        GpuOctreeNode node = nodes.nodes[entry.node_index];
+        float half_size = entry.size * 0.5;
+
+        for (uint i = 0u; i < 8u; i++) {
+            if (!has_child(node, i)) {
+                continue;
+            }
+
+            vec3 child_min = entry.box_min + get_child_offset(i, half_size);
+            vec3 child_max = child_min + vec3(half_size);
+
+            float child_t_near, child_t_far;
+            if (!ray_aabb_intersect(ray_origin, ray_dir_inv,
+                                    child_min, child_max,
+                                    child_t_near, child_t_far)) {
+                continue;
+            }
+
+            if (child_t_near > result.t) {
+                continue;
+            }
+
+            if (is_leaf(node, i)) {
+                uint block_id = node.children[i];
+                if (block_id != 0u) {
+                    float hit_t = max(child_t_near, 0.001);
+                    if (hit_t < result.t) {
+                        result.hit = true;
+                        result.block_id = block_id;
+                        result.t = hit_t;
+                        result.position = ray_origin + ray_dir * hit_t;
+                        result.normal = calculate_normal(result.position, child_min, child_max);
+                    }
+                }
+            } else {
+                if (stack_ptr < 32) {
+                    stack[stack_ptr].node_index = node.children[i];
+                    stack[stack_ptr].box_min = child_min;
+                    stack[stack_ptr].size = half_size;
+                    stack_ptr++;
+                }
+            }
+        }
+    }
+
+    return result;
+}
+
+// Trace ray through all chunks in world space
+RayHit trace_ray_world(vec3 ray_origin, vec3 ray_dir) {
+    RayHit closest;
+    closest.hit = false;
+    closest.block_id = 0u;
+    closest.t = 1e30;
+    closest.position = vec3(0.0);
+    closest.normal = vec3(0.0);
+
+    if (pc.chunk_count == 0u) {
+        return closest;
+    }
+
+    ChunkInfoBuffer chunk_buffer = ChunkInfoBuffer(pc.chunk_info_address);
+
+    for (uint i = 0u; i < pc.chunk_count; i++) {
+        GpuChunkInfo chunk_info = chunk_buffer.chunks[i];
+
+        // Transform ray to chunk-local space
+        vec3 chunk_offset = vec3(chunk_info.world_offset_x,
+                                  chunk_info.world_offset_y,
+                                  chunk_info.world_offset_z);
+        vec3 local_origin = ray_origin - chunk_offset;
+
+        // Trace in this chunk (pass current closest.t as max distance)
+        RayHit hit = trace_ray_chunk(local_origin, ray_dir, chunk_info, closest.t);
+
+        if (hit.hit && hit.t < closest.t) {
+            closest = hit;
+            // Transform hit position back to world space
+            closest.position = hit.position + chunk_offset;
+        }
+    }
+
+    return closest;
+}
+
+// ============================================================================
+// Shading
+// ============================================================================
+
+vec3 get_block_color(uint block_id) {
+    switch (block_id) {
+        case 1u: return vec3(0.5, 0.5, 0.5);         // Stone - gray
+        case 2u: return vec3(0.54, 0.35, 0.17);      // Dirt - brown
+        case 3u: return vec3(0.34, 0.49, 0.27);      // Grass - green
+        default: return vec3(0.8, 0.2, 0.8);         // Unknown - magenta
+    }
+}
+
+vec3 shade(RayHit hit, vec3 ray_dir) {
+    if (!hit.hit) {
+        // Sky gradient
+        float t = 0.5 * (ray_dir.y + 1.0);
+        return mix(vec3(0.8, 0.85, 0.9), vec3(0.4, 0.6, 0.9), t);
+    }
+
+    vec3 base_color = get_block_color(hit.block_id);
+
+    // Simple directional light (sun)
+    vec3 light_dir = normalize(vec3(0.5, 1.0, 0.3));
+    float ndotl = max(dot(hit.normal, light_dir), 0.0);
+
+    // Ambient + diffuse
+    float ambient = 0.3;
+    float diffuse = 0.7 * ndotl;
+
+    return base_color * (ambient + diffuse);
+}
+
+// ============================================================================
+// Main
+// ============================================================================
+
+void main() {
+    uvec2 pixel = gl_GlobalInvocationID.xy;
+
+    if (pixel.x >= pc.screen_size.x || pixel.y >= pc.screen_size.y) {
+        return;
+    }
+
+    vec2 uv = (vec2(pixel) + 0.5) / vec2(pc.screen_size);
+    vec2 ndc = uv * 2.0 - 1.0;
+
+    // Generate ray from camera (Vulkan Y-down)
+    vec4 clip = vec4(ndc.x, -ndc.y, 1.0, 1.0);
+    vec4 view_pos = camera.inverse_projection * clip;
+    view_pos = vec4(view_pos.xyz / view_pos.w, 0.0);
+
+    vec3 ray_origin = camera.position.xyz;
+    vec3 ray_dir = normalize((camera.inverse_view * view_pos).xyz);
+
+    // Trace ray through all world chunks
+    RayHit hit = trace_ray_world(ray_origin, ray_dir);
+
+    // Apply shading
+    vec3 color = shade(hit, ray_dir);
+
+    // Write output
+    imageStore(output_image, ivec2(pixel), vec4(color, 1.0));
+}

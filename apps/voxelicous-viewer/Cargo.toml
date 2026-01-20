@@ -1,0 +1,23 @@
+[package]
+name = "voxelicous-viewer"
+description = "Demo viewer for the Voxelicous engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = []
+nvidia = ["voxelicous-app/nvidia"]
+
+[dependencies]
+voxelicous-app.workspace = true
+voxelicous-core.workspace = true
+voxelicous-gpu.workspace = true
+voxelicous-voxel.workspace = true
+voxelicous-render.workspace = true
+voxelicous-world.workspace = true
+ash.workspace = true
+glam.workspace = true
+tracing.workspace = true
+anyhow.workspace = true

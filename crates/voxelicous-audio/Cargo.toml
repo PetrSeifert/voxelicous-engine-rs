@@ -1,0 +1,12 @@
+[package]
+name = "voxelicous-audio"
+description = "Spatial audio for the Voxelicous engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+voxelicous-core.workspace = true
+glam.workspace = true
+kira.workspace = true

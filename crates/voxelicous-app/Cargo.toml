@@ -1,0 +1,26 @@
+[package]
+name = "voxelicous-app"
+description = "Application framework for the Voxelicous engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = []
+nvidia = ["dep:voxelicous-nvidia", "voxelicous-nvidia/nvidia"]
+
+[dependencies]
+voxelicous-core.workspace = true
+voxelicous-gpu.workspace = true
+voxelicous-render.workspace = true
+voxelicous-nvidia = { workspace = true, optional = true }
+winit.workspace = true
+ash.workspace = true
+glam.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,23 @@
+[package]
+name = "voxelicous-shaders"
+description = "Shader compilation for the Voxelicous engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = []
+ray_tracing = []
+
+[dependencies]
+voxelicous-core.workspace = true
+
+[build-dependencies]
+shaderc = "0.8"
+bytemuck = "1.14"
+
+# Note: shaderc requires the Vulkan SDK to be installed (for pre-built libraries)
+# or cmake + ninja to build from source.
+# On Windows: Install Vulkan SDK from https://vulkan.lunarg.com/sdk/home
+# Set SHADERC_LIB_DIR to point to the Vulkan SDK lib directory.

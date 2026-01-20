@@ -1,0 +1,382 @@
+//! Application runner and event loop.
+
+use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
+
+use ash::vk;
+use tracing::{error, info};
+use tracing_subscriber::EnvFilter;
+use voxelicous_gpu::GpuContextBuilder;
+use winit::application::ApplicationHandler;
+use winit::dpi::PhysicalSize;
+use winit::event::WindowEvent;
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::window::{Window, WindowId};
+
+use crate::app::VoxelApp;
+use crate::context::AppContext;
+use crate::frame::FrameContext;
+
+/// Application configuration.
+#[derive(Clone)]
+pub struct AppConfig {
+    /// Window title.
+    pub title: String,
+    /// Initial window width.
+    pub width: u32,
+    /// Initial window height.
+    pub height: u32,
+    /// Target frames per second (None for unlimited).
+    pub target_fps: Option<u32>,
+    /// Enable vsync.
+    pub vsync: bool,
+    /// Enable Vulkan validation layers (default: debug builds only).
+    pub validation: bool,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            title: "Voxelicous Engine".to_string(),
+            width: 1280,
+            height: 720,
+            target_fps: None,
+            vsync: false,
+            validation: cfg!(debug_assertions),
+        }
+    }
+}
+
+impl AppConfig {
+    /// Create a new config with the given title.
+    pub fn new(title: impl Into<String>) -> Self {
+        Self {
+            title: title.into(),
+            ..Default::default()
+        }
+    }
+
+    /// Set the window dimensions.
+    pub fn with_size(mut self, width: u32, height: u32) -> Self {
+        self.width = width;
+        self.height = height;
+        self
+    }
+
+    /// Set the target FPS.
+    pub fn with_target_fps(mut self, fps: u32) -> Self {
+        self.target_fps = Some(fps);
+        self
+    }
+
+    /// Enable or disable vsync.
+    pub fn with_vsync(mut self, vsync: bool) -> Self {
+        self.vsync = vsync;
+        self
+    }
+
+    /// Enable or disable validation layers.
+    pub fn with_validation(mut self, validation: bool) -> Self {
+        self.validation = validation;
+        self
+    }
+}
+
+/// Run a VoxelApp with the given configuration.
+///
+/// This function initializes logging, creates the window and GPU context,
+/// and runs the event loop until the application exits.
+pub fn run_app<A: VoxelApp + 'static>(config: AppConfig) -> anyhow::Result<()> {
+    // Initialize logging
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
+
+    info!("{} starting...", config.title);
+
+    let event_loop = EventLoop::new().expect("Failed to create event loop");
+    event_loop.set_control_flow(ControlFlow::Poll);
+
+    let mut runner = AppRunner::<A> {
+        config,
+        state: None,
+    };
+
+    if let Err(e) = event_loop.run_app(&mut runner) {
+        error!("Event loop error: {e}");
+    }
+
+    Ok(())
+}
+
+/// Internal application runner that implements winit's ApplicationHandler.
+struct AppRunner<A: VoxelApp> {
+    config: AppConfig,
+    state: Option<AppState<A>>,
+}
+
+/// Internal application state.
+struct AppState<A: VoxelApp> {
+    ctx: AppContext,
+    app: A,
+    target_frame_time: Option<Duration>,
+    // FPS tracking
+    min_fps: f64,
+    max_fps: f64,
+    fps_sum: f64,
+}
+
+impl<A: VoxelApp + 'static> ApplicationHandler for AppRunner<A> {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.state.is_some() {
+            return;
+        }
+
+        info!("Creating application state...");
+
+        match self.create_state(event_loop) {
+            Ok(state) => {
+                self.state = Some(state);
+                info!("Application ready!");
+            }
+            Err(e) => {
+                error!("Failed to initialize application: {e}");
+                event_loop.exit();
+            }
+        }
+    }
+
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        // Let the app handle the event first
+        if let Some(state) = &mut self.state {
+            if state.app.on_event(&event) {
+                return;
+            }
+        }
+
+        match event {
+            WindowEvent::CloseRequested => {
+                info!("Close requested");
+                if let Some(mut state) = self.state.take() {
+                    state.cleanup();
+                }
+                event_loop.exit();
+            }
+            WindowEvent::RedrawRequested => {
+                if let Some(state) = &mut self.state {
+                    if let Err(e) = state.render_frame() {
+                        error!("Render error: {e}");
+                    }
+                    state.ctx.window.request_redraw();
+                }
+            }
+            WindowEvent::Resized(size) => {
+                if let Some(state) = &mut self.state {
+                    if let Err(e) = state.handle_resize(size.width, size.height) {
+                        error!("Resize error: {e}");
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        if let Some(state) = &self.state {
+            state.ctx.window.request_redraw();
+        }
+    }
+}
+
+impl<A: VoxelApp + 'static> AppRunner<A> {
+    fn create_state(&self, event_loop: &ActiveEventLoop) -> anyhow::Result<AppState<A>> {
+        // Create window
+        let window_attrs = Window::default_attributes()
+            .with_title(&self.config.title)
+            .with_inner_size(PhysicalSize::new(self.config.width, self.config.height));
+
+        let window = Arc::new(event_loop.create_window(window_attrs)?);
+
+        // Create GPU context
+        let gpu = GpuContextBuilder::new()
+            .app_name(&self.config.title)
+            .validation(self.config.validation)
+            .build()?;
+
+        info!("GPU: {}", gpu.capabilities().summary());
+
+        // Create app context
+        let mut ctx = unsafe { AppContext::new(window, gpu, self.config.vsync)? };
+
+        // Initialize the application
+        let app = A::init(&mut ctx)?;
+
+        let target_frame_time = self
+            .config
+            .target_fps
+            .map(|fps| Duration::from_nanos(1_000_000_000 / fps as u64));
+
+        Ok(AppState {
+            ctx,
+            app,
+            target_frame_time,
+            min_fps: f64::MAX,
+            max_fps: 0.0,
+            fps_sum: 0.0,
+        })
+    }
+}
+
+impl<A: VoxelApp> AppState<A> {
+    fn render_frame(&mut self) -> anyhow::Result<()> {
+        let frame_start = Instant::now();
+
+        // Calculate delta time
+        let now = Instant::now();
+        let dt = now.duration_since(self.ctx.last_frame_time).as_secs_f32();
+        self.ctx.last_frame_time = now;
+
+        // Update FPS tracking
+        if dt > 0.0 {
+            let fps = 1.0 / dt as f64;
+            self.min_fps = self.min_fps.min(fps);
+            self.max_fps = self.max_fps.max(fps);
+            self.fps_sum += fps;
+        }
+
+        // Update the application
+        self.app.update(&self.ctx, dt);
+
+        let device = self.ctx.gpu.device();
+        let frame_data = &self.ctx.frames[self.ctx.current_frame_index];
+
+        unsafe {
+            // Wait for this frame slot's fence
+            device.wait_for_fences(&[frame_data.in_flight_fence], true, u64::MAX)?;
+
+            // Acquire swapchain image
+            let (image_index, _suboptimal) = self.ctx.swapchain.acquire_next_image(
+                &self.ctx.surface.swapchain_loader,
+                frame_data.image_available,
+                u64::MAX,
+            )?;
+
+            // Reset fence after successful acquire
+            device.reset_fences(&[frame_data.in_flight_fence])?;
+
+            // Reset and begin command buffer
+            device.reset_command_buffer(
+                frame_data.command_buffer,
+                vk::CommandBufferResetFlags::empty(),
+            )?;
+
+            let begin_info = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            device.begin_command_buffer(frame_data.command_buffer, &begin_info)?;
+
+            // Create frame context
+            let mut frame_ctx = FrameContext::new(
+                frame_data.command_buffer,
+                image_index,
+                self.ctx.swapchain.images[image_index as usize],
+                dt,
+                self.ctx.frame_count,
+            );
+
+            // Render the frame
+            self.app.render(&self.ctx, &mut frame_ctx)?;
+
+            // End command buffer
+            device.end_command_buffer(frame_data.command_buffer)?;
+
+            // Get the render finished semaphore for this swapchain image
+            let render_finished = self.ctx.render_finished_semaphores[image_index as usize];
+
+            // Submit
+            let wait_semaphores = [frame_data.image_available];
+            let wait_stages = [vk::PipelineStageFlags::TRANSFER];
+            let signal_semaphores = [render_finished];
+            let command_buffers = [frame_data.command_buffer];
+
+            let submit_info = vk::SubmitInfo::default()
+                .wait_semaphores(&wait_semaphores)
+                .wait_dst_stage_mask(&wait_stages)
+                .command_buffers(&command_buffers)
+                .signal_semaphores(&signal_semaphores);
+
+            device.queue_submit(
+                self.ctx.gpu.graphics_queue(),
+                &[submit_info],
+                frame_data.in_flight_fence,
+            )?;
+
+            // Present
+            self.ctx.swapchain.present(
+                &self.ctx.surface.swapchain_loader,
+                self.ctx.gpu.graphics_queue(),
+                image_index,
+                &signal_semaphores,
+            )?;
+        }
+
+        self.ctx.current_frame_index = (self.ctx.current_frame_index + 1) % self.ctx.frames.len();
+        self.ctx.frame_count += 1;
+
+        // Frame pacing
+        if let Some(target) = self.target_frame_time {
+            let elapsed = frame_start.elapsed();
+            if elapsed < target {
+                thread::sleep(target - elapsed);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn handle_resize(&mut self, width: u32, height: u32) -> anyhow::Result<()> {
+        if width == 0 || height == 0 {
+            return Ok(());
+        }
+
+        unsafe {
+            self.ctx.gpu.wait_idle()?;
+            self.ctx.recreate_swapchain(width, height)?;
+        }
+
+        // Notify the application
+        self.app.on_resize(&mut self.ctx, width, height)?;
+
+        info!("Resized to {}x{}", width, height);
+        Ok(())
+    }
+
+    fn cleanup(&mut self) {
+        // Print FPS statistics
+        if self.ctx.frame_count > 0 {
+            let avg_fps = self.fps_sum / self.ctx.frame_count as f64;
+            info!("FPS Statistics:");
+            info!("  Min: {:.1}", self.min_fps);
+            info!("  Max: {:.1}", self.max_fps);
+            info!("  Avg: {:.1}", avg_fps);
+            info!("  Total frames: {}", self.ctx.frame_count);
+        }
+
+        info!("Starting cleanup...");
+        unsafe {
+            if let Err(e) = self.ctx.gpu.wait_idle() {
+                error!("Failed to wait idle: {e}");
+            }
+
+            // Let the app cleanup first
+            self.app.cleanup(&mut self.ctx);
+
+            // Then cleanup context resources
+            self.ctx.cleanup();
+
+            info!("Cleanup complete");
+        }
+    }
+}

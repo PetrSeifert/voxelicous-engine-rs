@@ -1,0 +1,16 @@
+[package]
+name = "voxelicous-benchmark"
+description = "Performance benchmarks for the Voxelicous engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+voxelicous-core.workspace = true
+voxelicous-voxel.workspace = true
+voxelicous-gpu.workspace = true
+voxelicous-render.workspace = true
+criterion.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

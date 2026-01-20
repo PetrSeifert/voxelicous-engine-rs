@@ -1,0 +1,14 @@
+[package]
+name = "voxelicous-platform"
+description = "Platform abstraction for the Voxelicous engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+voxelicous-core.workspace = true
+winit.workspace = true
+raw-window-handle.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

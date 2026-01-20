@@ -1,0 +1,23 @@
+[package]
+name = "voxelicous-render"
+description = "Ray tracing rendering pipeline for the Voxelicous engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+voxelicous-core.workspace = true
+voxelicous-gpu.workspace = true
+voxelicous-voxel.workspace = true
+voxelicous-world.workspace = true
+voxelicous-shaders.workspace = true
+ash.workspace = true
+glam.workspace = true
+bytemuck.workspace = true
+gpu-allocator.workspace = true
+tracing.workspace = true
+hashbrown.workspace = true
+image.workspace = true
+
+[dev-dependencies]

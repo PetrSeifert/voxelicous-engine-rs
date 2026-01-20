@@ -1,0 +1,16 @@
+[package]
+name = "voxelicous-world"
+description = "World generation and streaming for the Voxelicous engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+voxelicous-core.workspace = true
+voxelicous-voxel.workspace = true
+noise.workspace = true
+rayon.workspace = true
+hashbrown.workspace = true
+parking_lot.workspace = true
+glam.workspace = true

@@ -1,0 +1,16 @@
+[package]
+name = "voxelicous-voxel"
+description = "SVO-DAG voxel storage for the Voxelicous engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+voxelicous-core.workspace = true
+bytemuck.workspace = true
+hashbrown.workspace = true
+rayon.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
