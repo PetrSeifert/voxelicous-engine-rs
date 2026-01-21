@@ -88,7 +88,8 @@ impl InputManager {
                 true
             }
             WindowEvent::ModifiersChanged(modifiers) => {
-                self.keyboard.set_modifiers(Modifiers::from(modifiers.state()));
+                self.keyboard
+                    .set_modifiers(Modifiers::from(modifiers.state()));
                 true
             }
             WindowEvent::CursorMoved { position, .. } => {
@@ -262,9 +263,7 @@ mod tests {
 
     #[test]
     fn input_manager_with_actions() {
-        let actions = ActionMap::builder()
-            .bind("test", KeyCode::Space)
-            .build();
+        let actions = ActionMap::builder().bind("test", KeyCode::Space).build();
 
         let input = InputManager::with_actions(actions);
         assert!(!input.is_action_pressed("test"));

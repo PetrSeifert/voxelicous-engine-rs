@@ -1,0 +1,18 @@
+[package]
+name = "voxelicous-profiler-tui"
+description = "TUI dashboard for Voxelicous engine profiler"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+voxelicous-profiler.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+bincode.workspace = true
+serde.workspace = true
+anyhow.workspace = true
+
+[lints]
+workspace = true

@@ -15,9 +15,11 @@ members = [
     "crates/voxelicous-input",
     "crates/voxelicous-app",
     "crates/voxelicous-test",
+    "crates/voxelicous-profiler",
     "apps/voxelicous-editor",
     "apps/voxelicous-viewer",
     "apps/voxelicous-benchmark",
+    "apps/voxelicous-profiler-tui",
 ]
 
 [workspace.package]
@@ -78,6 +80,10 @@ image = "0.25"
 approx = "0.5"
 criterion = "0.5"
 
+# TUI
+ratatui = "0.29"
+crossterm = "0.28"
+
 # Internal crates
 voxelicous-core = { path = "crates/voxelicous-core" }
 voxelicous-voxel = { path = "crates/voxelicous-voxel" }
@@ -93,6 +99,7 @@ voxelicous-shaders = { path = "crates/voxelicous-shaders" }
 voxelicous-input = { path = "crates/voxelicous-input" }
 voxelicous-app = { path = "crates/voxelicous-app" }
 voxelicous-test = { path = "crates/voxelicous-test" }
+voxelicous-profiler = { path = "crates/voxelicous-profiler" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "warn"

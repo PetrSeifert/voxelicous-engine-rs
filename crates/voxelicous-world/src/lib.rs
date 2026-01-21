@@ -111,6 +111,11 @@ impl World {
     pub fn chunks_ready_for_upload(&self) -> Vec<ChunkPos> {
         self.chunk_manager.dirty_chunks()
     }
+
+    /// Get the number of chunks pending in the load queue.
+    pub fn pending_load_count(&self) -> usize {
+        self.streamer.pending_count()
+    }
 }
 
 #[cfg(test)]

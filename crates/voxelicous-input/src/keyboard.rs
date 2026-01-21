@@ -46,25 +46,19 @@ impl KeyboardState {
     /// Returns `true` if the key is currently pressed.
     #[must_use]
     pub fn is_pressed(&self, key: KeyCode) -> bool {
-        self.keys
-            .get(&key)
-            .is_some_and(|s| s.is_pressed())
+        self.keys.get(&key).is_some_and(|s| s.is_pressed())
     }
 
     /// Returns `true` if the key was just pressed this frame.
     #[must_use]
     pub fn is_just_pressed(&self, key: KeyCode) -> bool {
-        self.keys
-            .get(&key)
-            .is_some_and(|s| s.is_just_pressed())
+        self.keys.get(&key).is_some_and(|s| s.is_just_pressed())
     }
 
     /// Returns `true` if the key was just released this frame.
     #[must_use]
     pub fn is_just_released(&self, key: KeyCode) -> bool {
-        self.keys
-            .get(&key)
-            .is_some_and(|s| s.is_just_released())
+        self.keys.get(&key).is_some_and(|s| s.is_just_released())
     }
 
     /// Get the current modifier key state.

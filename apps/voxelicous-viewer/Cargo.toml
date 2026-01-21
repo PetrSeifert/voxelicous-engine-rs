@@ -9,6 +9,7 @@ license.workspace = true
 [features]
 default = []
 nvidia = ["voxelicous-app/nvidia"]
+profiling = ["dep:voxelicous-profiler", "voxelicous-profiler/profiling", "voxelicous-app/profiling", "voxelicous-world/profiling"]
 
 [dependencies]
 voxelicous-app.workspace = true
@@ -18,6 +19,7 @@ voxelicous-voxel.workspace = true
 voxelicous-render.workspace = true
 voxelicous-world.workspace = true
 voxelicous-input.workspace = true
+voxelicous-profiler = { workspace = true, optional = true }
 ash.workspace = true
 glam.workspace = true
 winit.workspace = true

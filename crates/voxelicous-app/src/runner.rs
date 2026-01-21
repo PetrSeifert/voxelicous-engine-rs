@@ -18,6 +18,9 @@ use crate::app::VoxelApp;
 use crate::context::AppContext;
 use crate::frame::FrameContext;
 
+#[cfg(feature = "profiling")]
+use voxelicous_profiler::{profile_scope, EventCategory};
+
 /// Application configuration.
 #[derive(Clone)]
 pub struct AppConfig {
@@ -94,6 +97,13 @@ pub fn run_app<A: VoxelApp + 'static>(config: AppConfig) -> anyhow::Result<()> {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
+
+    // Initialize profiler
+    #[cfg(feature = "profiling")]
+    {
+        voxelicous_profiler::init();
+        info!("Profiler initialized on port {}", voxelicous_profiler::DEFAULT_PORT);
+    }
 
     info!("{} starting...", config.title);
 
@@ -243,6 +253,9 @@ impl<A: VoxelApp + 'static> AppRunner<A> {
 
 impl<A: VoxelApp> AppState<A> {
     fn render_frame(&mut self) -> anyhow::Result<()> {
+        #[cfg(feature = "profiling")]
+        profile_scope!(EventCategory::Frame);
+
         let frame_start = Instant::now();
 
         // Calculate delta time
@@ -251,62 +264,92 @@ impl<A: VoxelApp> AppState<A> {
         self.ctx.last_frame_time = now;
 
         // Update FPS tracking
-        if dt > 0.0 {
+        #[allow(unused_variables)]
+        let fps = if dt > 0.0 {
             let fps = 1.0 / dt as f64;
             self.min_fps = self.min_fps.min(fps);
             self.max_fps = self.max_fps.max(fps);
             self.fps_sum += fps;
-        }
+            info!("FPS: {:.1}", fps);
+            fps as f32
+        } else {
+            0.0
+        };
 
         // Update the application
-        self.app.update(&self.ctx, dt);
+        {
+            #[cfg(feature = "profiling")]
+            profile_scope!(EventCategory::FrameUpdate);
+            self.app.update(&self.ctx, dt);
+        }
 
         let device = self.ctx.gpu.device();
         let frame_data = &self.ctx.frames[self.ctx.current_frame_index];
 
-        unsafe {
-            // Wait for this frame slot's fence
-            device.wait_for_fences(&[frame_data.in_flight_fence], true, u64::MAX)?;
+        // GPU synchronization: wait for previous frame and acquire next image
+        let image_index = {
+            #[cfg(feature = "profiling")]
+            profile_scope!(EventCategory::GpuSync);
 
-            // Acquire swapchain image
-            let (image_index, _suboptimal) = self.ctx.swapchain.acquire_next_image(
-                &self.ctx.surface.swapchain_loader,
-                frame_data.image_available,
-                u64::MAX,
-            )?;
+            unsafe {
+                // Wait for this frame slot's fence
+                device.wait_for_fences(&[frame_data.in_flight_fence], true, u64::MAX)?;
 
-            // Reset fence after successful acquire
-            device.reset_fences(&[frame_data.in_flight_fence])?;
+                // Acquire swapchain image
+                let (image_index, _suboptimal) = self.ctx.swapchain.acquire_next_image(
+                    &self.ctx.surface.swapchain_loader,
+                    frame_data.image_available,
+                    u64::MAX,
+                )?;
 
-            // Reset and begin command buffer
-            device.reset_command_buffer(
-                frame_data.command_buffer,
-                vk::CommandBufferResetFlags::empty(),
-            )?;
+                // Reset fence after successful acquire
+                device.reset_fences(&[frame_data.in_flight_fence])?;
 
-            let begin_info = vk::CommandBufferBeginInfo::default()
-                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-            device.begin_command_buffer(frame_data.command_buffer, &begin_info)?;
+                image_index
+            }
+        };
 
-            // Create frame context
-            let mut frame_ctx = FrameContext::new(
-                frame_data.command_buffer,
-                image_index,
-                self.ctx.swapchain.images[image_index as usize],
-                dt,
-                self.ctx.frame_count,
-            );
+        // Render: record command buffer
+        {
+            #[cfg(feature = "profiling")]
+            profile_scope!(EventCategory::FrameRender);
 
-            // Render the frame
-            self.app.render(&self.ctx, &mut frame_ctx)?;
+            unsafe {
+                // Reset and begin command buffer
+                device.reset_command_buffer(
+                    frame_data.command_buffer,
+                    vk::CommandBufferResetFlags::empty(),
+                )?;
 
-            // End command buffer
-            device.end_command_buffer(frame_data.command_buffer)?;
+                let begin_info = vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+                device.begin_command_buffer(frame_data.command_buffer, &begin_info)?;
 
-            // Get the render finished semaphore for this swapchain image
-            let render_finished = self.ctx.render_finished_semaphores[image_index as usize];
+                // Create frame context
+                let mut frame_ctx = FrameContext::new(
+                    frame_data.command_buffer,
+                    image_index,
+                    self.ctx.swapchain.images[image_index as usize],
+                    dt,
+                    self.ctx.frame_count,
+                );
 
-            // Submit
+                // Render the frame
+                self.app.render(&self.ctx, &mut frame_ctx)?;
+
+                // End command buffer
+                device.end_command_buffer(frame_data.command_buffer)?;
+            }
+        }
+
+        // Get the render finished semaphore for this swapchain image
+        let render_finished = self.ctx.render_finished_semaphores[image_index as usize];
+
+        // Submit command buffer to GPU
+        {
+            #[cfg(feature = "profiling")]
+            profile_scope!(EventCategory::GpuSubmit);
+
             let wait_semaphores = [frame_data.image_available];
             let wait_stages = [vk::PipelineStageFlags::TRANSFER];
             let signal_semaphores = [render_finished];
@@ -318,19 +361,28 @@ impl<A: VoxelApp> AppState<A> {
                 .command_buffers(&command_buffers)
                 .signal_semaphores(&signal_semaphores);
 
-            device.queue_submit(
-                self.ctx.gpu.graphics_queue(),
-                &[submit_info],
-                frame_data.in_flight_fence,
-            )?;
+            unsafe {
+                device.queue_submit(
+                    self.ctx.gpu.graphics_queue(),
+                    &[submit_info],
+                    frame_data.in_flight_fence,
+                )?;
+            }
+        }
 
-            // Present
-            self.ctx.swapchain.present(
-                &self.ctx.surface.swapchain_loader,
-                self.ctx.gpu.graphics_queue(),
-                image_index,
-                &signal_semaphores,
-            )?;
+        // Present to swapchain
+        {
+            #[cfg(feature = "profiling")]
+            profile_scope!(EventCategory::FramePresent);
+
+            unsafe {
+                self.ctx.swapchain.present(
+                    &self.ctx.surface.swapchain_loader,
+                    self.ctx.gpu.graphics_queue(),
+                    image_index,
+                    &[render_finished],
+                )?;
+            }
         }
 
         self.ctx.current_frame_index = (self.ctx.current_frame_index + 1) % self.ctx.frames.len();
@@ -343,6 +395,14 @@ impl<A: VoxelApp> AppState<A> {
                 thread::sleep(target - elapsed);
             }
         }
+
+        // Report frame to profiler
+        #[cfg(feature = "profiling")]
+        voxelicous_profiler::end_frame(
+            self.ctx.frame_count,
+            fps,
+            dt * 1000.0,
+        );
 
         Ok(())
     }
@@ -365,6 +425,10 @@ impl<A: VoxelApp> AppState<A> {
     }
 
     fn cleanup(&mut self) {
+        // Shutdown profiler
+        #[cfg(feature = "profiling")]
+        voxelicous_profiler::shutdown();
+
         // Print FPS statistics
         if self.ctx.frame_count > 0 {
             let avg_fps = self.fps_sum / self.ctx.frame_count as f64;

@@ -6,11 +6,19 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+default = []
+profiling = ["dep:voxelicous-profiler", "voxelicous-profiler/profiling"]
+
 [dependencies]
 voxelicous-core.workspace = true
 voxelicous-voxel.workspace = true
+voxelicous-profiler = { workspace = true, optional = true }
 noise.workspace = true
 rayon.workspace = true
 hashbrown.workspace = true
 parking_lot.workspace = true
 glam.workspace = true
+
+[lints]
+workspace = true

@@ -11,6 +11,9 @@ use crate::chunk::{Chunk, ChunkState};
 use crate::chunk_manager::ChunkManager;
 use crate::generation::TerrainGenerator;
 
+#[cfg(feature = "profiling")]
+use voxelicous_profiler::{profile_scope, EventCategory};
+
 /// Priority entry for chunk loading queue.
 #[derive(Debug, Clone, Copy)]
 struct LoadPriority {
@@ -73,6 +76,10 @@ pub struct ChunkStreamer {
     generator: TerrainGenerator,
     load_queue: BinaryHeap<LoadPriority>,
     last_center: Option<ChunkPos>,
+    /// Last camera position for distance-based reprioritization.
+    last_camera_pos: Option<Vec3>,
+    /// Number of updates since last queue rebuild.
+    updates_since_rebuild: u32,
 }
 
 impl ChunkStreamer {
@@ -83,6 +90,8 @@ impl ChunkStreamer {
             generator,
             load_queue: BinaryHeap::new(),
             last_center: None,
+            last_camera_pos: None,
+            updates_since_rebuild: 0,
         }
     }
 
@@ -156,6 +165,30 @@ impl ChunkStreamer {
         unloaded
     }
 
+    /// Check if we should rebuild the queue based on camera movement or time.
+    fn should_rebuild_queue(&self, camera_pos: Vec3, center: ChunkPos) -> bool {
+        // Always rebuild if center chunk changed
+        if self.center_changed(center) {
+            return true;
+        }
+
+        // Rebuild periodically to keep priorities fresh
+        if self.updates_since_rebuild > 30 {
+            return true;
+        }
+
+        // Rebuild if camera moved significantly within the same chunk (half chunk size)
+        if let Some(last_pos) = self.last_camera_pos {
+            let distance_sq = (camera_pos - last_pos).length_squared();
+            if distance_sq > 256.0 {
+                // 16 units = half chunk
+                return true;
+            }
+        }
+
+        false
+    }
+
     /// Update streaming state based on camera position.
     ///
     /// Returns a tuple of (chunks needing GPU upload, chunks unloaded).
@@ -166,10 +199,14 @@ impl ChunkStreamer {
     ) -> (Vec<ChunkPos>, Vec<ChunkPos>) {
         let center = Self::world_to_chunk(camera_pos);
 
-        // Rebuild queue if camera moved to new chunk
-        if self.center_changed(center) {
+        // Rebuild queue if camera moved significantly or periodically
+        if self.should_rebuild_queue(camera_pos, center) {
             self.rebuild_load_queue(center, chunk_manager);
             self.last_center = Some(center);
+            self.last_camera_pos = Some(camera_pos);
+            self.updates_since_rebuild = 0;
+        } else {
+            self.updates_since_rebuild += 1;
         }
 
         // Unload distant chunks
@@ -180,7 +217,11 @@ impl ChunkStreamer {
         for _ in 0..self.config.max_gen_per_update {
             if let Some(entry) = self.load_queue.pop() {
                 if !chunk_manager.contains(entry.pos) {
-                    let svo = self.generator.generate_chunk(entry.pos);
+                    let svo = {
+                        #[cfg(feature = "profiling")]
+                        profile_scope!(EventCategory::ChunkGeneration, [entry.pos.x, entry.pos.y, entry.pos.z]);
+                        self.generator.generate_chunk(entry.pos)
+                    };
                     let chunk = Chunk::with_svo(entry.pos, svo);
                     chunk_manager.insert(chunk);
                     generated.push(entry.pos);
@@ -200,6 +241,8 @@ impl ChunkStreamer {
             }
 
             chunk_manager.with_chunk_mut(pos, |chunk| {
+                #[cfg(feature = "profiling")]
+                profile_scope!(EventCategory::ChunkCompression, [pos.x, pos.y, pos.z]);
                 chunk.compress();
             });
             needs_upload.push(pos);

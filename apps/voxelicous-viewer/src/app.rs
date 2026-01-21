@@ -5,11 +5,16 @@ use glam::Vec3;
 use tracing::{debug, error, info};
 use winit::window::{CursorGrabMode, Window};
 
-use voxelicous_app::{AppContext, Camera, DeviceEvent, DeviceId, FrameContext, VoxelApp, WindowEvent};
+use voxelicous_app::{
+    AppContext, Camera, DeviceEvent, DeviceId, FrameContext, VoxelApp, WindowEvent,
+};
 use voxelicous_core::coords::ChunkPos;
 use voxelicous_input::{ActionMap, CursorMode, InputManager, KeyCode};
 use voxelicous_render::{save_screenshot, ScreenshotConfig, WorldRayMarchPipeline, WorldRenderer};
 use voxelicous_world::{ChunkState, StreamingConfig, TerrainConfig, World};
+
+#[cfg(feature = "profiling")]
+use voxelicous_profiler::{profile_scope, EventCategory, QueueSizes};
 
 /// Maximum ray marching steps per chunk.
 const MAX_STEPS: u32 = 128;
@@ -39,10 +44,10 @@ pub struct StreamingParams {
 impl Default for StreamingParams {
     fn default() -> Self {
         Self {
-            load_radius: 3,
-            unload_radius: 5,
+            load_radius: 4,
+            unload_radius: 6,
             vertical_radius: 2,
-            max_gen_per_frame: 2,
+            max_gen_per_frame: 8,
             seed: 42,
         }
     }
@@ -173,7 +178,7 @@ impl VoxelApp for Viewer {
             unload_radius: streaming_params.unload_radius,
             vertical_radius: streaming_params.vertical_radius,
             max_gen_per_update: streaming_params.max_gen_per_frame,
-            max_compress_per_update: streaming_params.max_gen_per_frame * 2,
+            max_compress_per_update: streaming_params.max_gen_per_frame,
         };
 
         // Create world with streaming
@@ -388,6 +393,20 @@ impl VoxelApp for Viewer {
                 self.world.chunk_count()
             );
         }
+
+        // Report queue sizes to profiler
+        #[cfg(feature = "profiling")]
+        {
+            let queues = QueueSizes {
+                pending_uploads: self.pending_uploads.len() as u32,
+                pending_unloads: self.pending_unloads.len() as u32,
+                load_queue_length: self.world.pending_load_count() as u32,
+                chunks_generating: 0, // Not tracked separately currently
+                total_chunks: self.world.chunk_count() as u32,
+                gpu_chunks: self.world_renderer.chunk_count() as u32,
+            };
+            voxelicous_profiler::report_queue_sizes(queues);
+        }
     }
 
     fn render(&mut self, ctx: &AppContext, frame: &mut FrameContext) -> anyhow::Result<()> {
@@ -396,9 +415,9 @@ impl VoxelApp for Viewer {
         let camera_uniforms = self.camera.uniforms();
 
         // Process pending GPU operations before rendering
-        // Limit uploads/unloads per frame to prevent GPU stalls
-        const MAX_UPLOADS_PER_FRAME: usize = 4;
-        const MAX_UNLOADS_PER_FRAME: usize = 8;
+        // Limit uploads/unloads per frame to balance performance vs responsiveness
+        const MAX_UPLOADS_PER_FRAME: usize = 8;
+        const MAX_UNLOADS_PER_FRAME: usize = 16;
 
         {
             let mut allocator = ctx.gpu.allocator().lock();
@@ -410,6 +429,8 @@ impl VoxelApp for Viewer {
             for pos in uploads {
                 if !self.world_renderer.has_chunk(pos) {
                     if let Some(dag) = get_chunk_dag(&self.world, pos) {
+                        #[cfg(feature = "profiling")]
+                        profile_scope!(EventCategory::GpuUpload, [pos.x, pos.y, pos.z]);
                         if let Err(e) =
                             self.world_renderer
                                 .upload_chunk(&mut allocator, device, pos, &dag)
@@ -425,6 +446,8 @@ impl VoxelApp for Viewer {
             let unloads: Vec<_> = self.pending_unloads.drain(..unload_count).collect();
 
             for pos in unloads {
+                #[cfg(feature = "profiling")]
+                profile_scope!(EventCategory::GpuUnload, [pos.x, pos.y, pos.z]);
                 if let Err(e) = self
                     .world_renderer
                     .remove_chunk(&mut allocator, device, pos)

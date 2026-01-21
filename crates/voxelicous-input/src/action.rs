@@ -139,36 +139,31 @@ impl ActionMap {
     pub fn update(&mut self, keyboard: &KeyboardState, mouse: &MouseState) {
         for action in self.actions.values_mut() {
             // Check if any binding is pressed
-            let any_pressed = action.bindings.iter().any(|binding| {
-                match binding {
-                    InputBinding::Key(key) => keyboard.is_pressed(*key),
-                    InputBinding::KeyWithModifiers(key, modifiers) => {
-                        keyboard.is_pressed(*key) && keyboard.modifiers().contains(*modifiers)
-                    }
-                    InputBinding::Mouse(button) => mouse.is_pressed(*button),
+            let any_pressed = action.bindings.iter().any(|binding| match binding {
+                InputBinding::Key(key) => keyboard.is_pressed(*key),
+                InputBinding::KeyWithModifiers(key, modifiers) => {
+                    keyboard.is_pressed(*key) && keyboard.modifiers().contains(*modifiers)
                 }
+                InputBinding::Mouse(button) => mouse.is_pressed(*button),
             });
 
             // Check if any binding was just pressed
-            let any_just_pressed = action.bindings.iter().any(|binding| {
-                match binding {
-                    InputBinding::Key(key) => keyboard.is_just_pressed(*key),
-                    InputBinding::KeyWithModifiers(key, modifiers) => {
-                        keyboard.is_just_pressed(*key) && keyboard.modifiers().contains(*modifiers)
-                    }
-                    InputBinding::Mouse(button) => mouse.is_just_pressed(*button),
+            let any_just_pressed = action.bindings.iter().any(|binding| match binding {
+                InputBinding::Key(key) => keyboard.is_just_pressed(*key),
+                InputBinding::KeyWithModifiers(key, modifiers) => {
+                    keyboard.is_just_pressed(*key) && keyboard.modifiers().contains(*modifiers)
                 }
+                InputBinding::Mouse(button) => mouse.is_just_pressed(*button),
             });
 
             // Check if any binding was just released (and none are still pressed)
-            let any_just_released = !any_pressed && action.bindings.iter().any(|binding| {
-                match binding {
+            let any_just_released = !any_pressed
+                && action.bindings.iter().any(|binding| match binding {
                     InputBinding::Key(key) | InputBinding::KeyWithModifiers(key, _) => {
                         keyboard.is_just_released(*key)
                     }
                     InputBinding::Mouse(button) => mouse.is_just_released(*button),
-                }
-            });
+                });
 
             // Update action state
             if any_just_pressed && !action.state.is_pressed() {

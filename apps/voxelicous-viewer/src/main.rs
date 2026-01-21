@@ -91,13 +91,13 @@ SCREENSHOT OPTIONS:
     --exit-after            Exit after capturing all specified frames
 
 STREAMING OPTIONS:
-    --load-radius <N>       Horizontal chunk load radius (default: 3)
-    --unload-radius <N>     Horizontal chunk unload radius (default: 5)
+    --load-radius <N>       Horizontal chunk load radius (default: 4)
+    --unload-radius <N>     Horizontal chunk unload radius (default: 6)
     --vertical-radius <N>   Vertical chunk radius (default: 2)
-    --max-gen-per-frame <N> Max chunks to generate per frame (default: 2)
+    --max-gen-per-frame <N> Max chunks to generate per frame (default: 8)
     --seed <N>              World generation seed (default: 42)
 
-NOTE: Large load radii (>6) may cause performance issues due to the O(pixels*chunks)
+NOTE: Large load radii (>8) may cause performance issues due to the O(pixels*chunks)
       complexity of the ray marching shader.
 
 OTHER:

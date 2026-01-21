@@ -1,0 +1,21 @@
+[package]
+name = "voxelicous-profiler"
+description = "Performance profiling for the Voxelicous engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = []
+# Enable profiling (disabled = zero-cost no-ops)
+profiling = []
+
+[dependencies]
+parking_lot.workspace = true
+bincode.workspace = true
+serde.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true
