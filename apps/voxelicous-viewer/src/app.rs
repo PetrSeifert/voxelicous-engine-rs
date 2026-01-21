@@ -266,10 +266,14 @@ impl VoxelApp for Viewer {
                 }
             }
 
-            // Rebuild chunk info buffer
-            if let Err(e) =
-                world_renderer.rebuild_chunk_info_buffer(&mut allocator, ctx.gpu.device())
-            {
+            // Rebuild chunk info buffer with frustum culling and distance sorting
+            let frustum = camera.frustum();
+            if let Err(e) = world_renderer.rebuild_chunk_info_buffer_culled(
+                &mut allocator,
+                ctx.gpu.device(),
+                &frustum,
+                camera.position,
+            ) {
                 error!("Failed to rebuild chunk info buffer: {}", e);
             }
         }
@@ -456,11 +460,14 @@ impl VoxelApp for Viewer {
                 }
             }
 
-            // Rebuild chunk info buffer if dirty
-            if let Err(e) = self
-                .world_renderer
-                .rebuild_chunk_info_buffer(&mut allocator, device)
-            {
+            // Rebuild chunk info buffer with frustum culling and distance sorting
+            let frustum = self.camera.frustum();
+            if let Err(e) = self.world_renderer.rebuild_chunk_info_buffer_culled(
+                &mut allocator,
+                device,
+                &frustum,
+                self.camera.position,
+            ) {
                 error!("Failed to rebuild chunk info buffer: {}", e);
             }
         }

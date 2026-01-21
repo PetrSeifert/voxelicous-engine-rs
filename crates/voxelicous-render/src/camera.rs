@@ -1,6 +1,7 @@
 //! Camera and view management.
 
 use glam::{Mat4, Vec3};
+use voxelicous_core::math::Frustum;
 
 /// Camera for rendering.
 #[derive(Debug, Clone)]
@@ -85,6 +86,16 @@ impl Camera {
 
     pub fn inverse_projection_matrix(&self) -> Mat4 {
         self.projection_matrix().inverse()
+    }
+
+    /// Get the view-projection matrix.
+    pub fn view_projection_matrix(&self) -> Mat4 {
+        self.projection_matrix() * self.view_matrix()
+    }
+
+    /// Extract frustum planes from the current camera state.
+    pub fn frustum(&self) -> Frustum {
+        Frustum::from_view_projection(self.view_projection_matrix())
     }
 }
 

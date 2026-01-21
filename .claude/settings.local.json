@@ -18,7 +18,8 @@
       "Bash($env:RUST_BACKTRACE=1)",
       "Bash(cargo fmt:*)",
       "Bash(set VOXELICOUS_FORCE_COMPUTE=1:*)",
-      "Bash(cmd /c \"set VOXELICOUS_FORCE_COMPUTE=1 && cargo run -p voxelicous-viewer --features nvidia -- -S -f 0 -o compute_frame_{}.png --exit-after\")"
+      "Bash(cmd /c \"set VOXELICOUS_FORCE_COMPUTE=1 && cargo run -p voxelicous-viewer --features nvidia -- -S -f 0 -o compute_frame_{}.png --exit-after\")",
+      "Bash(wc:*)"
     ]
   }
 }

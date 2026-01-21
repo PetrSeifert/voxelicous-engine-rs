@@ -139,6 +139,55 @@ struct StackEntry {
     float size;
 };
 
+// Child info for front-to-back sorting
+struct ChildInfo {
+    uint index;
+    float t_near;
+};
+
+// Swap helper for sorting
+void swap_children(inout ChildInfo a, inout ChildInfo b) {
+    ChildInfo tmp = a;
+    a = b;
+    b = tmp;
+}
+
+// Compare and swap for sorting network
+void compare_swap(inout ChildInfo arr[8], uint i, uint j) {
+    if (arr[i].t_near > arr[j].t_near) {
+        swap_children(arr[i], arr[j]);
+    }
+}
+
+// Batcher's odd-even merge sort for 8 elements (optimal for GPU)
+void sort_children_8(inout ChildInfo arr[8]) {
+    // Stage 1
+    compare_swap(arr, 0, 1);
+    compare_swap(arr, 2, 3);
+    compare_swap(arr, 4, 5);
+    compare_swap(arr, 6, 7);
+    // Stage 2
+    compare_swap(arr, 0, 2);
+    compare_swap(arr, 1, 3);
+    compare_swap(arr, 4, 6);
+    compare_swap(arr, 5, 7);
+    // Stage 3
+    compare_swap(arr, 1, 2);
+    compare_swap(arr, 5, 6);
+    // Stage 4
+    compare_swap(arr, 0, 4);
+    compare_swap(arr, 1, 5);
+    compare_swap(arr, 2, 6);
+    compare_swap(arr, 3, 7);
+    // Stage 5
+    compare_swap(arr, 2, 4);
+    compare_swap(arr, 3, 5);
+    // Stage 6
+    compare_swap(arr, 1, 2);
+    compare_swap(arr, 3, 4);
+    compare_swap(arr, 5, 6);
+}
+
 // Trace ray through a single chunk (in chunk-local coordinates)
 RayHit trace_ray_chunk(vec3 ray_origin, vec3 ray_dir, GpuChunkInfo chunk_info, float max_t) {
     RayHit result;
@@ -191,8 +240,14 @@ RayHit trace_ray_chunk(vec3 ray_origin, vec3 ray_dir, GpuChunkInfo chunk_info, f
         GpuOctreeNode node = nodes.nodes[entry.node_index];
         float half_size = entry.size * 0.5;
 
+        // Collect and sort children by distance (front-to-back)
+        ChildInfo children[8];
+        uint valid_count = 0u;
+
         for (uint i = 0u; i < 8u; i++) {
             if (!has_child(node, i)) {
+                children[i].index = i;
+                children[i].t_near = 1e30; // Push invalid children to end
                 continue;
             }
 
@@ -203,17 +258,38 @@ RayHit trace_ray_chunk(vec3 ray_origin, vec3 ray_dir, GpuChunkInfo chunk_info, f
             if (!ray_aabb_intersect(ray_origin, ray_dir_inv,
                                     child_min, child_max,
                                     child_t_near, child_t_far)) {
+                children[i].index = i;
+                children[i].t_near = 1e30; // Miss - push to end
                 continue;
             }
 
-            if (child_t_near > result.t) {
+            children[i].index = i;
+            children[i].t_near = child_t_near;
+            valid_count++;
+        }
+
+        // Sort children front-to-back
+        sort_children_8(children);
+
+        // Process children in front-to-back order
+        // Push to stack in REVERSE order so closest is processed first
+        for (uint j = 0u; j < 8u; j++) {
+            uint k = 7u - j; // Reverse order for stack
+            uint i = children[k].index;
+            float t_near = children[k].t_near;
+
+            // Skip if no valid intersection or further than current hit
+            if (t_near >= 1e29 || t_near > result.t) {
                 continue;
             }
+
+            vec3 child_min = entry.box_min + get_child_offset(i, half_size);
+            vec3 child_max = child_min + vec3(half_size);
 
             if (is_leaf(node, i)) {
                 uint block_id = node.children[i];
                 if (block_id != 0u) {
-                    float hit_t = max(child_t_near, 0.001);
+                    float hit_t = max(t_near, 0.001);
                     if (hit_t < result.t) {
                         result.hit = true;
                         result.block_id = block_id;
