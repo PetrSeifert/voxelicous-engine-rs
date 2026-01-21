@@ -1,7 +1,7 @@
 //! Voxelicous Engine Demo Viewer
 //!
-//! Renders procedurally generated terrain using ray tracing.
-//! Automatically selects hardware RT (RTX) or compute ray marching based on GPU capabilities.
+//! Renders procedurally generated terrain using ray tracing with chunk streaming.
+//! Chunks are dynamically loaded and unloaded based on camera position.
 //!
 //! ## Usage
 //!
@@ -11,35 +11,46 @@
 //!
 //! ## Options
 //!
+//! ### Screenshot options
 //! - `-S, --screenshot`: Enable screenshot capture mode
 //! - `-o, --output <PATTERN>`: Output path pattern (use `{}` for frame number)
 //! - `-f, --frames <FRAMES>`: Frame indices to capture (e.g., "0,10,20" or "0-5")
 //! - `--exit-after`: Exit after capturing all specified frames
+//!
+//! ### Streaming options
+//! - `--load-radius <N>`: Horizontal chunk load radius (default: 8)
+//! - `--unload-radius <N>`: Horizontal chunk unload radius (default: 12)
+//! - `--vertical-radius <N>`: Vertical chunk radius (default: 4)
+//! - `--max-gen-per-frame <N>`: Max chunks to generate per frame (default: 4)
+//! - `--seed <N>`: World generation seed (default: 42)
+//!
+//! ### Other
 //! - `-h, --help`: Print help message
 //!
 //! ## Examples
 //!
 //! ```bash
-//! # Basic viewer
+//! # Basic viewer with default streaming
 //! cargo run -p voxelicous-viewer
+//!
+//! # Smaller view distance for better performance
+//! cargo run -p voxelicous-viewer -- --load-radius 4
+//!
+//! # Larger view distance
+//! cargo run -p voxelicous-viewer -- --load-radius 12 --unload-radius 16
 //!
 //! # Capture frame 0
 //! cargo run -p voxelicous-viewer -- -S
 //!
-//! # Capture frames 0, 10, 20 and exit
-//! cargo run -p voxelicous-viewer -- -S -f 0,10,20 --exit-after
-//!
-//! # Capture frames 0-5 with custom output pattern
-//! cargo run -p voxelicous-viewer -- -S -o frame_{}.png -f 0-5
+//! # Capture frames during orbit and exit
+//! cargo run -p voxelicous-viewer -- -S -f 0,50,100,150,200 -o stream_{}.png --exit-after
 //! ```
 //!
 //! ## Environment Variables
 //!
-//! - `VOXELICOUS_FORCE_COMPUTE`: Force compute ray marching (skip hardware RT)
 //! - `RUST_LOG`: Set log level (e.g., info, debug, trace)
 
 mod app;
-mod terrain;
 
 use voxelicous_app::{run_app, AppConfig};
 
@@ -57,7 +68,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     run_app::<Viewer>(
-        AppConfig::new("Voxelicous Engine - Terrain Demo")
+        AppConfig::new("Voxelicous Engine - Streaming Demo")
             .with_size(WIDTH, HEIGHT)
             .with_target_fps(TARGET_FPS),
     )
@@ -65,12 +76,12 @@ fn main() -> anyhow::Result<()> {
 
 fn print_help() {
     eprintln!(
-        "Voxelicous Engine Demo Viewer
+        "Voxelicous Engine Demo Viewer with Chunk Streaming
 
 USAGE:
     cargo run -p voxelicous-viewer -- [OPTIONS]
 
-OPTIONS:
+SCREENSHOT OPTIONS:
     -S, --screenshot        Enable screenshot capture mode
     -o, --output <PATTERN>  Output path pattern (use {{}} for frame number)
                             Default: screenshot_{{}}.png
@@ -78,20 +89,34 @@ OPTIONS:
                             Examples: \"0\" \"0,10,20\" \"0-5\" \"0,5-10,20\"
                             Default: 0
     --exit-after            Exit after capturing all specified frames
+
+STREAMING OPTIONS:
+    --load-radius <N>       Horizontal chunk load radius (default: 3)
+    --unload-radius <N>     Horizontal chunk unload radius (default: 5)
+    --vertical-radius <N>   Vertical chunk radius (default: 2)
+    --max-gen-per-frame <N> Max chunks to generate per frame (default: 2)
+    --seed <N>              World generation seed (default: 42)
+
+NOTE: Large load radii (>6) may cause performance issues due to the O(pixels*chunks)
+      complexity of the ray marching shader.
+
+OTHER:
     -h, --help              Print this help message
 
 EXAMPLES:
-    # Capture frame 0
-    cargo run -p voxelicous-viewer -- -S
+    # Basic viewer with default streaming
+    cargo run -p voxelicous-viewer
 
-    # Capture frames 0, 10, 20 and exit
-    cargo run -p voxelicous-viewer -- -S -f 0,10,20 --exit-after
+    # Smaller view distance for better performance
+    cargo run -p voxelicous-viewer -- --load-radius 4
 
-    # Capture frames 0-5 with custom output pattern
-    cargo run -p voxelicous-viewer -- -S -o frame_{{}}.png -f 0-5
+    # Larger view distance
+    cargo run -p voxelicous-viewer -- --load-radius 12 --unload-radius 16
+
+    # Capture frames during orbit
+    cargo run -p voxelicous-viewer -- -S -f 0,50,100,150,200 -o stream_{{}}.png --exit-after
 
 ENVIRONMENT VARIABLES:
-    VOXELICOUS_FORCE_COMPUTE    Force compute ray marching (skip hardware RT)
-    RUST_LOG                    Set log level (e.g., info, debug, trace)"
+    RUST_LOG                Set log level (e.g., info, debug, trace)"
     );
 }

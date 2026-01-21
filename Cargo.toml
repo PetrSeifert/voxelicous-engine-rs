@@ -12,6 +12,7 @@ members = [
     "crates/voxelicous-audio",
     "crates/voxelicous-entity",
     "crates/voxelicous-shaders",
+    "crates/voxelicous-input",
     "crates/voxelicous-app",
     "crates/voxelicous-test",
     "apps/voxelicous-editor",
@@ -89,6 +90,7 @@ voxelicous-physics = { path = "crates/voxelicous-physics" }
 voxelicous-audio = { path = "crates/voxelicous-audio" }
 voxelicous-entity = { path = "crates/voxelicous-entity" }
 voxelicous-shaders = { path = "crates/voxelicous-shaders" }
+voxelicous-input = { path = "crates/voxelicous-input" }
 voxelicous-app = { path = "crates/voxelicous-app" }
 voxelicous-test = { path = "crates/voxelicous-test" }
 

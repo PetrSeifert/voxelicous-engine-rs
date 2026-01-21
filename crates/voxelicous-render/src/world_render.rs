@@ -111,6 +111,8 @@ impl WorldRenderer {
     }
 
     /// Upload a chunk's DAG to the GPU.
+    ///
+    /// If a chunk already exists at this position, waits for GPU idle before replacing.
     pub fn upload_chunk(
         &mut self,
         allocator: &mut GpuAllocator,
@@ -118,8 +120,11 @@ impl WorldRenderer {
         pos: ChunkPos,
         dag: &SvoDag,
     ) -> Result<()> {
-        // Remove old chunk if it exists
+        // Remove old chunk if it exists (wait for GPU first)
         if let Some(old) = self.chunks.remove(&pos) {
+            unsafe {
+                let _ = device.device_wait_idle();
+            }
             let mut buffer = old.gpu_dag.node_buffer;
             allocator.free_buffer(&mut buffer)?;
         }
@@ -135,8 +140,18 @@ impl WorldRenderer {
     }
 
     /// Remove a chunk from GPU memory.
-    pub fn remove_chunk(&mut self, allocator: &mut GpuAllocator, pos: ChunkPos) -> Result<()> {
+    ///
+    /// Waits for GPU idle before freeing to ensure buffer is not in use.
+    pub fn remove_chunk(
+        &mut self,
+        allocator: &mut GpuAllocator,
+        device: &ash::Device,
+        pos: ChunkPos,
+    ) -> Result<()> {
         if let Some(mut loaded) = self.chunks.remove(&pos) {
+            unsafe {
+                let _ = device.device_wait_idle();
+            }
             allocator.free_buffer(&mut loaded.gpu_dag.node_buffer)?;
             self.dirty = true;
         }
@@ -163,6 +178,10 @@ impl WorldRenderer {
     /// Rebuild the chunk info buffer for shader access.
     ///
     /// Call this before rendering if chunks have changed.
+    ///
+    /// # Safety
+    /// This function waits for the GPU to be idle before freeing the old buffer
+    /// to ensure it's not in use. This may impact performance.
     pub fn rebuild_chunk_info_buffer(
         &mut self,
         allocator: &mut GpuAllocator,
@@ -172,7 +191,15 @@ impl WorldRenderer {
             return Ok(());
         }
 
-        // Free old buffer
+        // Wait for GPU to finish before freeing old buffer
+        // This prevents accessing freed memory from previous frames
+        if self.chunk_info_buffer.is_some() {
+            unsafe {
+                let _ = device.device_wait_idle();
+            }
+        }
+
+        // Free old buffer (now safe since GPU is idle)
         if let Some(mut old_buffer) = self.chunk_info_buffer.take() {
             allocator.free_buffer(&mut old_buffer)?;
         }

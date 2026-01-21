@@ -1,8 +1,8 @@
-//! VoxelApp trait definition.
+//! `VoxelApp` trait definition.
 
 use crate::context::AppContext;
 use crate::frame::FrameContext;
-use winit::event::WindowEvent;
+use winit::event::{DeviceEvent, DeviceId, WindowEvent};
 
 /// Trait for Voxelicous applications.
 ///
@@ -63,6 +63,15 @@ pub trait VoxelApp: Sized {
     fn on_event(&mut self, event: &WindowEvent) -> bool {
         false
     }
+
+    /// Handle device events (raw input).
+    ///
+    /// Called for each device event. This is useful for raw mouse motion
+    /// when the cursor is locked (for FPS-style controls).
+    ///
+    /// Default implementation does nothing.
+    #[allow(unused_variables)]
+    fn on_device_event(&mut self, device_id: DeviceId, event: &DeviceEvent) {}
 
     /// Cleanup resources before shutdown.
     ///

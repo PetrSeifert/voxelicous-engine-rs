@@ -100,6 +100,7 @@ impl From<&DagNode> for NodeKey {
 }
 
 /// Compressed Sparse Voxel Octree DAG.
+#[derive(Clone)]
 pub struct SvoDag {
     /// Node pool.
     nodes: Vec<DagNode>,

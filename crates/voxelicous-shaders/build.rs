@@ -15,11 +15,19 @@ fn main() {
     // Create compiler
     let compiler = Compiler::new().expect("Failed to create shader compiler");
 
-    // Compile ray_march_svo.comp (compute fallback)
+    // Compile ray_march_svo.comp (single DAG compute)
     compile_shader(
         &compiler,
         shader_dir.join("ray_march_svo.comp"),
         Path::new(&out_dir).join("ray_march_svo.spv"),
+        ShaderKind::Compute,
+    );
+
+    // Compile ray_march_world.comp (multi-chunk compute)
+    compile_shader(
+        &compiler,
+        shader_dir.join("ray_march_world.comp"),
+        Path::new(&out_dir).join("ray_march_world.spv"),
         ShaderKind::Compute,
     );
 

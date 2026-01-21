@@ -52,4 +52,4 @@ pub use unified_pipeline::UnifiedPipeline;
 // Re-export commonly used types for convenience
 pub use voxelicous_gpu::{GpuContext, GpuContextBuilder};
 pub use voxelicous_render::{Camera, RenderPath};
-pub use winit::event::WindowEvent;
+pub use winit::event::{DeviceEvent, DeviceId, WindowEvent};

@@ -13,6 +13,7 @@ pub mod ray_march;
 pub mod ray_march_pipeline;
 pub mod screenshot;
 pub mod svo_upload;
+pub mod world_ray_march_pipeline;
 pub mod world_render;
 
 pub use camera::{Camera, CameraUniforms};
@@ -20,6 +21,7 @@ pub use ray_march::{Ray, RayHit, RayMarchConfig, RayMarchPushConstants};
 pub use ray_march_pipeline::RayMarchPipeline;
 pub use screenshot::{parse_frame_indices, save_screenshot, ScreenshotConfig, ScreenshotError};
 pub use svo_upload::GpuSvoDag;
+pub use world_ray_march_pipeline::WorldRayMarchPipeline;
 pub use world_render::{GpuChunkInfo, WorldRenderPushConstants, WorldRenderer};
 
 use voxelicous_gpu::GpuCapabilities;

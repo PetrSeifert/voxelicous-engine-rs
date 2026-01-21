@@ -1,0 +1,18 @@
+[package]
+name = "voxelicous-input"
+description = "Input handling for the Voxelicous engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+voxelicous-core.workspace = true
+winit.workspace = true
+glam.workspace = true
+hashbrown.workspace = true
+tracing.workspace = true
+bitflags.workspace = true
+
+[lints]
+workspace = true

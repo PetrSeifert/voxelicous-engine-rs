@@ -10,7 +10,7 @@ use tracing_subscriber::EnvFilter;
 use voxelicous_gpu::GpuContextBuilder;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
-use winit::event::WindowEvent;
+use winit::event::{DeviceEvent, DeviceId, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId};
 
@@ -181,6 +181,17 @@ impl<A: VoxelApp + 'static> ApplicationHandler for AppRunner<A> {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn device_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        device_id: DeviceId,
+        event: DeviceEvent,
+    ) {
+        if let Some(state) = &mut self.state {
+            state.app.on_device_event(device_id, &event);
         }
     }
 
