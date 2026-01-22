@@ -266,7 +266,8 @@ impl VoxelApp for Viewer {
                 }
             }
 
-            // Rebuild chunk info buffer with frustum culling and distance sorting
+            // Rebuild chunk info buffer with distance sorting (no frustum culling)
+            // This prevents pop-in during fast camera rotation
             let frustum = camera.frustum();
             if let Err(e) = world_renderer.rebuild_chunk_info_buffer_culled(
                 &mut allocator,
@@ -426,6 +427,12 @@ impl VoxelApp for Viewer {
         {
             let mut allocator = ctx.gpu.allocator().lock();
 
+            // Process deferred deletions from previous frames
+            // This frees buffers that are guaranteed to no longer be in use by the GPU
+            if let Err(e) = self.world_renderer.process_deferred_deletions(&mut allocator) {
+                error!("Failed to process deferred deletions: {}", e);
+            }
+
             // Upload new chunks (limited per frame)
             let upload_count = self.pending_uploads.len().min(MAX_UPLOADS_PER_FRAME);
             let uploads: Vec<_> = self.pending_uploads.drain(..upload_count).collect();
@@ -460,7 +467,8 @@ impl VoxelApp for Viewer {
                 }
             }
 
-            // Rebuild chunk info buffer with frustum culling and distance sorting
+            // Rebuild chunk info buffer with distance sorting (no frustum culling)
+            // This prevents pop-in during fast camera rotation
             let frustum = self.camera.frustum();
             if let Err(e) = self.world_renderer.rebuild_chunk_info_buffer_culled(
                 &mut allocator,
@@ -605,6 +613,9 @@ impl VoxelApp for Viewer {
             self.should_exit = true;
         }
 
+        // Advance frame counter for deferred deletion tracking
+        self.world_renderer.advance_frame();
+
         Ok(())
     }
 
@@ -642,7 +653,17 @@ impl VoxelApp for Viewer {
     }
 
     fn cleanup(&mut self, ctx: &mut AppContext) {
+        // Wait for GPU to finish before cleanup to ensure all pending work completes
+        if let Err(e) = ctx.gpu.wait_idle() {
+            error!("Failed to wait for GPU idle during cleanup: {e}");
+        }
+
         let mut allocator = ctx.gpu.allocator().lock();
+
+        // Flush any pending deletions before destroying (GPU is now idle)
+        if let Err(e) = self.world_renderer.flush_pending_deletions(&mut allocator) {
+            error!("Failed to flush pending deletions: {e}");
+        }
 
         // Destroy world renderer (frees all chunk GPU resources)
         let world_renderer = std::mem::replace(&mut self.world_renderer, WorldRenderer::new(0));

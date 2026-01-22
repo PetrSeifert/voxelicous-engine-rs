@@ -3,7 +3,7 @@
 Voxelicous Engine is a Rust + Vulkan voxel game engine using **pure voxel ray tracing** - rays traverse SVO-DAG (Sparse Voxel Octree - Directed Acyclic Graph) directly with no mesh generation. Supports Windows, Linux, and macOS.
 
 **Rendering Paths:**
-- **Hardware Ray Tracing**: RTX GPUs via `VK_KHR_ray_tracing_pipeline` (10-100x faster)
+- **Hardware Ray Tracing**: RTX GPUs via `VK_KHR_ray_tracing_pipeline`
 - **Compute Ray Marching**: Fallback for all Vulkan 1.3 GPUs
 
 ## Build Commands
