@@ -24,11 +24,11 @@ pub struct RayMarchPipeline {
     descriptor_set_layout: vk::DescriptorSetLayout,
     /// Descriptor pool.
     descriptor_pool: DescriptorPool,
-    /// Allocated descriptor set.
-    descriptor_set: vk::DescriptorSet,
+    /// Per-frame allocated descriptor sets.
+    descriptor_sets: Vec<vk::DescriptorSet>,
 
-    /// Camera uniform buffer.
-    camera_buffer: GpuBuffer,
+    /// Per-frame camera uniform buffers.
+    camera_buffers: Vec<GpuBuffer>,
     /// Output storage image.
     output_image: GpuImage,
     /// Image view for the output image.
@@ -36,6 +36,9 @@ pub struct RayMarchPipeline {
     /// Readback buffer for CPU access.
     readback_buffer: GpuBuffer,
 
+    /// Number of frames in flight.
+    #[allow(dead_code)]
+    frames_in_flight: usize,
     /// Output width in pixels.
     width: u32,
     /// Output height in pixels.
@@ -50,6 +53,7 @@ impl RayMarchPipeline {
     /// * `allocator` - GPU memory allocator
     /// * `width` - Output image width
     /// * `height` - Output image height
+    /// * `frames_in_flight` - Number of frames that can be in flight simultaneously
     ///
     /// # Safety
     /// The device must be valid and support compute shaders.
@@ -58,6 +62,7 @@ impl RayMarchPipeline {
         allocator: &mut GpuAllocator,
         width: u32,
         height: u32,
+        frames_in_flight: usize,
     ) -> Result<Self> {
         // 1. Create descriptor set layout
         // Binding 0: Camera uniform buffer
@@ -82,13 +87,17 @@ impl RayMarchPipeline {
             &[push_constant_range],
         )?;
 
-        // 4. Create camera uniform buffer
-        let camera_buffer = allocator.create_buffer(
-            std::mem::size_of::<CameraUniforms>() as u64,
-            vk::BufferUsageFlags::UNIFORM_BUFFER,
-            MemoryLocation::CpuToGpu,
-            "camera_uniforms",
-        )?;
+        // 4. Create per-frame camera uniform buffers
+        let mut camera_buffers = Vec::with_capacity(frames_in_flight);
+        for i in 0..frames_in_flight {
+            let buffer = allocator.create_buffer(
+                std::mem::size_of::<CameraUniforms>() as u64,
+                vk::BufferUsageFlags::UNIFORM_BUFFER,
+                MemoryLocation::CpuToGpu,
+                &format!("camera_uniforms_{i}"),
+            )?;
+            camera_buffers.push(buffer);
+        }
 
         // 5. Create output storage image
         let image_info = vk::ImageCreateInfo::default()
@@ -134,56 +143,61 @@ impl RayMarchPipeline {
             "ray_march_readback",
         )?;
 
-        // 8. Create descriptor pool
+        // 8. Create descriptor pool (one set per frame in flight)
         let pool_sizes = [
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::UNIFORM_BUFFER)
-                .descriptor_count(1),
+                .descriptor_count(frames_in_flight as u32),
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_IMAGE)
-                .descriptor_count(1),
+                .descriptor_count(frames_in_flight as u32),
         ];
 
-        let descriptor_pool = DescriptorPool::new(device, 1, &pool_sizes)?;
+        let descriptor_pool = DescriptorPool::new(device, frames_in_flight as u32, &pool_sizes)?;
 
-        // 9. Allocate descriptor set
-        let descriptor_sets = descriptor_pool.allocate(device, &[descriptor_set_layout])?;
-        let descriptor_set = descriptor_sets[0];
+        // 9. Allocate per-frame descriptor sets
+        let layouts: Vec<_> = (0..frames_in_flight)
+            .map(|_| descriptor_set_layout)
+            .collect();
+        let descriptor_sets = descriptor_pool.allocate(device, &layouts)?;
 
-        // 10. Write descriptor set
-        let buffer_info = vk::DescriptorBufferInfo::default()
-            .buffer(camera_buffer.buffer)
-            .offset(0)
-            .range(std::mem::size_of::<CameraUniforms>() as u64);
-
+        // 10. Write per-frame descriptor sets
         let image_info_desc = vk::DescriptorImageInfo::default()
             .image_view(output_image_view)
             .image_layout(vk::ImageLayout::GENERAL);
 
-        let writes = [
-            vk::WriteDescriptorSet::default()
-                .dst_set(descriptor_set)
-                .dst_binding(0)
-                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-                .buffer_info(std::slice::from_ref(&buffer_info)),
-            vk::WriteDescriptorSet::default()
-                .dst_set(descriptor_set)
-                .dst_binding(1)
-                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-                .image_info(std::slice::from_ref(&image_info_desc)),
-        ];
+        for (i, &descriptor_set) in descriptor_sets.iter().enumerate() {
+            let buffer_info = vk::DescriptorBufferInfo::default()
+                .buffer(camera_buffers[i].buffer)
+                .offset(0)
+                .range(std::mem::size_of::<CameraUniforms>() as u64);
 
-        device.update_descriptor_sets(&writes, &[]);
+            let writes = [
+                vk::WriteDescriptorSet::default()
+                    .dst_set(descriptor_set)
+                    .dst_binding(0)
+                    .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                    .buffer_info(std::slice::from_ref(&buffer_info)),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(descriptor_set)
+                    .dst_binding(1)
+                    .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                    .image_info(std::slice::from_ref(&image_info_desc)),
+            ];
+
+            device.update_descriptor_sets(&writes, &[]);
+        }
 
         Ok(Self {
             pipeline,
             descriptor_set_layout,
             descriptor_pool,
-            descriptor_set,
-            camera_buffer,
+            descriptor_sets,
+            camera_buffers,
             output_image,
             output_image_view,
             readback_buffer,
+            frames_in_flight,
             width,
             height,
         })
@@ -197,6 +211,7 @@ impl RayMarchPipeline {
     /// * `camera` - Camera uniforms to use
     /// * `svo` - GPU-resident SVO-DAG to render
     /// * `max_steps` - Maximum ray traversal steps
+    /// * `frame_index` - Current frame index in the ring buffer
     ///
     /// # Safety
     /// The command buffer must be in recording state.
@@ -207,9 +222,10 @@ impl RayMarchPipeline {
         camera: &CameraUniforms,
         svo: &GpuSvoDag,
         max_steps: u32,
+        frame_index: usize,
     ) -> Result<()> {
-        // Update camera buffer
-        self.camera_buffer.write(std::slice::from_ref(camera))?;
+        // Update this frame's camera buffer
+        self.camera_buffers[frame_index].write(std::slice::from_ref(camera))?;
 
         // Transition output image to GENERAL layout for compute shader
         let barrier = vk::ImageMemoryBarrier2::default()
@@ -233,14 +249,14 @@ impl RayMarchPipeline {
 
         device.cmd_pipeline_barrier2(cmd, &dependency_info);
 
-        // Bind pipeline and descriptors
+        // Bind pipeline and this frame's descriptor set
         device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.pipeline.pipeline);
         device.cmd_bind_descriptor_sets(
             cmd,
             vk::PipelineBindPoint::COMPUTE,
             self.pipeline.layout,
             0,
-            &[self.descriptor_set],
+            &[self.descriptor_sets[frame_index]],
             &[],
         );
 
@@ -406,7 +422,10 @@ impl RayMarchPipeline {
     ) -> Result<()> {
         device.destroy_image_view(self.output_image_view, None);
         allocator.free_image(&mut self.output_image)?;
-        allocator.free_buffer(&mut self.camera_buffer)?;
+        // Free all per-frame camera buffers
+        for camera_buffer in &mut self.camera_buffers {
+            allocator.free_buffer(camera_buffer)?;
+        }
         allocator.free_buffer(&mut self.readback_buffer)?;
         self.descriptor_pool.destroy(device);
         device.destroy_descriptor_set_layout(self.descriptor_set_layout, None);

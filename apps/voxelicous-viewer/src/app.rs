@@ -181,16 +181,23 @@ impl VoxelApp for Viewer {
             max_compress_per_update: streaming_params.max_gen_per_frame,
         };
 
-        // Create world with streaming
-        let mut world = World::with_config(terrain_config, streaming_config, 1024);
+        // Create world with async streaming for non-blocking chunk generation
+        let mut world = World::with_async_streaming(terrain_config, streaming_config, 1024);
 
-        // Create world renderer
-        let mut world_renderer = WorldRenderer::new(DEFAULT_MAX_GPU_CHUNKS);
+        // Create world renderer with frames_in_flight for per-frame buffers
+        let frames_in_flight = ctx.frames_in_flight();
+        let mut world_renderer = WorldRenderer::new(DEFAULT_MAX_GPU_CHUNKS, frames_in_flight);
 
-        // Create rendering pipeline
+        // Create rendering pipeline with frames_in_flight for per-frame buffers
         let pipeline = unsafe {
             let mut allocator = ctx.gpu.allocator().lock();
-            WorldRayMarchPipeline::new(ctx.gpu.device(), &mut allocator, ctx.width(), ctx.height())?
+            WorldRayMarchPipeline::new(
+                ctx.gpu.device(),
+                &mut allocator,
+                ctx.width(),
+                ctx.height(),
+                frames_in_flight,
+            )?
         };
 
         info!("World ray march pipeline created");
@@ -256,25 +263,35 @@ impl VoxelApp for Viewer {
         // Upload initial chunks to GPU
         {
             let mut allocator = ctx.gpu.allocator().lock();
+            // Use frame_number 0 for initial upload
+            let initial_frame_number = 0u64;
             for pos in &pending_uploads {
                 if let Some(dag) = get_chunk_dag(&world, *pos) {
-                    if let Err(e) =
-                        world_renderer.upload_chunk(&mut allocator, ctx.gpu.device(), *pos, &dag)
-                    {
+                    if let Err(e) = world_renderer.upload_chunk(
+                        &mut allocator,
+                        ctx.gpu.device(),
+                        *pos,
+                        &dag,
+                        initial_frame_number,
+                    ) {
                         error!("Failed to upload chunk {:?}: {}", pos, e);
                     }
                 }
             }
 
-            // Rebuild chunk info buffer with frustum culling and distance sorting
+            // Rebuild chunk info buffer for all frames with frustum culling and distance sorting
             let frustum = camera.frustum();
-            if let Err(e) = world_renderer.rebuild_chunk_info_buffer_culled(
-                &mut allocator,
-                ctx.gpu.device(),
-                &frustum,
-                camera.position,
-            ) {
-                error!("Failed to rebuild chunk info buffer: {}", e);
+            for frame_idx in 0..frames_in_flight {
+                if let Err(e) = world_renderer.rebuild_chunk_info_buffer_culled(
+                    &mut allocator,
+                    ctx.gpu.device(),
+                    &frustum,
+                    camera.position,
+                    frame_idx,
+                    initial_frame_number,
+                ) {
+                    error!("Failed to rebuild chunk info buffer: {}", e);
+                }
             }
         }
 
@@ -379,8 +396,8 @@ impl VoxelApp for Viewer {
         // End input frame (must be called at end of update)
         self.input.end_frame();
 
-        // Update world streaming based on camera position
-        let (needs_upload, unloaded) = self.world.update(self.camera.position);
+        // Update world streaming based on camera position (non-blocking)
+        let (needs_upload, unloaded) = self.world.update_async(self.camera.position);
 
         // Store pending operations for render phase
         self.pending_uploads.extend(needs_upload);
@@ -405,7 +422,7 @@ impl VoxelApp for Viewer {
                 pending_uploads: self.pending_uploads.len() as u32,
                 pending_unloads: self.pending_unloads.len() as u32,
                 load_queue_length: self.world.pending_load_count() as u32,
-                chunks_generating: 0, // Not tracked separately currently
+                chunks_generating: self.world.in_flight_count() as u32,
                 total_chunks: self.world.chunk_count() as u32,
                 gpu_chunks: self.world_renderer.chunk_count() as u32,
             };
@@ -417,6 +434,8 @@ impl VoxelApp for Viewer {
         let device = ctx.gpu.device();
         let cmd = frame.command_buffer;
         let camera_uniforms = self.camera.uniforms();
+        let frame_index = frame.frame_index;
+        let frame_number = frame.frame_number;
 
         // Process pending GPU operations before rendering
         // Limit uploads/unloads per frame to balance performance vs responsiveness
@@ -425,6 +444,14 @@ impl VoxelApp for Viewer {
 
         {
             let mut allocator = ctx.gpu.allocator().lock();
+
+            // Process deferred deletions from previous frames
+            if let Err(e) = self
+                .world_renderer
+                .process_deferred_deletions(&mut allocator, frame_number)
+            {
+                error!("Failed to process deferred deletions: {}", e);
+            }
 
             // Upload new chunks (limited per frame)
             let upload_count = self.pending_uploads.len().min(MAX_UPLOADS_PER_FRAME);
@@ -435,10 +462,13 @@ impl VoxelApp for Viewer {
                     if let Some(dag) = get_chunk_dag(&self.world, pos) {
                         #[cfg(feature = "profiling")]
                         profile_scope!(EventCategory::GpuUpload, [pos.x, pos.y, pos.z]);
-                        if let Err(e) =
-                            self.world_renderer
-                                .upload_chunk(&mut allocator, device, pos, &dag)
-                        {
+                        if let Err(e) = self.world_renderer.upload_chunk(
+                            &mut allocator,
+                            device,
+                            pos,
+                            &dag,
+                            frame_number,
+                        ) {
                             error!("Failed to upload chunk {:?}: {}", pos, e);
                         }
                     }
@@ -452,12 +482,7 @@ impl VoxelApp for Viewer {
             for pos in unloads {
                 #[cfg(feature = "profiling")]
                 profile_scope!(EventCategory::GpuUnload, [pos.x, pos.y, pos.z]);
-                if let Err(e) = self
-                    .world_renderer
-                    .remove_chunk(&mut allocator, device, pos)
-                {
-                    error!("Failed to remove chunk {:?}: {}", pos, e);
-                }
+                self.world_renderer.remove_chunk(pos, frame_number);
             }
 
             // Rebuild chunk info buffer with frustum culling and distance sorting
@@ -467,6 +492,8 @@ impl VoxelApp for Viewer {
                 device,
                 &frustum,
                 self.camera.position,
+                frame_index,
+                frame_number,
             ) {
                 error!("Failed to rebuild chunk info buffer: {}", e);
             }
@@ -482,6 +509,7 @@ impl VoxelApp for Viewer {
                 &camera_uniforms,
                 &self.world_renderer,
                 MAX_STEPS,
+                frame_index,
             )?;
 
             // Transition output image for transfer
@@ -618,9 +646,14 @@ impl VoxelApp for Viewer {
                 old_pipeline.destroy(ctx.gpu.device(), &mut allocator)?;
             }
 
-            // Create new pipeline
-            let new_pipeline =
-                WorldRayMarchPipeline::new(ctx.gpu.device(), &mut allocator, width, height)?;
+            // Create new pipeline with frames_in_flight
+            let new_pipeline = WorldRayMarchPipeline::new(
+                ctx.gpu.device(),
+                &mut allocator,
+                width,
+                height,
+                ctx.frames_in_flight(),
+            )?;
             self.pipeline = Some(new_pipeline);
         }
 
@@ -645,7 +678,9 @@ impl VoxelApp for Viewer {
         let mut allocator = ctx.gpu.allocator().lock();
 
         // Destroy world renderer (frees all chunk GPU resources)
-        let world_renderer = std::mem::replace(&mut self.world_renderer, WorldRenderer::new(0));
+        // Replace with a dummy renderer (will never be used)
+        let world_renderer =
+            std::mem::replace(&mut self.world_renderer, WorldRenderer::new(0, 1));
         if let Err(e) = world_renderer.destroy(&mut allocator) {
             error!("Failed to destroy world renderer: {e}");
         }

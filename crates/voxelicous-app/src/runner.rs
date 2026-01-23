@@ -270,7 +270,6 @@ impl<A: VoxelApp> AppState<A> {
             self.min_fps = self.min_fps.min(fps);
             self.max_fps = self.max_fps.max(fps);
             self.fps_sum += fps;
-            info!("FPS: {:.1}", fps);
             fps as f32
         } else {
             0.0
@@ -332,6 +331,7 @@ impl<A: VoxelApp> AppState<A> {
                     self.ctx.swapchain.images[image_index as usize],
                     dt,
                     self.ctx.frame_count,
+                    self.ctx.current_frame_index,
                 );
 
                 // Render the frame

@@ -9,6 +9,7 @@ use hashbrown::HashMap;
 use voxelicous_core::constants::CHUNK_SIZE;
 use voxelicous_core::coords::ChunkPos;
 use voxelicous_core::math::{Aabb, Frustum};
+use voxelicous_gpu::deferred::DeferredDeletionQueue;
 use voxelicous_gpu::error::Result;
 use voxelicous_gpu::memory::{GpuAllocator, GpuBuffer};
 use voxelicous_voxel::{SvoDag, VoxelStorage};
@@ -89,10 +90,17 @@ impl WorldRenderPushConstants {
 pub struct WorldRenderer {
     /// Per-chunk GPU data indexed by position.
     chunks: HashMap<ChunkPos, LoadedChunk>,
-    /// GPU buffer containing chunk info array for shader access.
-    chunk_info_buffer: Option<GpuBuffer>,
-    /// Device address of chunk info buffer.
-    chunk_info_address: vk::DeviceAddress,
+    /// Per-frame GPU buffers containing chunk info arrays for shader access.
+    chunk_info_buffers: Vec<Option<GpuBuffer>>,
+    /// Per-frame device addresses of chunk info buffers.
+    chunk_info_addresses: Vec<vk::DeviceAddress>,
+    /// Per-frame visible chunk counts after culling.
+    visible_chunk_counts: Vec<u32>,
+    /// Queue for deferred buffer deletions.
+    deferred_deletions: DeferredDeletionQueue,
+    /// Number of frames in flight.
+    #[allow(dead_code)]
+    frames_in_flight: usize,
     /// Maximum chunks to keep on GPU.
     #[allow(dead_code)]
     max_gpu_chunks: usize,
@@ -102,11 +110,18 @@ pub struct WorldRenderer {
 
 impl WorldRenderer {
     /// Create a new world renderer.
-    pub fn new(max_gpu_chunks: usize) -> Self {
+    ///
+    /// # Arguments
+    /// * `max_gpu_chunks` - Maximum number of chunks to keep on GPU.
+    /// * `frames_in_flight` - Number of frames that can be in flight simultaneously.
+    pub fn new(max_gpu_chunks: usize, frames_in_flight: usize) -> Self {
         Self {
             chunks: HashMap::with_capacity(max_gpu_chunks),
-            chunk_info_buffer: None,
-            chunk_info_address: 0,
+            chunk_info_buffers: (0..frames_in_flight).map(|_| None).collect(),
+            chunk_info_addresses: vec![0; frames_in_flight],
+            visible_chunk_counts: vec![0; frames_in_flight],
+            deferred_deletions: DeferredDeletionQueue::new(frames_in_flight),
+            frames_in_flight,
             max_gpu_chunks,
             dirty: true,
         }
@@ -114,36 +129,37 @@ impl WorldRenderer {
 
     /// Upload a chunk's DAG to the GPU.
     ///
-    /// If a chunk already exists at this position, waits for GPU idle before replacing.
+    /// If a chunk already exists at this position, the old buffer is queued for deferred deletion.
     /// Returns `Ok(true)` if the chunk was uploaded, `Ok(false)` if skipped (empty/air-only).
+    ///
+    /// # Arguments
+    /// * `allocator` - GPU allocator for creating buffers.
+    /// * `device` - Vulkan device handle.
+    /// * `pos` - Chunk position.
+    /// * `dag` - The SVO-DAG to upload.
+    /// * `frame_number` - Current frame number for deferred deletion tracking.
     pub fn upload_chunk(
         &mut self,
         allocator: &mut GpuAllocator,
         device: &ash::Device,
         pos: ChunkPos,
         dag: &SvoDag,
+        frame_number: u64,
     ) -> Result<bool> {
         // Skip empty (air-only) chunks - no point uploading them
         if dag.is_empty() {
             // Still remove old chunk if it existed (chunk might have been cleared)
             if let Some(old) = self.chunks.remove(&pos) {
-                unsafe {
-                    let _ = device.device_wait_idle();
-                }
-                let mut buffer = old.gpu_dag.node_buffer;
-                allocator.free_buffer(&mut buffer)?;
+                // Queue old buffer for deferred deletion
+                self.deferred_deletions.queue(old.gpu_dag.node_buffer, frame_number);
                 self.dirty = true;
             }
             return Ok(false);
         }
 
-        // Remove old chunk if it exists (wait for GPU first)
+        // Remove old chunk if it exists - queue for deferred deletion
         if let Some(old) = self.chunks.remove(&pos) {
-            unsafe {
-                let _ = device.device_wait_idle();
-            }
-            let mut buffer = old.gpu_dag.node_buffer;
-            allocator.free_buffer(&mut buffer)?;
+            self.deferred_deletions.queue(old.gpu_dag.node_buffer, frame_number);
         }
 
         // Upload new chunk
@@ -158,21 +174,16 @@ impl WorldRenderer {
 
     /// Remove a chunk from GPU memory.
     ///
-    /// Waits for GPU idle before freeing to ensure buffer is not in use.
-    pub fn remove_chunk(
-        &mut self,
-        allocator: &mut GpuAllocator,
-        device: &ash::Device,
-        pos: ChunkPos,
-    ) -> Result<()> {
-        if let Some(mut loaded) = self.chunks.remove(&pos) {
-            unsafe {
-                let _ = device.device_wait_idle();
-            }
-            allocator.free_buffer(&mut loaded.gpu_dag.node_buffer)?;
+    /// The buffer is queued for deferred deletion rather than freed immediately.
+    ///
+    /// # Arguments
+    /// * `pos` - Chunk position to remove.
+    /// * `frame_number` - Current frame number for deferred deletion tracking.
+    pub fn remove_chunk(&mut self, pos: ChunkPos, frame_number: u64) {
+        if let Some(loaded) = self.chunks.remove(&pos) {
+            self.deferred_deletions.queue(loaded.gpu_dag.node_buffer, frame_number);
             self.dirty = true;
         }
-        Ok(())
     }
 
     /// Check if a chunk is loaded on GPU.
@@ -188,41 +199,44 @@ impl WorldRenderer {
     /// Get total GPU memory usage in bytes.
     pub fn gpu_memory_usage(&self) -> u64 {
         let dag_memory: u64 = self.chunks.values().map(|c| c.gpu_dag.buffer_size()).sum();
-        let info_memory = self.chunk_info_buffer.as_ref().map_or(0, |b| b.size);
+        let info_memory: u64 = self
+            .chunk_info_buffers
+            .iter()
+            .filter_map(|b| b.as_ref())
+            .map(|b| b.size)
+            .sum();
         dag_memory + info_memory
     }
 
-    /// Rebuild the chunk info buffer for shader access.
+    /// Rebuild the chunk info buffer for shader access (non-culled version).
     ///
+    /// Creates a per-frame buffer containing all chunks without frustum culling.
     /// Call this before rendering if chunks have changed.
     ///
-    /// # Safety
-    /// This function waits for the GPU to be idle before freeing the old buffer
-    /// to ensure it's not in use. This may impact performance.
+    /// # Arguments
+    /// * `allocator` - GPU allocator for creating buffers.
+    /// * `device` - Vulkan device handle.
+    /// * `frame_index` - Current frame index in the ring buffer.
+    /// * `frame_number` - Current frame number for deferred deletion tracking.
     pub fn rebuild_chunk_info_buffer(
         &mut self,
         allocator: &mut GpuAllocator,
         device: &ash::Device,
+        frame_index: usize,
+        frame_number: u64,
     ) -> Result<()> {
         if !self.dirty {
             return Ok(());
         }
 
-        // Wait for GPU to finish before freeing old buffer
-        // This prevents accessing freed memory from previous frames
-        if self.chunk_info_buffer.is_some() {
-            unsafe {
-                let _ = device.device_wait_idle();
-            }
-        }
-
-        // Free old buffer (now safe since GPU is idle)
-        if let Some(mut old_buffer) = self.chunk_info_buffer.take() {
-            allocator.free_buffer(&mut old_buffer)?;
+        // Queue old buffer for deferred deletion if it exists
+        if let Some(old_buffer) = self.chunk_info_buffers[frame_index].take() {
+            self.deferred_deletions.queue(old_buffer, frame_number);
         }
 
         if self.chunks.is_empty() {
-            self.chunk_info_address = 0;
+            self.chunk_info_addresses[frame_index] = 0;
+            self.visible_chunk_counts[frame_index] = 0;
             self.dirty = false;
             return Ok(());
         }
@@ -246,8 +260,9 @@ impl WorldRenderer {
         chunk_info_buffer.write::<u8>(bytemuck::cast_slice(&infos))?;
 
         // Get device address
-        self.chunk_info_address = chunk_info_buffer.device_address(device);
-        self.chunk_info_buffer = Some(chunk_info_buffer);
+        self.chunk_info_addresses[frame_index] = chunk_info_buffer.device_address(device);
+        self.visible_chunk_counts[frame_index] = infos.len() as u32;
+        self.chunk_info_buffers[frame_index] = Some(chunk_info_buffer);
         self.dirty = false;
 
         Ok(())
@@ -262,30 +277,30 @@ impl WorldRenderer {
     /// The front-to-back ordering improves early termination in the shader
     /// since closer chunks set `closest.t` first.
     ///
-    /// # Safety
-    /// This function waits for the GPU to be idle before freeing the old buffer.
+    /// # Arguments
+    /// * `allocator` - GPU allocator for creating buffers.
+    /// * `device` - Vulkan device handle.
+    /// * `frustum` - Camera frustum for culling.
+    /// * `camera_pos` - Camera position for distance sorting.
+    /// * `frame_index` - Current frame index in the ring buffer.
+    /// * `frame_number` - Current frame number for deferred deletion tracking.
     pub fn rebuild_chunk_info_buffer_culled(
         &mut self,
         allocator: &mut GpuAllocator,
         device: &ash::Device,
         frustum: &Frustum,
         camera_pos: Vec3,
+        frame_index: usize,
+        frame_number: u64,
     ) -> Result<()> {
-        // Always rebuild when using culling since visibility changes with camera
-        // Wait for GPU to finish before freeing old buffer
-        if self.chunk_info_buffer.is_some() {
-            unsafe {
-                let _ = device.device_wait_idle();
-            }
-        }
-
-        // Free old buffer
-        if let Some(mut old_buffer) = self.chunk_info_buffer.take() {
-            allocator.free_buffer(&mut old_buffer)?;
+        // Queue old buffer for deferred deletion if it exists
+        if let Some(old_buffer) = self.chunk_info_buffers[frame_index].take() {
+            self.deferred_deletions.queue(old_buffer, frame_number);
         }
 
         if self.chunks.is_empty() {
-            self.chunk_info_address = 0;
+            self.chunk_info_addresses[frame_index] = 0;
+            self.visible_chunk_counts[frame_index] = 0;
             self.dirty = false;
             return Ok(());
         }
@@ -322,7 +337,8 @@ impl WorldRenderer {
         visible_chunks.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
 
         if visible_chunks.is_empty() {
-            self.chunk_info_address = 0;
+            self.chunk_info_addresses[frame_index] = 0;
+            self.visible_chunk_counts[frame_index] = 0;
             self.dirty = false;
             return Ok(());
         }
@@ -349,39 +365,46 @@ impl WorldRenderer {
         chunk_info_buffer.write::<u8>(bytemuck::cast_slice(&infos))?;
 
         // Get device address
-        self.chunk_info_address = chunk_info_buffer.device_address(device);
-        self.chunk_info_buffer = Some(chunk_info_buffer);
+        self.chunk_info_addresses[frame_index] = chunk_info_buffer.device_address(device);
+        self.visible_chunk_counts[frame_index] = infos.len() as u32;
+        self.chunk_info_buffers[frame_index] = Some(chunk_info_buffer);
         self.dirty = false;
 
         Ok(())
     }
 
-    /// Get the number of visible chunks after culling.
+    /// Get the number of visible chunks after culling for a specific frame.
     ///
-    /// Returns the count from the last `rebuild_chunk_info_buffer_culled` call.
-    pub fn visible_chunk_count(&self) -> u32 {
-        self.chunk_info_buffer
-            .as_ref()
-            .map_or(0, |b| (b.size / GpuChunkInfo::SIZE as u64) as u32)
+    /// Returns the count from the last `rebuild_chunk_info_buffer_culled` call for this frame.
+    ///
+    /// # Arguments
+    /// * `frame_index` - Frame index to query.
+    pub fn visible_chunk_count(&self, frame_index: usize) -> u32 {
+        self.visible_chunk_counts[frame_index]
     }
 
     /// Get push constants for rendering.
     ///
     /// The chunk count reflects the number of visible chunks after culling
     /// (if `rebuild_chunk_info_buffer_culled` was used).
+    ///
+    /// # Arguments
+    /// * `screen_width` - Screen width in pixels.
+    /// * `screen_height` - Screen height in pixels.
+    /// * `max_steps` - Maximum ray traversal steps per chunk.
+    /// * `frame_index` - Current frame index in the ring buffer.
     pub fn push_constants(
         &self,
         screen_width: u32,
         screen_height: u32,
         max_steps: u32,
+        frame_index: usize,
     ) -> WorldRenderPushConstants {
-        // Use actual buffer count (accounts for culling) rather than total loaded chunks
-        let chunk_count = self.visible_chunk_count();
         WorldRenderPushConstants {
             screen_size: [screen_width, screen_height],
             max_steps,
-            chunk_count,
-            chunk_info_address: self.chunk_info_address,
+            chunk_count: self.visible_chunk_counts[frame_index],
+            chunk_info_address: self.chunk_info_addresses[frame_index],
         }
     }
 
@@ -395,11 +418,33 @@ impl WorldRenderer {
         self.chunks.keys().copied().collect()
     }
 
+    /// Process deferred deletions.
+    ///
+    /// Call this at the start of each frame to free resources from completed frames.
+    ///
+    /// # Arguments
+    /// * `allocator` - GPU allocator for freeing buffers.
+    /// * `frame_number` - Current frame number.
+    pub fn process_deferred_deletions(
+        &mut self,
+        allocator: &mut GpuAllocator,
+        frame_number: u64,
+    ) -> Result<()> {
+        self.deferred_deletions.process(allocator, frame_number)
+    }
+
     /// Destroy all GPU resources.
+    ///
+    /// Call this after `device_wait_idle()` to ensure all resources are freed safely.
     pub fn destroy(mut self, allocator: &mut GpuAllocator) -> Result<()> {
-        // Free chunk info buffer
-        if let Some(mut buffer) = self.chunk_info_buffer.take() {
-            allocator.free_buffer(&mut buffer)?;
+        // Flush all pending deferred deletions
+        self.deferred_deletions.flush(allocator)?;
+
+        // Free all per-frame chunk info buffers
+        for buffer_opt in &mut self.chunk_info_buffers {
+            if let Some(mut buffer) = buffer_opt.take() {
+                allocator.free_buffer(&mut buffer)?;
+            }
         }
 
         // Free all chunk DAG buffers

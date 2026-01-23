@@ -10,6 +10,7 @@
 pub mod capabilities;
 pub mod command;
 pub mod context;
+pub mod deferred;
 pub mod descriptors;
 pub mod error;
 pub mod instance;
@@ -21,6 +22,7 @@ pub mod sync;
 
 pub use capabilities::{GpuCapabilities, GpuVendor, RayTracingCapabilities};
 pub use context::{GpuContext, GpuContextBuilder};
+pub use deferred::DeferredDeletionQueue;
 pub use descriptors::{
     write_storage_buffer, write_storage_image, write_uniform_buffer, DescriptorPool,
     DescriptorSetLayoutBuilder,

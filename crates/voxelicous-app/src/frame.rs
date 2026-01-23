@@ -16,6 +16,8 @@ pub struct FrameContext {
     pub dt: f32,
     /// Current frame number.
     pub frame_number: u64,
+    /// Index of the current frame in the ring buffer (0..frames_in_flight).
+    pub frame_index: usize,
 }
 
 impl FrameContext {
@@ -26,6 +28,7 @@ impl FrameContext {
         swapchain_image: vk::Image,
         dt: f32,
         frame_number: u64,
+        frame_index: usize,
     ) -> Self {
         Self {
             command_buffer,
@@ -33,6 +36,7 @@ impl FrameContext {
             swapchain_image,
             dt,
             frame_number,
+            frame_index,
         }
     }
 }

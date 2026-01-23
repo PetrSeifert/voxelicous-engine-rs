@@ -67,6 +67,21 @@ impl Chunk {
         }
     }
 
+    /// Create a chunk with an existing DAG (skips SVO stage).
+    ///
+    /// This is used for async chunk generation where the worker thread
+    /// handles both generation and compression.
+    pub fn with_dag(pos: ChunkPos, dag: SvoDag) -> Self {
+        Self {
+            pos,
+            state: ChunkState::Compressed,
+            svo: None,
+            dag: Some(dag),
+            last_access_frame: 0,
+            dirty: true,
+        }
+    }
+
     /// Check if this chunk is empty (all air).
     pub fn is_empty(&self) -> bool {
         match (&self.svo, &self.dag) {
@@ -125,6 +140,17 @@ mod tests {
         let svo = SparseVoxelOctree::new(OCTREE_DEPTH);
         let chunk = Chunk::with_svo(ChunkPos::new(0, 0, 0), svo);
         assert_eq!(chunk.state, ChunkState::Generated);
+    }
+
+    #[test]
+    fn chunk_with_dag_is_compressed() {
+        let svo = SparseVoxelOctree::new(OCTREE_DEPTH);
+        let dag = SvoDag::from_svo(&svo);
+        let chunk = Chunk::with_dag(ChunkPos::new(0, 0, 0), dag);
+        assert_eq!(chunk.state, ChunkState::Compressed);
+        assert!(chunk.svo.is_none());
+        assert!(chunk.dag.is_some());
+        assert!(chunk.dirty);
     }
 
     #[test]

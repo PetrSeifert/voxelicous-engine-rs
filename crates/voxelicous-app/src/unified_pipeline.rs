@@ -41,6 +41,7 @@ impl UnifiedPipeline {
         width: u32,
         height: u32,
         octree_depth: u32,
+        frames_in_flight: usize,
     ) -> anyhow::Result<(Self, RenderPath)> {
         let render_path = Self::select_render_path(gpu);
 
@@ -68,15 +69,17 @@ impl UnifiedPipeline {
                     "Hardware RT requested but nvidia feature not enabled, falling back to compute"
                 );
                 // SAFETY: Caller guarantees all handles are valid
-                let compute_pipeline =
-                    unsafe { RayMarchPipeline::new(gpu.device(), allocator, width, height)? };
+                let compute_pipeline = unsafe {
+                    RayMarchPipeline::new(gpu.device(), allocator, width, height, frames_in_flight)?
+                };
                 Self::Compute(compute_pipeline)
             }
             RenderPath::ComputeRayMarching => {
                 info!("Creating compute ray marching pipeline");
                 // SAFETY: Caller guarantees all handles are valid
-                let compute_pipeline =
-                    unsafe { RayMarchPipeline::new(gpu.device(), allocator, width, height)? };
+                let compute_pipeline = unsafe {
+                    RayMarchPipeline::new(gpu.device(), allocator, width, height, frames_in_flight)?
+                };
                 Self::Compute(compute_pipeline)
             }
         };
@@ -126,12 +129,13 @@ impl UnifiedPipeline {
         camera: &CameraUniforms,
         svo: &GpuSvoDag,
         max_steps: u32,
+        frame_index: usize,
     ) -> anyhow::Result<()> {
         match self {
             Self::Compute(pipeline) => {
                 // SAFETY: Caller guarantees command buffer is in recording state
                 unsafe {
-                    pipeline.record(gpu.device(), cmd, camera, svo, max_steps)?;
+                    pipeline.record(gpu.device(), cmd, camera, svo, max_steps, frame_index)?;
                 }
             }
             #[cfg(feature = "nvidia")]

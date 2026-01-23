@@ -10,6 +10,7 @@ use std::path::Path;
 
 use voxelicous_gpu::{GpuContext, GpuContextBuilder};
 use voxelicous_render::{Camera, CameraUniforms, GpuSvoDag, RayMarchPipeline};
+#[allow(unused_imports)]
 use voxelicous_voxel::{SparseVoxelOctree, SvoDag, VoxelStorage};
 
 use crate::{Result, TestError, VisualTestConfig};
@@ -76,10 +77,11 @@ impl HeadlessRenderer {
                 .map_err(|e| TestError::Gpu(format!("Failed to create fence: {e}")))?
         };
 
-        // Create ray march pipeline
+        // Create ray march pipeline (single frame in flight for testing)
         let mut allocator = context.allocator().lock();
+        let frames_in_flight = 1;
         let pipeline = unsafe {
-            RayMarchPipeline::new(device, &mut allocator, width, height)
+            RayMarchPipeline::new(device, &mut allocator, width, height, frames_in_flight)
                 .map_err(|e| TestError::Gpu(e.to_string()))?
         };
         drop(allocator);
@@ -138,9 +140,9 @@ impl HeadlessRenderer {
                 .begin_command_buffer(self.command_buffer, &begin_info)
                 .map_err(|e| TestError::Gpu(format!("Failed to begin command buffer: {e}")))?;
 
-            // Record ray march commands
+            // Record ray march commands (frame_index=0 for single frame testing)
             self.pipeline
-                .record(device, self.command_buffer, &camera_uniforms, &gpu_dag, 256)
+                .record(device, self.command_buffer, &camera_uniforms, &gpu_dag, 256, 0)
                 .map_err(|e| TestError::Gpu(e.to_string()))?;
 
             // Record readback commands

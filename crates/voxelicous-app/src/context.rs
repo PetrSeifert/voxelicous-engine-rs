@@ -147,6 +147,11 @@ impl AppContext {
         self.swapchain.extent.width as f32 / self.swapchain.extent.height as f32
     }
 
+    /// Get the number of frames in flight.
+    pub fn frames_in_flight(&self) -> usize {
+        self.frames.len()
+    }
+
     /// Recreate the swapchain (e.g., after resize).
     ///
     /// # Safety

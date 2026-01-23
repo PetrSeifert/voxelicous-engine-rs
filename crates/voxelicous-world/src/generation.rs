@@ -46,6 +46,7 @@ impl Default for TerrainConfig {
 }
 
 /// Procedural terrain generator using fractal noise.
+#[derive(Clone)]
 pub struct TerrainGenerator {
     config: TerrainConfig,
     height_noise: Fbm<Perlin>,
