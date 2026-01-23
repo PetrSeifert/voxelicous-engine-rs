@@ -142,7 +142,14 @@ impl HeadlessRenderer {
 
             // Record ray march commands (frame_index=0 for single frame testing)
             self.pipeline
-                .record(device, self.command_buffer, &camera_uniforms, &gpu_dag, 256, 0)
+                .record(
+                    device,
+                    self.command_buffer,
+                    &camera_uniforms,
+                    &gpu_dag,
+                    256,
+                    0,
+                )
                 .map_err(|e| TestError::Gpu(e.to_string()))?;
 
             // Record readback commands

@@ -2,6 +2,7 @@
 
 use crate::error::Result;
 use ash::vk;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Create a semaphore.
 ///
@@ -147,5 +148,115 @@ impl FrameSyncManager {
         for sync in &self.frame_syncs {
             sync.destroy(device);
         }
+    }
+}
+
+/// Timeline semaphore for GPU-GPU synchronization.
+///
+/// Timeline semaphores allow for more flexible synchronization than binary semaphores.
+/// They maintain an incrementing counter and can be waited on or signaled with specific values.
+/// This enables async upload patterns where transfers can complete in any order.
+pub struct TimelineSemaphore {
+    semaphore: vk::Semaphore,
+    current_value: AtomicU64,
+}
+
+impl TimelineSemaphore {
+    /// Create a new timeline semaphore with initial value 0.
+    ///
+    /// # Safety
+    /// The device must be valid.
+    pub unsafe fn new(device: &ash::Device) -> Result<Self> {
+        let mut type_info = vk::SemaphoreTypeCreateInfo::default()
+            .semaphore_type(vk::SemaphoreType::TIMELINE)
+            .initial_value(0);
+
+        let create_info = vk::SemaphoreCreateInfo::default().push_next(&mut type_info);
+
+        let semaphore = device.create_semaphore(&create_info, None)?;
+
+        Ok(Self {
+            semaphore,
+            current_value: AtomicU64::new(0),
+        })
+    }
+
+    /// Get the raw semaphore handle.
+    pub fn handle(&self) -> vk::Semaphore {
+        self.semaphore
+    }
+
+    /// Get the next value to signal and increment the internal counter.
+    ///
+    /// Call this to get the value to use when signaling this semaphore.
+    pub fn next_signal_value(&self) -> u64 {
+        self.current_value.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// Get the current counter value (last signaled value).
+    pub fn current_value(&self) -> u64 {
+        self.current_value.load(Ordering::SeqCst)
+    }
+
+    /// Check if a specific value has been completed (non-blocking).
+    ///
+    /// Returns `true` if the semaphore has reached at least the given value.
+    ///
+    /// # Safety
+    /// The device must be valid.
+    pub unsafe fn check_completed(&self, device: &ash::Device, value: u64) -> Result<bool> {
+        let counter_value = self.query_value(device)?;
+        Ok(counter_value >= value)
+    }
+
+    /// Query the current GPU-side semaphore counter value.
+    ///
+    /// # Safety
+    /// The device must be valid.
+    pub unsafe fn query_value(&self, device: &ash::Device) -> Result<u64> {
+        let value = device.get_semaphore_counter_value(self.semaphore)?;
+        Ok(value)
+    }
+
+    /// Wait for the semaphore to reach a specific value.
+    ///
+    /// # Arguments
+    /// * `device` - Vulkan device handle.
+    /// * `value` - Value to wait for.
+    /// * `timeout_ns` - Timeout in nanoseconds (u64::MAX for infinite).
+    ///
+    /// # Safety
+    /// The device must be valid.
+    pub unsafe fn wait(&self, device: &ash::Device, value: u64, timeout_ns: u64) -> Result<()> {
+        let semaphores = [self.semaphore];
+        let values = [value];
+
+        let wait_info = vk::SemaphoreWaitInfo::default()
+            .semaphores(&semaphores)
+            .values(&values);
+
+        device.wait_semaphores(&wait_info, timeout_ns)?;
+        Ok(())
+    }
+
+    /// Signal the semaphore to a specific value from the host.
+    ///
+    /// # Safety
+    /// The device must be valid. The value must be greater than the current value.
+    pub unsafe fn signal(&self, device: &ash::Device, value: u64) -> Result<()> {
+        let signal_info = vk::SemaphoreSignalInfo::default()
+            .semaphore(self.semaphore)
+            .value(value);
+
+        device.signal_semaphore(&signal_info)?;
+        Ok(())
+    }
+
+    /// Destroy the semaphore.
+    ///
+    /// # Safety
+    /// The device must be valid and the semaphore must not be in use.
+    pub unsafe fn destroy(&self, device: &ash::Device) {
+        device.destroy_semaphore(self.semaphore, None);
     }
 }

@@ -31,4 +31,4 @@ pub use error::{GpuError, Result};
 pub use memory::{GpuAllocator, GpuBuffer, GpuImage};
 pub use pipeline::{ComputePipeline, GraphicsPipeline, GraphicsPipelineConfig};
 pub use surface::{SurfaceCapabilities, SurfaceContext};
-pub use sync::{create_fence, create_semaphore, FrameSync, FrameSyncManager};
+pub use sync::{create_fence, create_semaphore, FrameSync, FrameSyncManager, TimelineSemaphore};

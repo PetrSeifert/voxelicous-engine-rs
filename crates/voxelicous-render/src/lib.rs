@@ -7,7 +7,9 @@
 //! - Post-processing effects
 //! - Camera and view management
 //! - Screenshot capture utilities
+//! - Async chunk upload manager for non-blocking transfers
 
+pub mod async_upload;
 pub mod camera;
 pub mod ray_march;
 pub mod ray_march_pipeline;
@@ -16,6 +18,7 @@ pub mod svo_upload;
 pub mod world_ray_march_pipeline;
 pub mod world_render;
 
+pub use async_upload::{AsyncUploadManager, CompletedUpload, PendingChunkUpload};
 pub use camera::{Camera, CameraUniforms};
 pub use ray_march::{Ray, RayHit, RayMarchConfig, RayMarchPushConstants};
 pub use ray_march_pipeline::RayMarchPipeline;

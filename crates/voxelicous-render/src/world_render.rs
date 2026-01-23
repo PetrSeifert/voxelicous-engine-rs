@@ -1,6 +1,7 @@
 //! Multi-chunk world rendering for procedural terrain.
 //!
 //! Manages GPU resources for rendering multiple SVO-DAG chunks simultaneously.
+//! Supports both synchronous and asynchronous chunk uploads.
 
 use ash::vk;
 use glam::Vec3;
@@ -14,6 +15,7 @@ use voxelicous_gpu::error::Result;
 use voxelicous_gpu::memory::{GpuAllocator, GpuBuffer};
 use voxelicous_voxel::{SvoDag, VoxelStorage};
 
+use crate::async_upload::AsyncUploadManager;
 use crate::GpuSvoDag;
 
 /// GPU-side information about a single chunk for shader access.
@@ -106,6 +108,8 @@ pub struct WorldRenderer {
     max_gpu_chunks: usize,
     /// Whether the chunk info buffer needs rebuilding.
     dirty: bool,
+    /// Async upload manager for non-blocking chunk transfers.
+    upload_manager: Option<AsyncUploadManager>,
 }
 
 impl WorldRenderer {
@@ -124,7 +128,153 @@ impl WorldRenderer {
             frames_in_flight,
             max_gpu_chunks,
             dirty: true,
+            upload_manager: None,
         }
+    }
+
+    /// Initialize async upload support.
+    ///
+    /// Must be called before using `queue_chunk_upload` and `process_completed_uploads`.
+    ///
+    /// # Arguments
+    /// * `device` - Vulkan device handle.
+    /// * `allocator` - GPU memory allocator.
+    /// * `transfer_queue_family` - Queue family index for transfer operations.
+    ///
+    /// # Safety
+    /// The device must be valid.
+    pub unsafe fn init_async_uploads(
+        &mut self,
+        device: &ash::Device,
+        allocator: &mut GpuAllocator,
+        transfer_queue_family: u32,
+    ) -> Result<()> {
+        self.upload_manager = Some(AsyncUploadManager::new(
+            device,
+            allocator,
+            transfer_queue_family,
+        )?);
+        Ok(())
+    }
+
+    /// Check if async uploads are enabled.
+    pub fn has_async_uploads(&self) -> bool {
+        self.upload_manager.is_some()
+    }
+
+    /// Get the timeline semaphore handle for async upload synchronization.
+    ///
+    /// Returns `None` if async uploads are not initialized.
+    pub fn upload_timeline_semaphore(&self) -> Option<vk::Semaphore> {
+        self.upload_manager.as_ref().map(|m| m.timeline_semaphore())
+    }
+
+    /// Get the last submitted upload timeline value.
+    ///
+    /// Returns 0 if async uploads are not initialized or no uploads have been submitted.
+    pub fn last_upload_value(&self) -> u64 {
+        self.upload_manager
+            .as_ref()
+            .map_or(0, |m| m.last_submitted_value())
+    }
+
+    /// Queue a chunk for async upload.
+    ///
+    /// Returns `Ok(true)` if the chunk was queued, `Ok(false)` if there's no space
+    /// or async uploads are not initialized.
+    ///
+    /// # Arguments
+    /// * `allocator` - GPU memory allocator.
+    /// * `device` - Vulkan device handle.
+    /// * `pos` - Chunk position.
+    /// * `dag` - The SVO-DAG to upload.
+    pub fn queue_chunk_upload(
+        &mut self,
+        allocator: &mut GpuAllocator,
+        device: &ash::Device,
+        pos: ChunkPos,
+        dag: &SvoDag,
+    ) -> Result<bool> {
+        // Skip empty chunks
+        if dag.is_empty() {
+            return Ok(false);
+        }
+
+        // Skip if already loaded
+        if self.chunks.contains_key(&pos) {
+            return Ok(false);
+        }
+
+        let Some(manager) = &mut self.upload_manager else {
+            return Ok(false);
+        };
+
+        manager.queue_chunk(allocator, device, pos, dag)
+    }
+
+    /// Submit pending async uploads to the transfer queue.
+    ///
+    /// Returns the timeline value that will be signaled when uploads complete.
+    ///
+    /// # Safety
+    /// The device and queue must be valid.
+    pub unsafe fn submit_pending_uploads(
+        &mut self,
+        device: &ash::Device,
+        transfer_queue: vk::Queue,
+    ) -> Result<u64> {
+        let Some(manager) = &mut self.upload_manager else {
+            return Ok(0);
+        };
+
+        manager.submit_pending(device, transfer_queue)
+    }
+
+    /// Poll for completed async uploads and integrate them into the renderer.
+    ///
+    /// Returns a list of chunk positions that were successfully uploaded.
+    ///
+    /// # Safety
+    /// The device must be valid.
+    pub unsafe fn process_completed_uploads(
+        &mut self,
+        device: &ash::Device,
+    ) -> Result<Vec<ChunkPos>> {
+        let Some(manager) = &mut self.upload_manager else {
+            return Ok(Vec::new());
+        };
+
+        let completed = manager.poll_completed(device)?;
+        let mut uploaded_positions = Vec::with_capacity(completed.len());
+
+        for upload in completed {
+            let gpu_dag = GpuSvoDag {
+                node_buffer: upload.node_buffer,
+                node_count: 0, // Not tracked for async uploads
+                root_index: upload.root_index,
+                depth: upload.depth,
+                device_address: upload.device_address,
+            };
+
+            let info = GpuChunkInfo::from_gpu_dag(&gpu_dag, upload.pos);
+
+            self.chunks
+                .insert(upload.pos, LoadedChunk { gpu_dag, info });
+            uploaded_positions.push(upload.pos);
+            self.dirty = true;
+        }
+
+        Ok(uploaded_positions)
+    }
+
+    /// Check if there's space for more async uploads.
+    pub fn has_upload_space(&self) -> bool {
+        self.upload_manager.as_ref().is_some_and(|m| m.has_space())
+    }
+
+    /// Get the number of chunks queued for async upload.
+    pub fn queued_upload_count(&self) -> usize {
+        self.upload_manager.as_ref().map_or(0, |m| m.queued_count())
     }
 
     /// Upload a chunk's DAG to the GPU.
@@ -151,7 +301,8 @@ impl WorldRenderer {
             // Still remove old chunk if it existed (chunk might have been cleared)
             if let Some(old) = self.chunks.remove(&pos) {
                 // Queue old buffer for deferred deletion
-                self.deferred_deletions.queue(old.gpu_dag.node_buffer, frame_number);
+                self.deferred_deletions
+                    .queue(old.gpu_dag.node_buffer, frame_number);
                 self.dirty = true;
             }
             return Ok(false);
@@ -159,7 +310,8 @@ impl WorldRenderer {
 
         // Remove old chunk if it exists - queue for deferred deletion
         if let Some(old) = self.chunks.remove(&pos) {
-            self.deferred_deletions.queue(old.gpu_dag.node_buffer, frame_number);
+            self.deferred_deletions
+                .queue(old.gpu_dag.node_buffer, frame_number);
         }
 
         // Upload new chunk
@@ -181,7 +333,8 @@ impl WorldRenderer {
     /// * `frame_number` - Current frame number for deferred deletion tracking.
     pub fn remove_chunk(&mut self, pos: ChunkPos, frame_number: u64) {
         if let Some(loaded) = self.chunks.remove(&pos) {
-            self.deferred_deletions.queue(loaded.gpu_dag.node_buffer, frame_number);
+            self.deferred_deletions
+                .queue(loaded.gpu_dag.node_buffer, frame_number);
             self.dirty = true;
         }
     }
@@ -436,7 +589,19 @@ impl WorldRenderer {
     /// Destroy all GPU resources.
     ///
     /// Call this after `device_wait_idle()` to ensure all resources are freed safely.
-    pub fn destroy(mut self, allocator: &mut GpuAllocator) -> Result<()> {
+    ///
+    /// # Safety
+    /// The device must be valid and idle.
+    pub unsafe fn destroy(
+        mut self,
+        device: &ash::Device,
+        allocator: &mut GpuAllocator,
+    ) -> Result<()> {
+        // Destroy async upload manager first
+        if let Some(manager) = self.upload_manager.take() {
+            manager.destroy(device, allocator)?;
+        }
+
         // Flush all pending deferred deletions
         self.deferred_deletions.flush(allocator)?;
 

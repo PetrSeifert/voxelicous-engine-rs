@@ -171,7 +171,10 @@ impl ChunkWorkerHandle {
 
     /// Send a batch of positions to generate (non-blocking).
     fn send_work(&self, positions: Vec<ChunkPos>) -> Result<(), Vec<ChunkPos>> {
-        match self.request_tx.try_send(ChunkWorkRequest::Generate(positions.clone())) {
+        match self
+            .request_tx
+            .try_send(ChunkWorkRequest::Generate(positions.clone()))
+        {
             Ok(()) => Ok(()),
             Err(_) => Err(positions), // Queue full, return positions
         }
@@ -380,7 +383,10 @@ impl ChunkStreamer {
                 if !chunk_manager.contains(entry.pos) {
                     let svo = {
                         #[cfg(feature = "profiling")]
-                        profile_scope!(EventCategory::ChunkGeneration, [entry.pos.x, entry.pos.y, entry.pos.z]);
+                        profile_scope!(
+                            EventCategory::ChunkGeneration,
+                            [entry.pos.x, entry.pos.y, entry.pos.z]
+                        );
                         self.generator.generate_chunk(entry.pos)
                     };
                     let chunk = Chunk::with_svo(entry.pos, svo);

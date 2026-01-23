@@ -102,7 +102,10 @@ pub fn run_app<A: VoxelApp + 'static>(config: AppConfig) -> anyhow::Result<()> {
     #[cfg(feature = "profiling")]
     {
         voxelicous_profiler::init();
-        info!("Profiler initialized on port {}", voxelicous_profiler::DEFAULT_PORT);
+        info!(
+            "Profiler initialized on port {}",
+            voxelicous_profiler::DEFAULT_PORT
+        );
     }
 
     info!("{} starting...", config.title);
@@ -398,11 +401,7 @@ impl<A: VoxelApp> AppState<A> {
 
         // Report frame to profiler
         #[cfg(feature = "profiling")]
-        voxelicous_profiler::end_frame(
-            self.ctx.frame_count,
-            fps,
-            dt * 1000.0,
-        );
+        voxelicous_profiler::end_frame(self.ctx.frame_count, fps, dt * 1000.0);
 
         Ok(())
     }

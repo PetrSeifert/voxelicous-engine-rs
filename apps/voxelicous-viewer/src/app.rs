@@ -188,6 +188,19 @@ impl VoxelApp for Viewer {
         let frames_in_flight = ctx.frames_in_flight();
         let mut world_renderer = WorldRenderer::new(DEFAULT_MAX_GPU_CHUNKS, frames_in_flight);
 
+        // Initialize async upload support using the dedicated transfer queue
+        {
+            let mut allocator = ctx.gpu.allocator().lock();
+            unsafe {
+                world_renderer.init_async_uploads(
+                    ctx.gpu.device(),
+                    &mut allocator,
+                    ctx.gpu.transfer_queue_family(),
+                )?;
+            }
+        }
+        info!("Async chunk upload system initialized");
+
         // Create rendering pipeline with frames_in_flight for per-frame buffers
         let pipeline = unsafe {
             let mut allocator = ctx.gpu.allocator().lock();
@@ -399,8 +412,45 @@ impl VoxelApp for Viewer {
         // Update world streaming based on camera position (non-blocking)
         let (needs_upload, unloaded) = self.world.update_async(self.camera.position);
 
-        // Store pending operations for render phase
-        self.pending_uploads.extend(needs_upload);
+        // Queue new chunks for async upload (non-blocking)
+        // This stages data in CPU memory for later transfer
+        {
+            let mut allocator = ctx.gpu.allocator().lock();
+            for pos in needs_upload {
+                if !self.world_renderer.has_chunk(pos) && self.world_renderer.has_upload_space() {
+                    if let Some(dag) = get_chunk_dag(&self.world, pos) {
+                        match self.world_renderer.queue_chunk_upload(
+                            &mut allocator,
+                            ctx.gpu.device(),
+                            pos,
+                            &dag,
+                        ) {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                // No space, add to pending for retry
+                                self.pending_uploads.push(pos);
+                            }
+                            Err(e) => {
+                                error!("Failed to queue chunk {:?}: {}", pos, e);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Submit pending uploads to transfer queue EARLY (before fence wait)
+            // This allows GPU to start working on transfers while we wait
+            unsafe {
+                if let Err(e) = self
+                    .world_renderer
+                    .submit_pending_uploads(ctx.gpu.device(), ctx.gpu.transfer_queue())
+                {
+                    error!("Failed to submit pending uploads: {}", e);
+                }
+            }
+        }
+
+        // Store pending unloads for render phase
         self.pending_unloads.extend(unloaded);
 
         // Log streaming activity periodically
@@ -438,9 +488,8 @@ impl VoxelApp for Viewer {
         let frame_number = frame.frame_number;
 
         // Process pending GPU operations before rendering
-        // Limit uploads/unloads per frame to balance performance vs responsiveness
-        const MAX_UPLOADS_PER_FRAME: usize = 8;
         const MAX_UNLOADS_PER_FRAME: usize = 16;
+        const MAX_RETRY_UPLOADS_PER_FRAME: usize = 8;
 
         {
             let mut allocator = ctx.gpu.allocator().lock();
@@ -453,23 +502,42 @@ impl VoxelApp for Viewer {
                 error!("Failed to process deferred deletions: {}", e);
             }
 
-            // Upload new chunks (limited per frame)
-            let upload_count = self.pending_uploads.len().min(MAX_UPLOADS_PER_FRAME);
-            let uploads: Vec<_> = self.pending_uploads.drain(..upload_count).collect();
+            // Poll for completed async uploads (non-blocking)
+            unsafe {
+                match self.world_renderer.process_completed_uploads(device) {
+                    Ok(uploaded) => {
+                        if !uploaded.is_empty() {
+                            debug!("Async uploaded {} chunks", uploaded.len());
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to process completed uploads: {}", e);
+                    }
+                }
+            }
 
-            for pos in uploads {
-                if !self.world_renderer.has_chunk(pos) {
+            // Retry queuing any pending uploads that couldn't be queued before
+            // These will be submitted in the next frame's update()
+            let retry_count = self.pending_uploads.len().min(MAX_RETRY_UPLOADS_PER_FRAME);
+            let retries: Vec<_> = self.pending_uploads.drain(..retry_count).collect();
+
+            for pos in retries {
+                if !self.world_renderer.has_chunk(pos) && self.world_renderer.has_upload_space() {
                     if let Some(dag) = get_chunk_dag(&self.world, pos) {
-                        #[cfg(feature = "profiling")]
-                        profile_scope!(EventCategory::GpuUpload, [pos.x, pos.y, pos.z]);
-                        if let Err(e) = self.world_renderer.upload_chunk(
+                        match self.world_renderer.queue_chunk_upload(
                             &mut allocator,
                             device,
                             pos,
                             &dag,
-                            frame_number,
                         ) {
-                            error!("Failed to upload chunk {:?}: {}", pos, e);
+                            Ok(false) => {
+                                // Still no space, put back
+                                self.pending_uploads.push(pos);
+                            }
+                            Ok(true) => {}
+                            Err(e) => {
+                                error!("Failed to queue chunk {:?}: {}", pos, e);
+                            }
                         }
                     }
                 }
@@ -679,10 +747,11 @@ impl VoxelApp for Viewer {
 
         // Destroy world renderer (frees all chunk GPU resources)
         // Replace with a dummy renderer (will never be used)
-        let world_renderer =
-            std::mem::replace(&mut self.world_renderer, WorldRenderer::new(0, 1));
-        if let Err(e) = world_renderer.destroy(&mut allocator) {
-            error!("Failed to destroy world renderer: {e}");
+        let world_renderer = std::mem::replace(&mut self.world_renderer, WorldRenderer::new(0, 1));
+        unsafe {
+            if let Err(e) = world_renderer.destroy(ctx.gpu.device(), &mut allocator) {
+                error!("Failed to destroy world renderer: {e}");
+            }
         }
 
         // Destroy pipeline

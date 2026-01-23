@@ -4,9 +4,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
-use voxelicous_profiler::{
-    ClientMessage, ProfilerSnapshot, ServerMessage, PROTOCOL_VERSION,
-};
+use voxelicous_profiler::{ClientMessage, ProfilerSnapshot, ServerMessage, PROTOCOL_VERSION};
 
 /// Connection state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,10 +50,7 @@ impl ProfilerClient {
         self.state = ConnectionState::Connecting;
 
         let addr = format!("{}:{}", self.host, self.port);
-        let stream = TcpStream::connect_timeout(
-            &addr.parse()?,
-            Duration::from_secs(2),
-        )?;
+        let stream = TcpStream::connect_timeout(&addr.parse()?, Duration::from_secs(2))?;
 
         stream.set_nonblocking(true)?;
         stream.set_nodelay(true)?;

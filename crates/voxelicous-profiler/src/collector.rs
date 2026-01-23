@@ -2,7 +2,9 @@
 
 use std::collections::HashMap;
 
-use crate::events::{CategoryStats, EventCategory, MemoryStats, ProfilerSnapshot, QueueSizes, TimingEvent};
+use crate::events::{
+    CategoryStats, EventCategory, MemoryStats, ProfilerSnapshot, QueueSizes, TimingEvent,
+};
 use crate::ring_buffer::RingBuffer;
 
 /// Number of recent samples to keep for percentile calculations.
@@ -85,13 +87,15 @@ impl Collector {
 
         for event in events {
             // Update stats
-            let stats = self.stats
+            let stats = self
+                .stats
                 .entry(event.category)
                 .or_insert_with(|| CategoryStats::new(event.category));
             stats.record(event.duration_ns);
 
             // Store sample for percentile calculation
-            let samples = self.samples
+            let samples = self
+                .samples
                 .entry(event.category)
                 .or_insert_with(|| Vec::with_capacity(SAMPLE_HISTORY_SIZE));
             if samples.len() >= SAMPLE_HISTORY_SIZE {

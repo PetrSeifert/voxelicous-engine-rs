@@ -60,7 +60,11 @@ impl DeferredDeletionQueue {
     /// # Arguments
     /// * `allocator` - GPU allocator for freeing buffers.
     /// * `current_frame_number` - Current frame number.
-    pub fn process(&mut self, allocator: &mut GpuAllocator, current_frame_number: u64) -> Result<()> {
+    pub fn process(
+        &mut self,
+        allocator: &mut GpuAllocator,
+        current_frame_number: u64,
+    ) -> Result<()> {
         // Keep buffers that were queued within the last `frames_in_flight` frames
         let cutoff = current_frame_number.saturating_sub(self.frames_in_flight as u64);
 
