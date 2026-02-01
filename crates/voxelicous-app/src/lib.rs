@@ -41,13 +41,11 @@ mod app;
 mod context;
 mod frame;
 mod runner;
-mod unified_pipeline;
 
 pub use app::VoxelApp;
 pub use context::AppContext;
 pub use frame::FrameContext;
 pub use runner::{run_app, AppConfig};
-pub use unified_pipeline::UnifiedPipeline;
 
 // Re-export commonly used types for convenience
 pub use voxelicous_gpu::{GpuContext, GpuContextBuilder};

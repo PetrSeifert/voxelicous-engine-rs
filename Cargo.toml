@@ -14,7 +14,6 @@ members = [
     "crates/voxelicous-shaders",
     "crates/voxelicous-input",
     "crates/voxelicous-app",
-    "crates/voxelicous-test",
     "crates/voxelicous-profiler",
     "apps/voxelicous-editor",
     "apps/voxelicous-viewer",

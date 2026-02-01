@@ -7,10 +7,6 @@ use std::sync::OnceLock;
 
 /// Embedded SPIR-V shader bytecode (raw bytes, may not be aligned).
 mod spirv_bytes {
-    /// Ray march SVO-DAG compute shader (compiled SPIR-V).
-    pub static RAY_MARCH_SVO_COMP: &[u8] =
-        include_bytes!(concat!(env!("OUT_DIR"), "/ray_march_svo.spv"));
-
     /// Ray march world compute shader for multi-chunk rendering (compiled SPIR-V).
     pub static RAY_MARCH_WORLD_COMP: &[u8] =
         include_bytes!(concat!(env!("OUT_DIR"), "/ray_march_world.spv"));
@@ -48,16 +44,8 @@ fn bytes_to_spirv(bytes: &[u8]) -> Vec<u32> {
         .collect()
 }
 
-/// Cached aligned SPIR-V for ray march shader.
-static RAY_MARCH_SVO_SPIRV: OnceLock<Vec<u32>> = OnceLock::new();
-
 /// Cached aligned SPIR-V for world ray march shader.
 static RAY_MARCH_WORLD_SPIRV: OnceLock<Vec<u32>> = OnceLock::new();
-
-/// Get ray march SVO shader as u32 slice for Vulkan.
-pub fn ray_march_svo_shader() -> &'static [u32] {
-    RAY_MARCH_SVO_SPIRV.get_or_init(|| bytes_to_spirv(spirv_bytes::RAY_MARCH_SVO_COMP))
-}
 
 /// Get ray march world shader for multi-chunk rendering as u32 slice for Vulkan.
 pub fn ray_march_world_shader() -> &'static [u32] {
@@ -105,14 +93,6 @@ pub fn ray_trace_svo_closest_hit_shader() -> &'static [u32] {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn shader_loads() {
-        let shader = ray_march_svo_shader();
-        // SPIR-V magic number is 0x07230203
-        assert_eq!(shader[0], 0x0723_0203, "Invalid SPIR-V magic number");
-        assert!(shader.len() > 100, "Shader too small");
-    }
 
     #[test]
     fn world_shader_loads() {
