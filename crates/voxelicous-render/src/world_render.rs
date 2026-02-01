@@ -14,6 +14,7 @@ use voxelicous_gpu::error::Result;
 use voxelicous_gpu::memory::{GpuAllocator, GpuBuffer};
 use voxelicous_voxel::{SvoDag, VoxelStorage};
 
+use crate::debug::DebugMode;
 use crate::GpuSvoDag;
 
 /// GPU-side information about a single chunk for shader access.
@@ -79,6 +80,10 @@ pub struct WorldRenderPushConstants {
     pub chunk_count: u32,
     /// Device address of the chunk info buffer.
     pub chunk_info_address: u64,
+    /// Debug visualization mode.
+    pub debug_mode: u32,
+    /// Padding for 8-byte alignment.
+    pub _padding: u32,
 }
 
 impl WorldRenderPushConstants {
@@ -393,18 +398,22 @@ impl WorldRenderer {
     /// * `screen_height` - Screen height in pixels.
     /// * `max_steps` - Maximum ray traversal steps per chunk.
     /// * `frame_index` - Current frame index in the ring buffer.
+    /// * `debug_mode` - Debug visualization mode.
     pub fn push_constants(
         &self,
         screen_width: u32,
         screen_height: u32,
         max_steps: u32,
         frame_index: usize,
+        debug_mode: DebugMode,
     ) -> WorldRenderPushConstants {
         WorldRenderPushConstants {
             screen_size: [screen_width, screen_height],
             max_steps,
             chunk_count: self.visible_chunk_counts[frame_index],
             chunk_info_address: self.chunk_info_addresses[frame_index],
+            debug_mode: debug_mode.as_u32(),
+            _padding: 0,
         }
     }
 
@@ -480,8 +489,8 @@ mod tests {
 
     #[test]
     fn push_constants_size() {
-        // Push constants should be 24 bytes
-        assert_eq!(WorldRenderPushConstants::SIZE, 24);
+        // Push constants should be 32 bytes (24 + debug_mode + padding)
+        assert_eq!(WorldRenderPushConstants::SIZE, 32);
     }
 
     #[test]
@@ -498,6 +507,14 @@ mod tests {
         assert_eq!(
             std::mem::offset_of!(WorldRenderPushConstants, chunk_info_address),
             16
+        );
+        assert_eq!(
+            std::mem::offset_of!(WorldRenderPushConstants, debug_mode),
+            24
+        );
+        assert_eq!(
+            std::mem::offset_of!(WorldRenderPushConstants, _padding),
+            28
         );
     }
 }

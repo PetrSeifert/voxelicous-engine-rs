@@ -10,6 +10,7 @@ use voxelicous_gpu::memory::{GpuAllocator, GpuBuffer, GpuImage};
 use voxelicous_gpu::pipeline::ComputePipeline;
 
 use crate::camera::CameraUniforms;
+use crate::debug::DebugMode;
 use crate::world_render::{WorldRenderPushConstants, WorldRenderer};
 
 /// World ray marching compute pipeline for multi-chunk rendering.
@@ -214,6 +215,7 @@ impl WorldRayMarchPipeline {
     /// * `world_renderer` - World renderer with chunk data
     /// * `max_steps` - Maximum ray traversal steps per chunk
     /// * `frame_index` - Current frame index in the ring buffer
+    /// * `debug_mode` - Debug visualization mode
     ///
     /// # Safety
     /// The command buffer must be in recording state.
@@ -225,6 +227,7 @@ impl WorldRayMarchPipeline {
         world_renderer: &WorldRenderer,
         max_steps: u32,
         frame_index: usize,
+        debug_mode: DebugMode,
     ) -> Result<()> {
         // Update this frame's camera buffer
         self.camera_buffers[frame_index].write(std::slice::from_ref(camera))?;
@@ -264,7 +267,7 @@ impl WorldRayMarchPipeline {
 
         // Push constants from WorldRenderer (using this frame's buffer address)
         let push_constants =
-            world_renderer.push_constants(self.width, self.height, max_steps, frame_index);
+            world_renderer.push_constants(self.width, self.height, max_steps, frame_index, debug_mode);
 
         device.cmd_push_constants(
             cmd,

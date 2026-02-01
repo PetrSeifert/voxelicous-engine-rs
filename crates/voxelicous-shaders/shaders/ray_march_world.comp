@@ -32,12 +32,22 @@ layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer Chu
     GpuChunkInfo chunks[];
 };
 
-// Push constants (24 bytes) - matches WorldRenderPushConstants
+// Debug mode constants
+const uint DEBUG_NONE = 0u;
+const uint DEBUG_TRAVERSAL_STEPS = 1u;
+const uint DEBUG_NODE_DEPTH = 2u;
+const uint DEBUG_DISTANCE = 3u;
+const uint DEBUG_NORMALS = 4u;
+const uint DEBUG_CHUNK_BOUNDARIES = 5u;
+
+// Push constants (32 bytes) - matches WorldRenderPushConstants
 layout(push_constant) uniform PushConstants {
     uvec2 screen_size;             // 8 bytes
     uint max_steps;                // 4 bytes
     uint chunk_count;              // 4 bytes
     uint64_t chunk_info_address;   // 8 bytes
+    uint debug_mode;               // 4 bytes
+    uint _padding;                 // 4 bytes
 } pc;
 
 // Camera uniforms (must match CameraUniforms in Rust)
@@ -131,6 +141,8 @@ struct RayHit {
     vec3 position;
     vec3 normal;
     float t;
+    uint traversal_steps;
+    uint max_depth_reached;
 };
 
 struct StackEntry {
@@ -189,13 +201,15 @@ void sort_children_8(inout ChildInfo arr[8]) {
 }
 
 // Trace ray through a single chunk (in chunk-local coordinates)
-RayHit trace_ray_chunk(vec3 ray_origin, vec3 ray_dir, GpuChunkInfo chunk_info, float max_t) {
+RayHit trace_ray_chunk(vec3 ray_origin, vec3 ray_dir, GpuChunkInfo chunk_info, float max_t, inout uint total_steps, inout uint max_depth) {
     RayHit result;
     result.hit = false;
     result.block_id = 0u;
     result.t = max_t;
     result.position = vec3(0.0);
     result.normal = vec3(0.0);
+    result.traversal_steps = 0u;
+    result.max_depth_reached = 0u;
 
     // Early exit if empty octree
     if (chunk_info.root_index == 0u) {
@@ -230,9 +244,13 @@ RayHit trace_ray_chunk(vec3 ray_origin, vec3 ray_dir, GpuChunkInfo chunk_info, f
     stack_ptr++;
 
     uint steps = 0u;
+    uint current_depth = 0u;
 
     while (stack_ptr > 0 && steps < pc.max_steps) {
         steps++;
+        // Track depth based on node size relative to octree size
+        current_depth = uint(log2(octree_size / stack[stack_ptr - 1].size));
+        max_depth = max(max_depth, current_depth);
 
         stack_ptr--;
         StackEntry entry = stack[stack_ptr];
@@ -309,6 +327,9 @@ RayHit trace_ray_chunk(vec3 ray_origin, vec3 ray_dir, GpuChunkInfo chunk_info, f
         }
     }
 
+    total_steps += steps;
+    result.traversal_steps = steps;
+    result.max_depth_reached = max_depth;
     return result;
 }
 
@@ -320,12 +341,17 @@ RayHit trace_ray_world(vec3 ray_origin, vec3 ray_dir) {
     closest.t = 1e30;
     closest.position = vec3(0.0);
     closest.normal = vec3(0.0);
+    closest.traversal_steps = 0u;
+    closest.max_depth_reached = 0u;
 
     if (pc.chunk_count == 0u) {
         return closest;
     }
 
     ChunkInfoBuffer chunk_buffer = ChunkInfoBuffer(pc.chunk_info_address);
+
+    uint total_steps = 0u;
+    uint max_depth = 0u;
 
     for (uint i = 0u; i < pc.chunk_count; i++) {
         GpuChunkInfo chunk_info = chunk_buffer.chunks[i];
@@ -337,7 +363,7 @@ RayHit trace_ray_world(vec3 ray_origin, vec3 ray_dir) {
         vec3 local_origin = ray_origin - chunk_offset;
 
         // Trace in this chunk (pass current closest.t as max distance)
-        RayHit hit = trace_ray_chunk(local_origin, ray_dir, chunk_info, closest.t);
+        RayHit hit = trace_ray_chunk(local_origin, ray_dir, chunk_info, closest.t, total_steps, max_depth);
 
         if (hit.hit && hit.t < closest.t) {
             closest = hit;
@@ -346,7 +372,54 @@ RayHit trace_ray_world(vec3 ray_origin, vec3 ray_dir) {
         }
     }
 
+    closest.traversal_steps = total_steps;
+    closest.max_depth_reached = max_depth;
     return closest;
+}
+
+// ============================================================================
+// Debug Visualization
+// ============================================================================
+
+// Turbo colormap - perceptually uniform heatmap from blue to red
+// Based on Google's Turbo colormap
+vec3 turbo_colormap(float t) {
+    t = clamp(t, 0.0, 1.0);
+
+    const vec4 kRedVec4 = vec4(0.13572138, 4.61539260, -42.66032258, 132.13108234);
+    const vec4 kGreenVec4 = vec4(0.09140261, 2.19418839, 4.84296658, -14.18503333);
+    const vec4 kBlueVec4 = vec4(0.10667330, 12.64194608, -60.58204836, 110.36276771);
+    const vec2 kRedVec2 = vec2(-152.94239396, 59.28637943);
+    const vec2 kGreenVec2 = vec2(4.27729857, 2.82956604);
+    const vec2 kBlueVec2 = vec2(-89.90310912, 27.34824973);
+
+    float t2 = t * t;
+    float t3 = t2 * t;
+    float t4 = t3 * t;
+    float t5 = t4 * t;
+
+    vec3 color;
+    color.r = kRedVec4.x + kRedVec4.y * t + kRedVec4.z * t2 + kRedVec4.w * t3 + kRedVec2.x * t4 + kRedVec2.y * t5;
+    color.g = kGreenVec4.x + kGreenVec4.y * t + kGreenVec4.z * t2 + kGreenVec4.w * t3 + kGreenVec2.x * t4 + kGreenVec2.y * t5;
+    color.b = kBlueVec4.x + kBlueVec4.y * t + kBlueVec4.z * t2 + kBlueVec4.w * t3 + kBlueVec2.x * t4 + kBlueVec2.y * t5;
+
+    return clamp(color, 0.0, 1.0);
+}
+
+// Map normals from [-1,1] to [0,1] RGB
+vec3 debug_normals(vec3 n) {
+    return n * 0.5 + 0.5;
+}
+
+// Check if position is on chunk boundary (within threshold)
+bool is_on_chunk_boundary(vec3 world_pos, float threshold) {
+    const float CHUNK_SIZE = 32.0;
+    vec3 chunk_local = mod(world_pos, CHUNK_SIZE);
+
+    // Check proximity to any chunk edge
+    return chunk_local.x < threshold || chunk_local.x > CHUNK_SIZE - threshold ||
+           chunk_local.y < threshold || chunk_local.y > CHUNK_SIZE - threshold ||
+           chunk_local.z < threshold || chunk_local.z > CHUNK_SIZE - threshold;
 }
 
 // ============================================================================
@@ -407,8 +480,59 @@ void main() {
     // Trace ray through all world chunks
     RayHit hit = trace_ray_world(ray_origin, ray_dir);
 
-    // Apply shading
-    vec3 color = shade(hit, ray_dir);
+    // Apply debug mode visualization or normal shading
+    vec3 color;
+
+    switch (pc.debug_mode) {
+        case DEBUG_TRAVERSAL_STEPS:
+            // Heatmap showing computational cost per pixel
+            // Normalize to max_steps for visualization
+            float step_ratio = float(hit.traversal_steps) / float(pc.max_steps);
+            color = turbo_colormap(step_ratio);
+            break;
+
+        case DEBUG_NODE_DEPTH:
+            // Heatmap showing SVO depth reached
+            // Typical octree depths are 5-10, normalize to reasonable range
+            float depth_ratio = float(hit.max_depth_reached) / 10.0;
+            color = turbo_colormap(depth_ratio);
+            break;
+
+        case DEBUG_DISTANCE:
+            // Heatmap showing distance from camera
+            // Normalize to a reasonable view distance
+            float dist_ratio = hit.t / 500.0;
+            color = turbo_colormap(clamp(dist_ratio, 0.0, 1.0));
+            if (!hit.hit) {
+                color = vec3(0.1, 0.1, 0.2); // Dark for sky
+            }
+            break;
+
+        case DEBUG_NORMALS:
+            // Surface normals as RGB
+            if (hit.hit) {
+                color = debug_normals(hit.normal);
+            } else {
+                // Sky gradient for non-hits
+                float t = 0.5 * (ray_dir.y + 1.0);
+                color = mix(vec3(0.8, 0.85, 0.9), vec3(0.4, 0.6, 0.9), t);
+            }
+            break;
+
+        case DEBUG_CHUNK_BOUNDARIES:
+            // Normal shading with red wireframe overlay on chunk edges
+            color = shade(hit, ray_dir);
+            if (hit.hit && is_on_chunk_boundary(hit.position, 0.15)) {
+                color = mix(color, vec3(1.0, 0.2, 0.2), 0.7); // Red overlay
+            }
+            break;
+
+        case DEBUG_NONE:
+        default:
+            // Normal rendering
+            color = shade(hit, ray_dir);
+            break;
+    }
 
     // Write output
     imageStore(output_image, ivec2(pixel), vec4(color, 1.0));

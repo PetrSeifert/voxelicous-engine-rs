@@ -10,7 +10,7 @@ use voxelicous_app::{
 };
 use voxelicous_core::coords::ChunkPos;
 use voxelicous_input::{ActionMap, CursorMode, InputManager, KeyCode};
-use voxelicous_render::{save_screenshot, ScreenshotConfig, WorldRayMarchPipeline, WorldRenderer};
+use voxelicous_render::{save_screenshot, DebugMode, ScreenshotConfig, WorldRayMarchPipeline, WorldRenderer};
 use voxelicous_world::{ChunkState, StreamingConfig, TerrainConfig, World};
 
 #[cfg(feature = "profiling")]
@@ -143,6 +143,8 @@ pub struct Viewer {
     pending_uploads: Vec<ChunkPos>,
     /// Chunks to be removed from GPU.
     pending_unloads: Vec<ChunkPos>,
+    /// Current debug visualization mode.
+    debug_mode: DebugMode,
 }
 
 impl VoxelApp for Viewer {
@@ -236,6 +238,7 @@ impl VoxelApp for Viewer {
             .bind("sprint", KeyCode::ShiftLeft)
             .bind("sprint", KeyCode::ShiftRight)
             .bind("toggle_cursor", KeyCode::Escape)
+            .bind("debug_cycle", KeyCode::F3)
             .build();
         let mut input = InputManager::with_actions(actions);
 
@@ -316,6 +319,7 @@ impl VoxelApp for Viewer {
             should_exit: false,
             pending_uploads: Vec::new(),
             pending_unloads: Vec::new(),
+            debug_mode: DebugMode::default(),
         })
     }
 
@@ -331,6 +335,12 @@ impl VoxelApp for Viewer {
             };
             self.input.set_cursor_mode(new_mode);
             apply_cursor_mode(&ctx.window, new_mode);
+        }
+
+        // Handle debug mode cycling (F3)
+        if self.input.is_action_just_pressed("debug_cycle") {
+            self.debug_mode = self.debug_mode.next();
+            info!("Debug mode: {:?}", self.debug_mode);
         }
 
         // Camera rotation from mouse (only when cursor is locked)
@@ -510,6 +520,7 @@ impl VoxelApp for Viewer {
                 &self.world_renderer,
                 MAX_STEPS,
                 frame_index,
+                self.debug_mode,
             )?;
 
             // Transition output image for transfer
