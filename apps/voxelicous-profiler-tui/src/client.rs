@@ -81,6 +81,7 @@ impl ProfilerClient {
 
     /// Poll for new data from the server.
     ///
+    /// Drains all available messages and keeps only the latest snapshot.
     /// Returns `true` if a new snapshot was received.
     pub fn poll(&mut self) -> bool {
         let stream = match &mut self.stream {
@@ -88,7 +89,9 @@ impl ProfilerClient {
             None => return false,
         };
 
-        // Try to read messages
+        let mut received_snapshot = false;
+
+        // Drain all available messages, keeping only the latest snapshot
         loop {
             let mut len_buf = [0u8; 4];
             match stream.read_exact(&mut len_buf) {
@@ -97,13 +100,13 @@ impl ProfilerClient {
                     if len > 10 * 1024 * 1024 {
                         // Sanity check: max 10MB
                         self.disconnect();
-                        return false;
+                        return received_snapshot;
                     }
 
                     let mut data = vec![0u8; len];
                     if stream.read_exact(&mut data).is_err() {
                         self.disconnect();
-                        return false;
+                        return received_snapshot;
                     }
 
                     match bincode::deserialize::<ServerMessage>(&data) {
@@ -114,36 +117,37 @@ impl ProfilerClient {
                                     version, PROTOCOL_VERSION
                                 );
                                 self.disconnect();
-                                return false;
+                                return received_snapshot;
                             }
                         }
                         Ok(ServerMessage::Snapshot(snapshot)) => {
+                            // Keep draining - don't return yet
                             self.last_snapshot = Some(snapshot);
-                            return true;
+                            received_snapshot = true;
                         }
                         Ok(ServerMessage::Goodbye) => {
                             self.disconnect();
-                            return false;
+                            return received_snapshot;
                         }
                         Err(_) => {
                             // Invalid message, disconnect
                             self.disconnect();
-                            return false;
+                            return received_snapshot;
                         }
                     }
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    // No more data available
-                    return false;
+                    // No more data available - we've drained the buffer
+                    return received_snapshot;
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {
                     // Timeout, no data
-                    return false;
+                    return received_snapshot;
                 }
                 Err(_) => {
                     // Connection error
                     self.disconnect();
-                    return false;
+                    return received_snapshot;
                 }
             }
         }
