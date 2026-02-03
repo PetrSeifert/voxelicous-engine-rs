@@ -6,7 +6,7 @@ use std::ffi::{CStr, CString};
 
 /// Required instance extensions for the engine.
 pub fn required_instance_extensions() -> Vec<&'static CStr> {
-    let mut extensions = vec![
+    let extensions = vec![
         ash::khr::surface::NAME,
         #[cfg(target_os = "windows")]
         ash::khr::win32_surface::NAME,
@@ -19,9 +19,6 @@ pub fn required_instance_extensions() -> Vec<&'static CStr> {
         #[cfg(target_os = "macos")]
         ash::khr::portability_enumeration::NAME,
     ];
-
-    // For getting physical device properties2 (needed for ray tracing properties)
-    extensions.push(ash::khr::get_physical_device_properties2::NAME);
 
     extensions
 }
@@ -104,7 +101,6 @@ pub unsafe fn create_instance(
 /// The instance must be valid.
 pub unsafe fn select_physical_device(
     instance: &ash::Instance,
-    require_ray_tracing: bool,
 ) -> Result<vk::PhysicalDevice> {
     let devices = instance.enumerate_physical_devices()?;
 
@@ -117,7 +113,7 @@ pub unsafe fn select_physical_device(
     let mut best_score = 0i32;
 
     for device in devices {
-        let score = score_physical_device(instance, device, require_ray_tracing);
+        let score = score_physical_device(instance, device);
         if score > best_score {
             best_score = score;
             best_device = Some(device);
@@ -131,7 +127,6 @@ pub unsafe fn select_physical_device(
 unsafe fn score_physical_device(
     instance: &ash::Instance,
     device: vk::PhysicalDevice,
-    require_ray_tracing: bool,
 ) -> i32 {
     let properties = instance.get_physical_device_properties(device);
     let features = instance.get_physical_device_features(device);
@@ -144,25 +139,6 @@ unsafe fn score_physical_device(
         return -1;
     }
 
-    // Get available extensions
-    let extensions = instance
-        .enumerate_device_extension_properties(device)
-        .unwrap_or_default();
-
-    let has_extension = |name: &CStr| {
-        extensions
-            .iter()
-            .any(|ext| CStr::from_ptr(ext.extension_name.as_ptr()) == name)
-    };
-
-    // Check ray tracing if required
-    let has_ray_tracing = has_extension(ash::khr::ray_tracing_pipeline::NAME)
-        && has_extension(ash::khr::acceleration_structure::NAME);
-
-    if require_ray_tracing && !has_ray_tracing {
-        return -1;
-    }
-
     // Start scoring
     let mut score = 0;
 
@@ -172,11 +148,6 @@ unsafe fn score_physical_device(
         vk::PhysicalDeviceType::INTEGRATED_GPU => score += 100,
         vk::PhysicalDeviceType::VIRTUAL_GPU => score += 50,
         _ => {}
-    }
-
-    // Prefer GPUs with ray tracing
-    if has_ray_tracing {
-        score += 500;
     }
 
     // Prefer more VRAM

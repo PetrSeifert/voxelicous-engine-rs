@@ -1,6 +1,6 @@
 //! Voxelicous Engine Demo Viewer
 //!
-//! Renders procedurally generated terrain using ray tracing with chunk streaming.
+//! Renders procedurally generated terrain using compute ray marching with chunk streaming.
 //! Chunks are dynamically loaded and unloaded based on camera position.
 //!
 //! ## Usage

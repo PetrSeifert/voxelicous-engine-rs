@@ -59,16 +59,6 @@ impl<'a> DescriptorSetLayoutBuilder<'a> {
         )
     }
 
-    /// Add an acceleration structure binding (for ray tracing).
-    pub fn acceleration_structure(self, binding: u32, stage_flags: vk::ShaderStageFlags) -> Self {
-        self.binding(
-            binding,
-            vk::DescriptorType::ACCELERATION_STRUCTURE_KHR,
-            1,
-            stage_flags,
-        )
-    }
-
     /// Build the descriptor set layout.
     ///
     /// # Safety

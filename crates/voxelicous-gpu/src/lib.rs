@@ -20,7 +20,7 @@ pub mod surface;
 pub mod swapchain;
 pub mod sync;
 
-pub use capabilities::{GpuCapabilities, GpuVendor, RayTracingCapabilities};
+pub use capabilities::{GpuCapabilities, GpuVendor};
 pub use context::{GpuContext, GpuContextBuilder};
 pub use deferred::DeferredDeletionQueue;
 pub use descriptors::{

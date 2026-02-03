@@ -1,6 +1,6 @@
 //! Debug rendering modes for visualization and profiling.
 //!
-//! Provides toggleable debug visualization modes for ray tracing, including
+//! Provides toggleable debug visualization modes for ray marching, including
 //! heatmaps and SVO visualization, controlled by hotkeys.
 
 /// Debug visualization mode for rendering.

@@ -80,11 +80,6 @@ impl GpuContext {
         &self.instance
     }
 
-    /// Check if hardware ray tracing is available.
-    pub fn has_hardware_ray_tracing(&self) -> bool {
-        self.capabilities.ray_tracing.has_hardware_rt()
-    }
-
     /// Get access to the GPU allocator.
     pub fn allocator(&self) -> &Mutex<GpuAllocator> {
         &self.allocator
@@ -118,7 +113,6 @@ impl Drop for GpuContext {
 pub struct GpuContextBuilder {
     app_name: String,
     enable_validation: bool,
-    require_ray_tracing: bool,
 }
 
 impl Default for GpuContextBuilder {
@@ -126,7 +120,6 @@ impl Default for GpuContextBuilder {
         Self {
             app_name: "Voxelicous".to_string(),
             enable_validation: cfg!(debug_assertions),
-            require_ray_tracing: false,
         }
     }
 }
@@ -149,12 +142,6 @@ impl GpuContextBuilder {
         self
     }
 
-    /// Require hardware ray tracing support.
-    pub fn require_ray_tracing(mut self, require: bool) -> Self {
-        self.require_ray_tracing = require;
-        self
-    }
-
     /// Build the GPU context.
     pub fn build(self) -> Result<GpuContext> {
         // Load Vulkan entry point
@@ -165,8 +152,7 @@ impl GpuContextBuilder {
         let instance = unsafe { create_instance(&entry, &self.app_name, self.enable_validation) }?;
 
         // Select best physical device
-        let physical_device =
-            unsafe { select_physical_device(&instance, self.require_ray_tracing) }?;
+        let physical_device = unsafe { select_physical_device(&instance) }?;
 
         // Query capabilities
         let capabilities = unsafe { GpuCapabilities::query(&instance, physical_device) };
@@ -183,7 +169,7 @@ impl GpuContextBuilder {
 
         // Create logical device
         let (device, graphics_queue, compute_queue, transfer_queue) =
-            unsafe { create_device(&instance, physical_device, &queue_families, &capabilities)? };
+            unsafe { create_device(&instance, physical_device, &queue_families)? };
 
         let device = Arc::new(device);
 
@@ -271,22 +257,11 @@ unsafe fn find_queue_families(
 }
 
 /// Required device extensions.
-fn required_device_extensions(capabilities: &GpuCapabilities) -> Vec<&'static CStr> {
-    let mut extensions = vec![
+fn required_device_extensions() -> Vec<&'static CStr> {
+    let extensions = vec![
         ash::khr::swapchain::NAME,
         // Buffer device address is core in Vulkan 1.3, but some drivers still need the extension
     ];
-
-    // Add ray tracing extensions if available
-    if capabilities.ray_tracing.has_hardware_rt() {
-        extensions.push(ash::khr::ray_tracing_pipeline::NAME);
-        extensions.push(ash::khr::acceleration_structure::NAME);
-        extensions.push(ash::khr::deferred_host_operations::NAME);
-
-        if capabilities.ray_tracing.ray_query {
-            extensions.push(ash::khr::ray_query::NAME);
-        }
-    }
 
     extensions
 }
@@ -299,7 +274,6 @@ unsafe fn create_device(
     instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
     queue_families: &QueueFamilyIndices,
-    capabilities: &GpuCapabilities,
 ) -> Result<(ash::Device, vk::Queue, vk::Queue, vk::Queue)> {
     // Collect unique queue families
     let mut unique_families = std::collections::HashSet::new();
@@ -319,7 +293,7 @@ unsafe fn create_device(
         .collect();
 
     // Get required extensions
-    let extensions = required_device_extensions(capabilities);
+    let extensions = required_device_extensions();
     let extension_names: Vec<*const i8> = extensions.iter().map(|ext| ext.as_ptr()).collect();
 
     // Enable Vulkan 1.3 features
@@ -344,26 +318,6 @@ unsafe fn create_device(
         .features(features)
         .push_next(&mut vulkan_1_3_features)
         .push_next(&mut vulkan_1_2_features);
-
-    // Enable ray tracing features if available
-    let mut rt_pipeline_features;
-    let mut accel_struct_features;
-    let mut ray_query_features;
-
-    if capabilities.ray_tracing.has_hardware_rt() {
-        rt_pipeline_features =
-            vk::PhysicalDeviceRayTracingPipelineFeaturesKHR::default().ray_tracing_pipeline(true);
-        accel_struct_features = vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default()
-            .acceleration_structure(true);
-        features2 = features2
-            .push_next(&mut rt_pipeline_features)
-            .push_next(&mut accel_struct_features);
-
-        if capabilities.ray_tracing.ray_query {
-            ray_query_features = vk::PhysicalDeviceRayQueryFeaturesKHR::default().ray_query(true);
-            features2 = features2.push_next(&mut ray_query_features);
-        }
-    }
 
     // Create the device
     let device_create_info = vk::DeviceCreateInfo::default()

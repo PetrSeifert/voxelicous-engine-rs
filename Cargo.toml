@@ -5,7 +5,6 @@ members = [
     "crates/voxelicous-voxel",
     "crates/voxelicous-gpu",
     "crates/voxelicous-render",
-    "crates/voxelicous-nvidia",
     "crates/voxelicous-platform",
     "crates/voxelicous-world",
     "crates/voxelicous-physics",
@@ -88,7 +87,6 @@ voxelicous-core = { path = "crates/voxelicous-core" }
 voxelicous-voxel = { path = "crates/voxelicous-voxel" }
 voxelicous-gpu = { path = "crates/voxelicous-gpu" }
 voxelicous-render = { path = "crates/voxelicous-render" }
-voxelicous-nvidia = { path = "crates/voxelicous-nvidia" }
 voxelicous-platform = { path = "crates/voxelicous-platform" }
 voxelicous-world = { path = "crates/voxelicous-world" }
 voxelicous-physics = { path = "crates/voxelicous-physics" }

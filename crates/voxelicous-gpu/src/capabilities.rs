@@ -25,33 +25,6 @@ impl GpuVendor {
             other => Self::Other(other),
         }
     }
-
-    /// Check if this is an Nvidia GPU.
-    pub fn is_nvidia(&self) -> bool {
-        matches!(self, Self::Nvidia)
-    }
-}
-
-/// Ray tracing capability details.
-#[derive(Debug, Clone, Default)]
-pub struct RayTracingCapabilities {
-    /// VK_KHR_ray_tracing_pipeline supported
-    pub pipeline: bool,
-    /// VK_KHR_ray_query supported (inline ray tracing)
-    pub ray_query: bool,
-    /// VK_KHR_acceleration_structure supported
-    pub acceleration_structure: bool,
-    /// Maximum ray recursion depth
-    pub max_ray_recursion_depth: u32,
-    /// Maximum ray hit attribute size
-    pub max_ray_hit_attribute_size: u32,
-}
-
-impl RayTracingCapabilities {
-    /// Check if full hardware ray tracing is available.
-    pub fn has_hardware_rt(&self) -> bool {
-        self.pipeline && self.acceleration_structure
-    }
 }
 
 /// Detected GPU capabilities.
@@ -79,10 +52,6 @@ pub struct GpuCapabilities {
     pub supports_descriptor_indexing: bool,
     /// Scalar block layout support
     pub supports_scalar_block_layout: bool,
-
-    // Ray tracing
-    /// Ray tracing capabilities
-    pub ray_tracing: RayTracingCapabilities,
 
     // Memory info
     /// Device-local memory in MB
@@ -142,10 +111,6 @@ impl GpuCapabilities {
             .map(|heap| heap.size / (1024 * 1024))
             .sum();
 
-        // Check ray tracing support
-        let ray_tracing =
-            Self::query_ray_tracing_capabilities(instance, physical_device, &available_extensions);
-
         // Vulkan 1.3 features are core, so we check API version
         let api_version = properties.api_version;
         let has_vulkan_1_3 =
@@ -167,8 +132,6 @@ impl GpuCapabilities {
             supports_scalar_block_layout: has_vulkan_1_3
                 || available_extensions.contains("VK_EXT_scalar_block_layout"),
 
-            ray_tracing,
-
             device_local_memory_mb,
             max_memory_allocation_count: properties.limits.max_memory_allocation_count,
 
@@ -177,36 +140,6 @@ impl GpuCapabilities {
             max_compute_shared_memory_size: properties.limits.max_compute_shared_memory_size,
 
             available_extensions,
-        }
-    }
-
-    /// Query ray tracing specific capabilities.
-    unsafe fn query_ray_tracing_capabilities(
-        instance: &ash::Instance,
-        physical_device: vk::PhysicalDevice,
-        available_extensions: &HashSet<String>,
-    ) -> RayTracingCapabilities {
-        let has_rt_pipeline = available_extensions.contains("VK_KHR_ray_tracing_pipeline");
-        let has_ray_query = available_extensions.contains("VK_KHR_ray_query");
-        let has_accel_struct = available_extensions.contains("VK_KHR_acceleration_structure");
-
-        if !has_rt_pipeline || !has_accel_struct {
-            return RayTracingCapabilities::default();
-        }
-
-        // Query ray tracing pipeline properties
-        let mut rt_properties = vk::PhysicalDeviceRayTracingPipelinePropertiesKHR::default();
-        let mut properties2 =
-            vk::PhysicalDeviceProperties2::default().push_next(&mut rt_properties);
-
-        instance.get_physical_device_properties2(physical_device, &mut properties2);
-
-        RayTracingCapabilities {
-            pipeline: has_rt_pipeline,
-            ray_query: has_ray_query,
-            acceleration_structure: has_accel_struct,
-            max_ray_recursion_depth: rt_properties.max_ray_recursion_depth,
-            max_ray_hit_attribute_size: rt_properties.max_ray_hit_attribute_size,
         }
     }
 
@@ -235,21 +168,14 @@ impl GpuCapabilities {
 
     /// Get a human-readable summary of capabilities.
     pub fn summary(&self) -> String {
-        let rt_status = if self.ray_tracing.has_hardware_rt() {
-            "Hardware RT"
-        } else {
-            "Compute fallback"
-        };
-
         format!(
-            "{} ({:?}) - Vulkan {}.{}.{} - {} MB VRAM - {}",
+            "{} ({:?}) - Vulkan {}.{}.{} - {} MB VRAM",
             self.device_name,
             self.vendor,
             vk::api_version_major(self.api_version),
             vk::api_version_minor(self.api_version),
             vk::api_version_patch(self.api_version),
             self.device_local_memory_mb,
-            rt_status,
         )
     }
 }

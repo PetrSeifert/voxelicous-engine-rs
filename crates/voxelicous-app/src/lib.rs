@@ -49,5 +49,5 @@ pub use runner::{run_app, AppConfig};
 
 // Re-export commonly used types for convenience
 pub use voxelicous_gpu::{GpuContext, GpuContextBuilder};
-pub use voxelicous_render::{Camera, RenderPath};
+pub use voxelicous_render::Camera;
 pub use winit::event::{DeviceEvent, DeviceId, WindowEvent};

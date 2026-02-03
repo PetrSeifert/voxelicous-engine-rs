@@ -1,6 +1,6 @@
 [package]
 name = "voxelicous-render"
-description = "Ray tracing rendering pipeline for the Voxelicous engine"
+description = "Compute ray marching rendering pipeline for the Voxelicous engine"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

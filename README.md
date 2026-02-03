@@ -1,12 +1,12 @@
 # Voxelicous Engine
 
-A high-performance voxel game engine written in Rust, featuring **pure voxel ray tracing** that directly traverses Sparse Voxel Octree - Directed Acyclic Graphs (SVO-DAG) without mesh generation.
+A high-performance voxel game engine written in Rust, featuring **pure voxel ray marching** that directly traverses Sparse Voxel Octree - Directed Acyclic Graphs (SVO-DAG) without mesh generation.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 ## 🌟 Key Features
 
-- **Pure Voxel Ray Tracing**: Rays traverse SVO-DAG structures directly
+- **Pure Voxel Ray Marching**: Rays traverse SVO-DAG structures directly in compute
 - **Cross-Platform**: Windows, Linux, and macOS support
 - **Modular Architecture**: Clean separation of concerns across multiple crates
 - **Performance Focused**: Thin LTO, optimized release builds
@@ -24,8 +24,7 @@ A high-performance voxel game engine written in Rust, featuring **pure voxel ray
 voxelicous-core (foundation: types, math, ECS re-exports)
 ├── voxelicous-voxel (SVO-DAG storage, compression, GPU format)
 ├── voxelicous-gpu (Vulkan abstraction via ash, memory via gpu-allocator)
-│   └── voxelicous-render (ray tracing pipeline, compute fallback)
-│       ├── voxelicous-nvidia (RTX acceleration, DLSS - feature-gated)
+│   └── voxelicous-render (compute ray marching pipeline)
 │       └── voxelicous-test (headless harness)
 ├── voxelicous-platform (windowing via winit)
 ├── voxelicous-world (chunk streaming, terrain generation)

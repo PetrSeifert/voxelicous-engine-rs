@@ -28,7 +28,7 @@ impl GpuSvoDag {
     /// Upload an SvoDag to GPU memory.
     ///
     /// Creates a storage buffer with shader device address support
-    /// for access via buffer references in compute/ray tracing shaders.
+    /// for access via buffer references in compute shaders.
     ///
     /// # Arguments
     /// * `allocator` - GPU memory allocator

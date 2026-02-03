@@ -23,37 +23,6 @@ fn main() {
         ShaderKind::Compute,
     );
 
-    // Compile ray tracing shaders (feature-gated)
-    #[cfg(feature = "ray_tracing")]
-    {
-        compile_shader(
-            &compiler,
-            shader_dir.join("ray_trace_svo.rgen"),
-            Path::new(&out_dir).join("ray_trace_svo_rgen.spv"),
-            ShaderKind::RayGeneration,
-        );
-
-        compile_shader(
-            &compiler,
-            shader_dir.join("ray_trace_svo.rmiss"),
-            Path::new(&out_dir).join("ray_trace_svo_rmiss.spv"),
-            ShaderKind::Miss,
-        );
-
-        compile_shader(
-            &compiler,
-            shader_dir.join("ray_trace_svo.rint"),
-            Path::new(&out_dir).join("ray_trace_svo_rint.spv"),
-            ShaderKind::Intersection,
-        );
-
-        compile_shader(
-            &compiler,
-            shader_dir.join("ray_trace_svo.rchit"),
-            Path::new(&out_dir).join("ray_trace_svo_rchit.spv"),
-            ShaderKind::ClosestHit,
-        );
-    }
 }
 
 fn compile_shader(

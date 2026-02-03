@@ -8,14 +8,12 @@ license.workspace = true
 
 [features]
 default = []
-nvidia = ["dep:voxelicous-nvidia", "voxelicous-nvidia/nvidia"]
 profiling = ["dep:voxelicous-profiler", "voxelicous-profiler/profiling"]
 
 [dependencies]
 voxelicous-core.workspace = true
 voxelicous-gpu.workspace = true
 voxelicous-render.workspace = true
-voxelicous-nvidia = { workspace = true, optional = true }
 voxelicous-profiler = { workspace = true, optional = true }
 winit.workspace = true
 ash.workspace = true
