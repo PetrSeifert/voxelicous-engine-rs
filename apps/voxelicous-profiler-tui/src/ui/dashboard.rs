@@ -37,7 +37,7 @@ impl Dashboard {
         let area = frame.area();
 
         // Main layout: header, content, footer
-        let chunks = Layout::default()
+        let sections = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(3), // Header
@@ -48,11 +48,11 @@ impl Dashboard {
             ])
             .split(area);
 
-        self.render_header(frame, chunks[0], connection_state, snapshot);
-        self.render_frame_info(frame, chunks[1], snapshot);
-        self.render_stats_table(frame, chunks[2], snapshot);
-        self.render_queue_info(frame, chunks[3], snapshot);
-        self.render_footer(frame, chunks[4]);
+        self.render_header(frame, sections[0], connection_state, snapshot);
+        self.render_frame_info(frame, sections[1], snapshot);
+        self.render_stats_table(frame, sections[2], snapshot);
+        self.render_queue_info(frame, sections[3], snapshot);
+        self.render_footer(frame, sections[4]);
     }
 
     fn render_header(
@@ -85,10 +85,7 @@ impl Dashboard {
             Span::raw(" | "),
             Span::styled(status_text, Style::default().fg(status_color)),
             Span::raw(" | Frame: "),
-            Span::styled(
-                format!("{}", frame_num),
-                Style::default().fg(Color::Yellow),
-            ),
+            Span::styled(format!("{}", frame_num), Style::default().fg(Color::Yellow)),
         ]);
 
         let header = Paragraph::new(title).block(
@@ -100,28 +97,49 @@ impl Dashboard {
         frame.render_widget(header, area);
     }
 
-    fn render_frame_info(&self, frame: &mut Frame, area: Rect, snapshot: Option<&ProfilerSnapshot>) {
-        let (fps, frame_time, update_time, gpu_sync_time, render_time, submit_time, present_time) = snapshot.map_or(
-            (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
-            |s| {
-                let update = s.categories.iter()
+    fn render_frame_info(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        snapshot: Option<&ProfilerSnapshot>,
+    ) {
+        let (fps, frame_time, update_time, gpu_sync_time, render_time, submit_time, present_time) =
+            snapshot.map_or((0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0), |s| {
+                let update = s
+                    .categories
+                    .iter()
                     .find(|c| c.category == voxelicous_profiler::EventCategory::FrameUpdate)
                     .map_or(0.0, |c| c.avg_ms());
-                let gpu_sync = s.categories.iter()
+                let gpu_sync = s
+                    .categories
+                    .iter()
                     .find(|c| c.category == voxelicous_profiler::EventCategory::GpuSync)
                     .map_or(0.0, |c| c.avg_ms());
-                let render = s.categories.iter()
+                let render = s
+                    .categories
+                    .iter()
                     .find(|c| c.category == voxelicous_profiler::EventCategory::FrameRender)
                     .map_or(0.0, |c| c.avg_ms());
-                let submit = s.categories.iter()
+                let submit = s
+                    .categories
+                    .iter()
                     .find(|c| c.category == voxelicous_profiler::EventCategory::GpuSubmit)
                     .map_or(0.0, |c| c.avg_ms());
-                let present = s.categories.iter()
+                let present = s
+                    .categories
+                    .iter()
                     .find(|c| c.category == voxelicous_profiler::EventCategory::FramePresent)
                     .map_or(0.0, |c| c.avg_ms());
-                (s.fps, s.frame_time_ms, update, gpu_sync, render, submit, present)
-            },
-        );
+                (
+                    s.fps,
+                    s.frame_time_ms,
+                    update,
+                    gpu_sync,
+                    render,
+                    submit,
+                    present,
+                )
+            });
 
         let fps_color = if fps >= 60.0 {
             Color::Green
@@ -143,15 +161,30 @@ impl Dashboard {
                 Style::default().fg(Color::White),
             ),
             Span::raw(" (Upd: "),
-            Span::styled(format!("{:.1}", update_time), Style::default().fg(Color::Blue)),
+            Span::styled(
+                format!("{:.1}", update_time),
+                Style::default().fg(Color::Blue),
+            ),
             Span::raw(" Sync: "),
-            Span::styled(format!("{:.1}", gpu_sync_time), Style::default().fg(Color::Yellow)),
+            Span::styled(
+                format!("{:.1}", gpu_sync_time),
+                Style::default().fg(Color::Yellow),
+            ),
             Span::raw(" Rnd: "),
-            Span::styled(format!("{:.1}", render_time), Style::default().fg(Color::Magenta)),
+            Span::styled(
+                format!("{:.1}", render_time),
+                Style::default().fg(Color::Magenta),
+            ),
             Span::raw(" Sub: "),
-            Span::styled(format!("{:.1}", submit_time), Style::default().fg(Color::Green)),
+            Span::styled(
+                format!("{:.1}", submit_time),
+                Style::default().fg(Color::Green),
+            ),
             Span::raw(" Prs: "),
-            Span::styled(format!("{:.1}", present_time), Style::default().fg(Color::Cyan)),
+            Span::styled(
+                format!("{:.1}", present_time),
+                Style::default().fg(Color::Cyan),
+            ),
             Span::raw(")"),
         ]);
 
@@ -165,7 +198,12 @@ impl Dashboard {
         frame.render_widget(widget, area);
     }
 
-    fn render_stats_table(&self, frame: &mut Frame, area: Rect, snapshot: Option<&ProfilerSnapshot>) {
+    fn render_stats_table(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        snapshot: Option<&ProfilerSnapshot>,
+    ) {
         let header_cells = ["Category", "Count", "Avg", "Min", "Max", "Total"]
             .iter()
             .map(|h| Cell::from(*h).style(Style::default().fg(Color::Yellow)));
@@ -187,11 +225,11 @@ impl Dashboard {
                         voxelicous_profiler::EventCategory::FrameRender => Color::Magenta,
                         voxelicous_profiler::EventCategory::GpuSubmit => Color::Green,
                         voxelicous_profiler::EventCategory::FramePresent => Color::Cyan,
-                        voxelicous_profiler::EventCategory::ChunkGeneration => Color::LightGreen,
-                        voxelicous_profiler::EventCategory::ChunkCompression => Color::LightCyan,
-                        voxelicous_profiler::EventCategory::GpuUpload => Color::LightMagenta,
-                        voxelicous_profiler::EventCategory::GpuUnload => Color::LightRed,
-                        voxelicous_profiler::EventCategory::WorldUpdate => Color::LightBlue,
+                        voxelicous_profiler::EventCategory::ClipmapPageBuild => Color::LightGreen,
+                        voxelicous_profiler::EventCategory::ClipmapEncode => Color::LightCyan,
+                        voxelicous_profiler::EventCategory::GpuClipmapUpload => Color::LightMagenta,
+                        voxelicous_profiler::EventCategory::GpuClipmapUnload => Color::LightRed,
+                        voxelicous_profiler::EventCategory::ClipmapUpdate => Color::LightBlue,
                         _ => Color::White,
                     };
 
@@ -229,33 +267,38 @@ impl Dashboard {
         frame.render_widget(table, area);
     }
 
-    fn render_queue_info(&self, frame: &mut Frame, area: Rect, snapshot: Option<&ProfilerSnapshot>) {
+    fn render_queue_info(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        snapshot: Option<&ProfilerSnapshot>,
+    ) {
         let queues = snapshot.map_or_else(Default::default, |s| s.queues);
 
         let info = Line::from(vec![
-            Span::raw(" Uploads: "),
+            Span::raw(" Page Uploads: "),
             Span::styled(
-                format!("{}", queues.pending_uploads),
+                format!("{}", queues.pending_page_uploads),
                 Style::default().fg(Color::Magenta),
             ),
-            Span::raw(" | Unloads: "),
+            Span::raw(" | Page Unloads: "),
             Span::styled(
-                format!("{}", queues.pending_unloads),
+                format!("{}", queues.pending_page_unloads),
                 Style::default().fg(Color::Red),
             ),
-            Span::raw(" | Load Queue: "),
+            Span::raw(" | Build Queue: "),
             Span::styled(
-                format!("{}", queues.load_queue_length),
+                format!("{}", queues.pending_page_builds),
                 Style::default().fg(Color::Yellow),
             ),
-            Span::raw(" | Chunks: "),
+            Span::raw(" | Resident Pages: "),
             Span::styled(
-                format!("{}", queues.total_chunks),
+                format!("{}", queues.resident_pages),
                 Style::default().fg(Color::Cyan),
             ),
-            Span::raw(" | GPU: "),
+            Span::raw(" | GPU Pages: "),
             Span::styled(
-                format!("{}", queues.gpu_chunks),
+                format!("{}", queues.gpu_pages),
                 Style::default().fg(Color::Green),
             ),
         ]);

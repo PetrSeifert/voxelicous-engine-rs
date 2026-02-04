@@ -150,7 +150,7 @@ mod tests {
         let buffer = RingBuffer::new();
 
         for i in 0..50 {
-            buffer.push(TimingEvent::new(EventCategory::ChunkGeneration, i * 1000));
+            buffer.push(TimingEvent::new(EventCategory::ClipmapPageBuild, i * 1000));
         }
 
         let events = buffer.drain();

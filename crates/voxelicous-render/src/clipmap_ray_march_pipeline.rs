@@ -1,6 +1,6 @@
-//! World ray marching compute pipeline for multi-chunk rendering.
+//! Clipmap ray marching compute pipeline.
 //!
-//! Uses the `ray_march_world.comp` shader to render multiple SVO-DAG chunks.
+//! Uses the `ray_march_clipmap.comp` shader to render clipmap voxel data.
 
 use ash::vk;
 use gpu_allocator::MemoryLocation;
@@ -10,53 +10,29 @@ use voxelicous_gpu::memory::{GpuAllocator, GpuBuffer, GpuImage};
 use voxelicous_gpu::pipeline::ComputePipeline;
 
 use crate::camera::CameraUniforms;
+use crate::clipmap_render::{ClipmapRenderPushConstants, ClipmapRenderer};
 use crate::debug::DebugMode;
-use crate::world_render::{WorldRenderPushConstants, WorldRenderer};
 
-/// World ray marching compute pipeline for multi-chunk rendering.
-///
-/// Manages GPU resources for ray marching through multiple SVO-DAG chunks
-/// using the `ray_march_world.comp` shader.
-pub struct WorldRayMarchPipeline {
-    /// The compute pipeline.
+/// Clipmap ray marching compute pipeline.
+pub struct ClipmapRayMarchPipeline {
     pipeline: ComputePipeline,
-    /// Descriptor set layout.
     descriptor_set_layout: vk::DescriptorSetLayout,
-    /// Descriptor pool.
     descriptor_pool: DescriptorPool,
-    /// Per-frame allocated descriptor sets.
     descriptor_sets: Vec<vk::DescriptorSet>,
-
-    /// Per-frame camera uniform buffers.
     camera_buffers: Vec<GpuBuffer>,
-    /// Output storage image.
     output_image: GpuImage,
-    /// Image view for the output image.
     output_image_view: vk::ImageView,
-    /// Readback buffer for CPU access.
     readback_buffer: GpuBuffer,
-
-    /// Number of frames in flight.
-    #[allow(dead_code)]
     frames_in_flight: usize,
-    /// Output width in pixels.
     width: u32,
-    /// Output height in pixels.
     height: u32,
 }
 
-impl WorldRayMarchPipeline {
-    /// Create a new world ray marching pipeline.
-    ///
-    /// # Arguments
-    /// * `device` - Vulkan device handle
-    /// * `allocator` - GPU memory allocator
-    /// * `width` - Output image width
-    /// * `height` - Output image height
-    /// * `frames_in_flight` - Number of frames that can be in flight simultaneously
+impl ClipmapRayMarchPipeline {
+    /// Create a new clipmap ray marching pipeline.
     ///
     /// # Safety
-    /// The device must be valid and support compute shaders.
+    /// The Vulkan device must be valid.
     pub unsafe fn new(
         device: &ash::Device,
         allocator: &mut GpuAllocator,
@@ -64,22 +40,17 @@ impl WorldRayMarchPipeline {
         height: u32,
         frames_in_flight: usize,
     ) -> Result<Self> {
-        // 1. Create descriptor set layout
-        // Binding 0: Camera uniform buffer
-        // Binding 1: Output storage image
         let descriptor_set_layout = DescriptorSetLayoutBuilder::new()
             .uniform_buffer(0, vk::ShaderStageFlags::COMPUTE)
             .storage_image(1, vk::ShaderStageFlags::COMPUTE)
             .build(device)?;
 
-        // 2. Create push constant range for WorldRenderPushConstants
         let push_constant_range = vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::COMPUTE)
             .offset(0)
-            .size(WorldRenderPushConstants::SIZE);
+            .size(ClipmapRenderPushConstants::SIZE);
 
-        // 3. Create compute pipeline using the world shader
-        let shader_code = voxelicous_shaders::ray_march_world_shader();
+        let shader_code = voxelicous_shaders::ray_march_clipmap_shader();
         let pipeline = ComputePipeline::new(
             device,
             shader_code,
@@ -87,19 +58,17 @@ impl WorldRayMarchPipeline {
             &[push_constant_range],
         )?;
 
-        // 4. Create per-frame camera uniform buffers
         let mut camera_buffers = Vec::with_capacity(frames_in_flight);
         for i in 0..frames_in_flight {
             let buffer = allocator.create_buffer(
                 std::mem::size_of::<CameraUniforms>() as u64,
                 vk::BufferUsageFlags::UNIFORM_BUFFER,
                 MemoryLocation::CpuToGpu,
-                &format!("world_camera_uniforms_{i}"),
+                &format!("clipmap_camera_uniforms_{i}"),
             )?;
             camera_buffers.push(buffer);
         }
 
-        // 5. Create output storage image
         let image_info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(vk::Format::R8G8B8A8_UNORM)
@@ -115,13 +84,9 @@ impl WorldRayMarchPipeline {
             .usage(vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC)
             .initial_layout(vk::ImageLayout::UNDEFINED);
 
-        let output_image = allocator.create_image(
-            &image_info,
-            MemoryLocation::GpuOnly,
-            "world_ray_march_output",
-        )?;
+        let output_image =
+            allocator.create_image(&image_info, MemoryLocation::GpuOnly, "clipmap_output")?;
 
-        // 6. Create image view
         let view_info = vk::ImageViewCreateInfo::default()
             .image(output_image.image)
             .view_type(vk::ImageViewType::TYPE_2D)
@@ -138,15 +103,13 @@ impl WorldRayMarchPipeline {
             .create_image_view(&view_info, None)
             .map_err(|e| GpuError::Other(format!("Failed to create image view: {e}")))?;
 
-        // 7. Create readback buffer for CPU access
         let readback_buffer = allocator.create_buffer(
-            (width * height * 4) as u64, // RGBA8
+            (width * height * 4) as u64,
             vk::BufferUsageFlags::TRANSFER_DST,
             MemoryLocation::GpuToCpu,
-            "world_ray_march_readback",
+            "clipmap_readback",
         )?;
 
-        // 8. Create descriptor pool (one set per frame in flight)
         let pool_sizes = [
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::UNIFORM_BUFFER)
@@ -157,14 +120,11 @@ impl WorldRayMarchPipeline {
         ];
 
         let descriptor_pool = DescriptorPool::new(device, frames_in_flight as u32, &pool_sizes)?;
-
-        // 9. Allocate per-frame descriptor sets
         let layouts: Vec<_> = (0..frames_in_flight)
             .map(|_| descriptor_set_layout)
             .collect();
         let descriptor_sets = descriptor_pool.allocate(device, &layouts)?;
 
-        // 10. Write per-frame descriptor sets
         let image_info_desc = vk::DescriptorImageInfo::default()
             .image_view(output_image_view)
             .image_layout(vk::ImageLayout::GENERAL);
@@ -206,33 +166,22 @@ impl WorldRayMarchPipeline {
         })
     }
 
-    /// Record world ray march dispatch commands into a command buffer.
-    ///
-    /// # Arguments
-    /// * `device` - Vulkan device handle
-    /// * `cmd` - Command buffer (must be in recording state)
-    /// * `camera` - Camera uniforms to use
-    /// * `world_renderer` - World renderer with chunk data
-    /// * `max_steps` - Maximum ray traversal steps per chunk
-    /// * `frame_index` - Current frame index in the ring buffer
-    /// * `debug_mode` - Debug visualization mode
+    /// Record clipmap ray marching dispatch commands.
     ///
     /// # Safety
-    /// The command buffer must be in recording state.
+    /// Command buffer must be in recording state.
     pub unsafe fn record(
         &self,
         device: &ash::Device,
         cmd: vk::CommandBuffer,
         camera: &CameraUniforms,
-        world_renderer: &WorldRenderer,
+        renderer: &ClipmapRenderer,
         max_steps: u32,
         frame_index: usize,
         debug_mode: DebugMode,
     ) -> Result<()> {
-        // Update this frame's camera buffer
         self.camera_buffers[frame_index].write(std::slice::from_ref(camera))?;
 
-        // Transition output image to GENERAL layout for compute shader
         let barrier = vk::ImageMemoryBarrier2::default()
             .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
             .src_access_mask(vk::AccessFlags2::NONE)
@@ -254,7 +203,6 @@ impl WorldRayMarchPipeline {
 
         device.cmd_pipeline_barrier2(cmd, &dependency_info);
 
-        // Bind pipeline and this frame's descriptor set
         device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.pipeline.pipeline);
         device.cmd_bind_descriptor_sets(
             cmd,
@@ -265,9 +213,8 @@ impl WorldRayMarchPipeline {
             &[],
         );
 
-        // Push constants from WorldRenderer (using this frame's buffer address)
         let push_constants =
-            world_renderer.push_constants(self.width, self.height, max_steps, frame_index, debug_mode);
+            renderer.push_constants(self.width, self.height, max_steps, frame_index, debug_mode);
 
         device.cmd_push_constants(
             cmd,
@@ -277,7 +224,6 @@ impl WorldRayMarchPipeline {
             bytemuck::bytes_of(&push_constants),
         );
 
-        // Dispatch compute
         let workgroup_x = (self.width + 7) / 8;
         let workgroup_y = (self.height + 7) / 8;
         device.cmd_dispatch(cmd, workgroup_x, workgroup_y, 1);
@@ -286,13 +232,6 @@ impl WorldRayMarchPipeline {
     }
 
     /// Record commands to copy the output image to the readback buffer.
-    ///
-    /// This variant assumes the output image is already in `TRANSFER_SRC_OPTIMAL` layout
-    /// (e.g., after a blit operation).
-    ///
-    /// # Safety
-    /// Command buffer must be in recording state.
-    /// Output image must be in `TRANSFER_SRC_OPTIMAL` layout.
     pub unsafe fn record_readback_from_transfer_src(
         &self,
         device: &ash::Device,
@@ -341,20 +280,20 @@ impl WorldRayMarchPipeline {
         Ok(data)
     }
 
-    /// Get the output image dimensions.
+    /// Get output image dimensions.
     pub fn dimensions(&self) -> (u32, u32) {
         (self.width, self.height)
     }
 
-    /// Get a reference to the output image.
+    /// Access output image.
     pub fn output_image(&self) -> &GpuImage {
         &self.output_image
     }
 
-    /// Destroy all GPU resources.
+    /// Destroy GPU resources.
     ///
     /// # Safety
-    /// The device must be valid and all resources must not be in use.
+    /// The device must be idle.
     pub unsafe fn destroy(
         mut self,
         device: &ash::Device,
@@ -362,7 +301,6 @@ impl WorldRayMarchPipeline {
     ) -> Result<()> {
         device.destroy_image_view(self.output_image_view, None);
         allocator.free_image(&mut self.output_image)?;
-        // Free all per-frame camera buffers
         for camera_buffer in &mut self.camera_buffers {
             allocator.free_buffer(camera_buffer)?;
         }

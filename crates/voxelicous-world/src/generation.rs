@@ -1,11 +1,7 @@
 //! Procedural terrain generation.
 
 use noise::{Fbm, MultiFractal, NoiseFn, Perlin};
-use rayon::prelude::*;
-use voxelicous_core::constants::{CHUNK_SIZE, OCTREE_DEPTH};
-use voxelicous_core::coords::ChunkPos;
 use voxelicous_core::types::BlockId;
-use voxelicous_voxel::{SparseVoxelOctree, VoxelStorage};
 
 use crate::WorldSeed;
 
@@ -104,49 +100,16 @@ impl TerrainGenerator {
         }
     }
 
-    /// Generate a chunk's voxel data at the given position.
-    pub fn generate_chunk(&self, pos: ChunkPos) -> SparseVoxelOctree {
-        let mut svo = SparseVoxelOctree::new(OCTREE_DEPTH);
-        let world_base = pos.to_world_pos();
-
-        for lz in 0..CHUNK_SIZE {
-            for lx in 0..CHUNK_SIZE {
-                let world_x = world_base.x + lx as i64;
-                let world_z = world_base.z + lz as i64;
-                let surface_height = self.height_at(world_x, world_z);
-
-                for ly in 0..CHUNK_SIZE {
-                    let world_y = world_base.y + ly as i64;
-                    let block = self.block_at_depth(world_y as i32, surface_height);
-
-                    if block != BlockId::AIR {
-                        svo.set(lx as u32, ly as u32, lz as u32, block);
-                    }
-                }
-            }
-        }
-
-        svo
-    }
-
-    /// Generate multiple chunks in parallel.
-    ///
-    /// Returns a vector of (position, SVO) pairs.
-    pub fn generate_chunks_parallel(
-        &self,
-        positions: &[ChunkPos],
-    ) -> Vec<(ChunkPos, SparseVoxelOctree)> {
-        positions
-            .par_iter()
-            .map(|&pos| (pos, self.generate_chunk(pos)))
-            .collect()
+    /// Get block ID at world coordinates.
+    pub fn block_at_world(&self, world_x: i64, world_y: i64, world_z: i64) -> BlockId {
+        let surface_height = self.height_at(world_x, world_z);
+        self.block_at_depth(world_y as i32, surface_height)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use voxelicous_voxel::VoxelStorage;
 
     #[test]
     fn generator_deterministic() {
@@ -179,65 +142,27 @@ mod tests {
     }
 
     #[test]
-    fn chunk_generation() {
-        let gen = TerrainGenerator::with_seed(42);
-        let chunk = gen.generate_chunk(ChunkPos::new(0, 2, 0)); // Y=2 means world Y 64-95
+    fn block_sampling_matches_surface_logic() {
+        let generator = TerrainGenerator::with_seed(42);
+        let x = 32;
+        let z = -24;
+        let surface = generator.height_at(x, z);
 
-        // Chunk at sea level should have some terrain
-        assert!(!chunk.is_empty());
-    }
-
-    #[test]
-    fn chunk_above_terrain_is_mostly_empty() {
-        let gen = TerrainGenerator::with_seed(42);
-        // Y=10 means world Y 320-351, well above terrain
-        let chunk = gen.generate_chunk(ChunkPos::new(0, 10, 0));
-
-        // Should be completely empty (all air)
-        assert!(chunk.is_empty());
-    }
-
-    #[test]
-    fn chunk_below_surface_is_solid() {
-        let gen = TerrainGenerator::with_seed(42);
-        // Y=-2 means world Y -64 to -33, below sea level
-        let chunk = gen.generate_chunk(ChunkPos::new(0, -2, 0));
-
-        // Should be solid stone
-        assert!(!chunk.is_empty());
-
-        // Check a few voxels
-        assert_eq!(chunk.get(0, 0, 0), BlockId::STONE);
-        assert_eq!(chunk.get(16, 16, 16), BlockId::STONE);
-    }
-
-    #[test]
-    fn parallel_generation_matches_sequential() {
-        let gen = TerrainGenerator::with_seed(42);
-        let positions = vec![
-            ChunkPos::new(0, 0, 0),
-            ChunkPos::new(1, 0, 0),
-            ChunkPos::new(0, 0, 1),
-        ];
-
-        let parallel_results = gen.generate_chunks_parallel(&positions);
-
-        for (pos, parallel_svo) in parallel_results {
-            let sequential_svo = gen.generate_chunk(pos);
-
-            // Check some sample voxels match
-            for x in [0, 15, 31] {
-                for y in [0, 15, 31] {
-                    for z in [0, 15, 31] {
-                        assert_eq!(
-                            parallel_svo.get(x, y, z),
-                            sequential_svo.get(x, y, z),
-                            "Mismatch at ({x}, {y}, {z}) in chunk {:?}",
-                            pos
-                        );
-                    }
-                }
-            }
-        }
+        assert_eq!(
+            generator.block_at_world(x, i64::from(surface), z),
+            BlockId::GRASS
+        );
+        assert_eq!(
+            generator.block_at_world(x, i64::from(surface - 1), z),
+            BlockId::DIRT
+        );
+        assert_eq!(
+            generator.block_at_world(x, i64::from(surface - 32), z),
+            BlockId::STONE
+        );
+        assert_eq!(
+            generator.block_at_world(x, i64::from(surface + 1), z),
+            BlockId::AIR
+        );
     }
 }

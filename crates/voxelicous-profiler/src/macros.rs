@@ -52,15 +52,15 @@ impl Drop for ScopeGuard {
 /// ```ignore
 /// use voxelicous_profiler::{profile_scope, EventCategory};
 ///
-/// fn generate_chunk() {
-///     profile_scope!(EventCategory::ChunkGeneration);
-///     // ... chunk generation code
+/// fn build_page() {
+///     profile_scope!(EventCategory::ClipmapPageBuild);
+///     // ... clipmap page build code
 /// } // timing recorded here
 /// ```
 ///
 /// With context:
 /// ```ignore
-/// profile_scope!(EventCategory::ChunkGeneration, [chunk_x, chunk_y, chunk_z]);
+/// profile_scope!(EventCategory::ClipmapPageBuild, [page_x, page_y, page_z]);
 /// ```
 #[cfg(feature = "profiling")]
 #[macro_export]

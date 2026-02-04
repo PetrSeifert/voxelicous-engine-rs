@@ -99,9 +99,7 @@ pub unsafe fn create_instance(
 ///
 /// # Safety
 /// The instance must be valid.
-pub unsafe fn select_physical_device(
-    instance: &ash::Instance,
-) -> Result<vk::PhysicalDevice> {
+pub unsafe fn select_physical_device(instance: &ash::Instance) -> Result<vk::PhysicalDevice> {
     let devices = instance.enumerate_physical_devices()?;
 
     if devices.is_empty() {
@@ -124,10 +122,7 @@ pub unsafe fn select_physical_device(
 }
 
 /// Score a physical device for selection.
-unsafe fn score_physical_device(
-    instance: &ash::Instance,
-    device: vk::PhysicalDevice,
-) -> i32 {
+unsafe fn score_physical_device(instance: &ash::Instance, device: vk::PhysicalDevice) -> i32 {
     let properties = instance.get_physical_device_properties(device);
     let features = instance.get_physical_device_features(device);
 

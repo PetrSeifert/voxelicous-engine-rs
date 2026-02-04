@@ -1,26 +1,24 @@
-//! Viewer application implementation with chunk streaming.
+//! Viewer application implementation with clipmap streaming.
 
 use ash::vk;
 use glam::Vec3;
-use tracing::{debug, error, info};
+use tracing::{error, info};
 use winit::window::{CursorGrabMode, Window};
 
 use voxelicous_app::{
     AppContext, Camera, DeviceEvent, DeviceId, FrameContext, VoxelApp, WindowEvent,
 };
-use voxelicous_core::coords::ChunkPos;
 use voxelicous_input::{ActionMap, CursorMode, InputManager, KeyCode};
-use voxelicous_render::{save_screenshot, DebugMode, ScreenshotConfig, WorldRayMarchPipeline, WorldRenderer};
-use voxelicous_world::{ChunkState, StreamingConfig, TerrainConfig, World};
+use voxelicous_render::{
+    save_screenshot, ClipmapRayMarchPipeline, ClipmapRenderer, DebugMode, ScreenshotConfig,
+};
+use voxelicous_world::{ClipmapStreamingController, TerrainConfig, TerrainGenerator};
 
 #[cfg(feature = "profiling")]
-use voxelicous_profiler::{profile_scope, EventCategory, QueueSizes};
+use voxelicous_profiler::QueueSizes;
 
-/// Maximum ray marching steps per chunk.
-const MAX_STEPS: u32 = 128;
-
-/// Default maximum chunks to keep on GPU.
-const DEFAULT_MAX_GPU_CHUNKS: usize = 64;
+/// Maximum ray marching steps per pixel.
+const MAX_STEPS: u32 = 512;
 
 /// Camera movement speed in units per second.
 const CAMERA_SPEED: f32 = 30.0;
@@ -31,30 +29,20 @@ const CAMERA_SPRINT_MULT: f32 = 2.5;
 /// Mouse sensitivity for camera rotation (radians per pixel).
 const MOUSE_SENSITIVITY: f32 = 0.002;
 
-/// Configuration for chunk streaming (from CLI or defaults).
+/// Configuration for clipmap rendering (from CLI or defaults).
 #[derive(Debug, Clone)]
-pub struct StreamingParams {
-    pub load_radius: i32,
-    pub unload_radius: i32,
-    pub vertical_radius: i32,
-    pub max_gen_per_frame: usize,
+pub struct ClipmapParams {
     pub seed: u64,
 }
 
-impl Default for StreamingParams {
+impl Default for ClipmapParams {
     fn default() -> Self {
-        Self {
-            load_radius: 4,
-            unload_radius: 6,
-            vertical_radius: 2,
-            max_gen_per_frame: 8,
-            seed: 42,
-        }
+        Self { seed: 42 }
     }
 }
 
-impl StreamingParams {
-    /// Parse streaming parameters from command line arguments.
+impl ClipmapParams {
+    /// Parse clipmap parameters from command line arguments.
     pub fn from_args() -> Self {
         let mut params = Self::default();
         let args: Vec<String> = std::env::args().collect();
@@ -62,38 +50,6 @@ impl StreamingParams {
         let mut i = 1;
         while i < args.len() {
             match args[i].as_str() {
-                "--load-radius" => {
-                    if i + 1 < args.len() {
-                        if let Ok(v) = args[i + 1].parse() {
-                            params.load_radius = v;
-                            i += 1;
-                        }
-                    }
-                }
-                "--unload-radius" => {
-                    if i + 1 < args.len() {
-                        if let Ok(v) = args[i + 1].parse() {
-                            params.unload_radius = v;
-                            i += 1;
-                        }
-                    }
-                }
-                "--vertical-radius" => {
-                    if i + 1 < args.len() {
-                        if let Ok(v) = args[i + 1].parse() {
-                            params.vertical_radius = v;
-                            i += 1;
-                        }
-                    }
-                }
-                "--max-gen-per-frame" => {
-                    if i + 1 < args.len() {
-                        if let Ok(v) = args[i + 1].parse() {
-                            params.max_gen_per_frame = v;
-                            i += 1;
-                        }
-                    }
-                }
                 "--seed" => {
                     if i + 1 < args.len() {
                         if let Ok(v) = args[i + 1].parse() {
@@ -107,23 +63,18 @@ impl StreamingParams {
             i += 1;
         }
 
-        // Ensure unload radius is greater than load radius
-        if params.unload_radius <= params.load_radius {
-            params.unload_radius = params.load_radius + 4;
-        }
-
         params
     }
 }
 
-/// Viewer application state with chunk streaming.
+/// Viewer application state with clipmap streaming.
 pub struct Viewer {
-    /// World containing chunk manager and streamer.
-    world: World,
-    /// GPU renderer for world chunks.
-    world_renderer: WorldRenderer,
-    /// Ray marching pipeline for world rendering.
-    pipeline: Option<WorldRayMarchPipeline>,
+    /// Clipmap streaming controller.
+    clipmap: ClipmapStreamingController,
+    /// GPU renderer for clipmap data.
+    clipmap_renderer: ClipmapRenderer,
+    /// Ray marching pipeline for clipmap rendering.
+    pipeline: Option<ClipmapRayMarchPipeline>,
     /// Camera for viewing the world.
     camera: Camera,
     /// Camera yaw (rotation around Y axis) in radians.
@@ -134,15 +85,11 @@ pub struct Viewer {
     input: InputManager,
     /// Screenshot configuration.
     screenshot_config: ScreenshotConfig,
-    /// Streaming parameters (stored for potential runtime adjustment).
+    /// Clipmap parameters (stored for potential runtime adjustment).
     #[allow(dead_code)]
-    streaming_params: StreamingParams,
+    clipmap_params: ClipmapParams,
     /// Whether the app should exit.
     should_exit: bool,
-    /// Chunks waiting to be uploaded to GPU.
-    pending_uploads: Vec<ChunkPos>,
-    /// Chunks to be removed from GPU.
-    pending_unloads: Vec<ChunkPos>,
     /// Current debug visualization mode.
     debug_mode: DebugMode,
 }
@@ -157,43 +104,28 @@ impl VoxelApp for Viewer {
             );
         }
 
-        let streaming_params = StreamingParams::from_args();
-        info!(
-            "Streaming config: load_radius={}, unload_radius={}, vertical_radius={}, max_gen={}",
-            streaming_params.load_radius,
-            streaming_params.unload_radius,
-            streaming_params.vertical_radius,
-            streaming_params.max_gen_per_frame
-        );
+        let clipmap_params = ClipmapParams::from_args();
+        info!("Clipmap config: seed={}", clipmap_params.seed);
 
-        // Create terrain and streaming configuration
+        // Create terrain generator for clipmap sampling
         let terrain_config = TerrainConfig {
-            seed: streaming_params.seed,
+            seed: clipmap_params.seed,
             sea_level: 64,
             terrain_scale: 50.0,
             terrain_height: 32.0,
             ..Default::default()
         };
+        let generator = TerrainGenerator::new(terrain_config);
 
-        let streaming_config = StreamingConfig {
-            load_radius: streaming_params.load_radius,
-            unload_radius: streaming_params.unload_radius,
-            vertical_radius: streaming_params.vertical_radius,
-            max_gen_per_update: streaming_params.max_gen_per_frame,
-            max_compress_per_update: streaming_params.max_gen_per_frame,
-        };
-
-        // Create world with async streaming for non-blocking chunk generation
-        let mut world = World::with_async_streaming(terrain_config, streaming_config, 1024);
-
-        // Create world renderer with frames_in_flight for per-frame buffers
+        // Create clipmap streaming controller and renderer
+        let mut clipmap = ClipmapStreamingController::new(generator);
         let frames_in_flight = ctx.frames_in_flight();
-        let mut world_renderer = WorldRenderer::new(DEFAULT_MAX_GPU_CHUNKS, frames_in_flight);
+        let mut clipmap_renderer = ClipmapRenderer::new(frames_in_flight);
 
         // Create rendering pipeline with frames_in_flight for per-frame buffers
         let pipeline = unsafe {
             let mut allocator = ctx.gpu.allocator().lock();
-            WorldRayMarchPipeline::new(
+            ClipmapRayMarchPipeline::new(
                 ctx.gpu.device(),
                 &mut allocator,
                 ctx.width(),
@@ -202,7 +134,7 @@ impl VoxelApp for Viewer {
             )?
         };
 
-        info!("World ray march pipeline created");
+        info!("Clipmap ray march pipeline created");
 
         // Set up camera - start in the air above terrain
         let start_pos = Vec3::new(64.0, 120.0, 64.0);
@@ -246,79 +178,39 @@ impl VoxelApp for Viewer {
         input.set_cursor_mode(CursorMode::Locked);
         apply_cursor_mode(&ctx.window, CursorMode::Locked);
 
-        // Generate initial chunks around camera position
-        let camera_chunk = ChunkPos::new(
-            (start_pos.x / 32.0).floor() as i32,
-            (start_pos.y / 32.0).floor() as i32,
-            (start_pos.z / 32.0).floor() as i32,
-        );
-
-        // Start with a small number of chunks to avoid GPU overload
-        // The streaming system will load more as needed
-        info!("Generating initial chunks around {:?}...", camera_chunk);
-        world.generate_initial_chunks(camera_chunk, 1, 1); // 3x3x3 = 27 chunks
-        info!("Generated {} initial chunks", world.chunk_count());
-
-        // Collect initial chunks for GPU upload
-        let pending_uploads: Vec<ChunkPos> = world.chunks_ready_for_upload();
-        info!("{} chunks ready for GPU upload", pending_uploads.len());
-
-        // Upload initial chunks to GPU
+        // Initialize clipmap around the starting camera position.
+        clipmap.update(start_pos);
+        let dirty = clipmap.take_dirty_state();
         {
             let mut allocator = ctx.gpu.allocator().lock();
-            // Use frame_number 0 for initial upload
             let initial_frame_number = 0u64;
-            for pos in &pending_uploads {
-                if let Some(dag) = get_chunk_dag(&world, *pos) {
-                    if let Err(e) = world_renderer.upload_chunk(
-                        &mut allocator,
-                        ctx.gpu.device(),
-                        *pos,
-                        &dag,
-                        initial_frame_number,
-                    ) {
-                        error!("Failed to upload chunk {:?}: {}", pos, e);
-                    }
-                }
-            }
-
-            // Rebuild chunk info buffer for all frames with frustum culling and distance sorting
-            let frustum = camera.frustum();
-            for frame_idx in 0..frames_in_flight {
-                if let Err(e) = world_renderer.rebuild_chunk_info_buffer_culled(
-                    &mut allocator,
-                    ctx.gpu.device(),
-                    &frustum,
-                    camera.position,
-                    frame_idx,
-                    initial_frame_number,
-                ) {
-                    error!("Failed to rebuild chunk info buffer: {}", e);
-                }
+            if let Err(e) = clipmap_renderer.sync_from_controller(
+                &mut allocator,
+                ctx.gpu.device(),
+                &clipmap,
+                dirty,
+                0,
+                initial_frame_number,
+            ) {
+                error!("Failed to upload initial clipmap data: {e}");
             }
         }
 
-        info!(
-            "Uploaded {} chunks to GPU ({:.2} MB)",
-            world_renderer.chunk_count(),
-            world_renderer.gpu_memory_usage() as f64 / (1024.0 * 1024.0)
-        );
+        info!("Clipmap initialized");
 
         info!("Viewer initialized successfully!");
 
         Ok(Self {
-            world,
-            world_renderer,
+            clipmap,
+            clipmap_renderer,
             pipeline: Some(pipeline),
             camera,
             camera_yaw,
             camera_pitch,
             input,
             screenshot_config,
-            streaming_params,
+            clipmap_params,
             should_exit: false,
-            pending_uploads: Vec::new(),
-            pending_unloads: Vec::new(),
             debug_mode: DebugMode::default(),
         })
     }
@@ -406,35 +298,19 @@ impl VoxelApp for Viewer {
         // End input frame (must be called at end of update)
         self.input.end_frame();
 
-        // Update world streaming based on camera position (non-blocking)
-        let (needs_upload, unloaded) = self.world.update_async(self.camera.position);
-
-        // Store pending operations for render phase
-        self.pending_uploads.extend(needs_upload);
-        self.pending_unloads.extend(unloaded);
-
-        // Log streaming activity periodically
-        if ctx.frame_count % 60 == 0
-            && (!self.pending_uploads.is_empty() || !self.pending_unloads.is_empty())
-        {
-            debug!(
-                "Streaming: {} uploads pending, {} unloads, {} total chunks",
-                self.pending_uploads.len(),
-                self.pending_unloads.len(),
-                self.world.chunk_count()
-            );
-        }
+        // Update clipmap around the camera position
+        self.clipmap.update(self.camera.position);
 
         // Report queue sizes to profiler
         #[cfg(feature = "profiling")]
         {
             let queues = QueueSizes {
-                pending_uploads: self.pending_uploads.len() as u32,
-                pending_unloads: self.pending_unloads.len() as u32,
-                load_queue_length: self.world.pending_load_count() as u32,
-                chunks_generating: self.world.in_flight_count() as u32,
-                total_chunks: self.world.chunk_count() as u32,
-                gpu_chunks: self.world_renderer.chunk_count() as u32,
+                pending_page_uploads: 0,
+                pending_page_unloads: 0,
+                pending_page_builds: 0,
+                pages_building: 0,
+                resident_pages: 0,
+                gpu_pages: 0,
             };
             voxelicous_profiler::report_queue_sizes(queues);
         }
@@ -447,65 +323,27 @@ impl VoxelApp for Viewer {
         let frame_index = frame.frame_index;
         let frame_number = frame.frame_number;
 
-        // Process pending GPU operations before rendering
-        // Limit uploads/unloads per frame to balance performance vs responsiveness
-        const MAX_UPLOADS_PER_FRAME: usize = 8;
-        const MAX_UNLOADS_PER_FRAME: usize = 16;
-
+        // Sync clipmap GPU buffers before rendering
         {
             let mut allocator = ctx.gpu.allocator().lock();
 
-            // Process deferred deletions from previous frames
             if let Err(e) = self
-                .world_renderer
+                .clipmap_renderer
                 .process_deferred_deletions(&mut allocator, frame_number)
             {
                 error!("Failed to process deferred deletions: {}", e);
             }
 
-            // Upload new chunks (limited per frame)
-            let upload_count = self.pending_uploads.len().min(MAX_UPLOADS_PER_FRAME);
-            let uploads: Vec<_> = self.pending_uploads.drain(..upload_count).collect();
-
-            for pos in uploads {
-                if !self.world_renderer.has_chunk(pos) {
-                    if let Some(dag) = get_chunk_dag(&self.world, pos) {
-                        #[cfg(feature = "profiling")]
-                        profile_scope!(EventCategory::GpuUpload, [pos.x, pos.y, pos.z]);
-                        if let Err(e) = self.world_renderer.upload_chunk(
-                            &mut allocator,
-                            device,
-                            pos,
-                            &dag,
-                            frame_number,
-                        ) {
-                            error!("Failed to upload chunk {:?}: {}", pos, e);
-                        }
-                    }
-                }
-            }
-
-            // Remove unloaded chunks from GPU (limited per frame)
-            let unload_count = self.pending_unloads.len().min(MAX_UNLOADS_PER_FRAME);
-            let unloads: Vec<_> = self.pending_unloads.drain(..unload_count).collect();
-
-            for pos in unloads {
-                #[cfg(feature = "profiling")]
-                profile_scope!(EventCategory::GpuUnload, [pos.x, pos.y, pos.z]);
-                self.world_renderer.remove_chunk(pos, frame_number);
-            }
-
-            // Rebuild chunk info buffer with frustum culling and distance sorting
-            let frustum = self.camera.frustum();
-            if let Err(e) = self.world_renderer.rebuild_chunk_info_buffer_culled(
+            let dirty = self.clipmap.take_dirty_state();
+            if let Err(e) = self.clipmap_renderer.sync_from_controller(
                 &mut allocator,
                 device,
-                &frustum,
-                self.camera.position,
+                &self.clipmap,
+                dirty,
                 frame_index,
                 frame_number,
             ) {
-                error!("Failed to rebuild chunk info buffer: {}", e);
+                error!("Failed to sync clipmap GPU buffers: {e}");
             }
         }
 
@@ -517,7 +355,7 @@ impl VoxelApp for Viewer {
                 device,
                 cmd,
                 &camera_uniforms,
-                &self.world_renderer,
+                &self.clipmap_renderer,
                 MAX_STEPS,
                 frame_index,
                 self.debug_mode,
@@ -658,7 +496,7 @@ impl VoxelApp for Viewer {
             }
 
             // Create new pipeline with frames_in_flight
-            let new_pipeline = WorldRayMarchPipeline::new(
+            let new_pipeline = ClipmapRayMarchPipeline::new(
                 ctx.gpu.device(),
                 &mut allocator,
                 width,
@@ -688,12 +526,12 @@ impl VoxelApp for Viewer {
     fn cleanup(&mut self, ctx: &mut AppContext) {
         let mut allocator = ctx.gpu.allocator().lock();
 
-        // Destroy world renderer (frees all chunk GPU resources)
+        // Destroy clipmap renderer (frees all clipmap GPU resources)
         // Replace with a dummy renderer (will never be used)
-        let world_renderer =
-            std::mem::replace(&mut self.world_renderer, WorldRenderer::new(0, 1));
-        if let Err(e) = world_renderer.destroy(&mut allocator) {
-            error!("Failed to destroy world renderer: {e}");
+        let clipmap_renderer =
+            std::mem::replace(&mut self.clipmap_renderer, ClipmapRenderer::new(1));
+        if let Err(e) = clipmap_renderer.destroy(&mut allocator) {
+            error!("Failed to destroy clipmap renderer: {e}");
         }
 
         // Destroy pipeline
@@ -728,17 +566,6 @@ impl Viewer {
 
         Ok(())
     }
-}
-
-/// Helper to get the compressed DAG from a chunk.
-fn get_chunk_dag(world: &World, pos: ChunkPos) -> Option<voxelicous_voxel::SvoDag> {
-    let mut result = None;
-    world.chunk_manager.with_chunk(pos, |chunk| {
-        if chunk.state == ChunkState::Compressed {
-            result = chunk.dag.clone();
-        }
-    });
-    result
 }
 
 /// Apply cursor mode to the window.

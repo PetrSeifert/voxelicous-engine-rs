@@ -2,13 +2,13 @@
 
 
 
-Voxelicous Engine is a Rust + Vulkan voxel game engine using \*\*pure voxel ray marching\*\* - rays traverse SVO-DAG (Sparse Voxel Octree - Directed Acyclic Graph) directly with no mesh generation. Supports Windows, Linux, and macOS.
+Voxelicous Engine is a Rust + Vulkan voxel game engine using \*\*pure voxel ray marching\*\* with no mesh generation. The current rendering path is clipmap-based compute ray marching. Supports Windows, Linux, and macOS.
 
 
 
 \*\*Rendering Paths:\*\*
 
-\- \*\*Compute Ray Marching\*\*: Primary path for all Vulkan 1.3 GPUs
+\- \*\*Compute Ray Marching (Clipmap)\*\*: Active rendering path used by the viewer
 
 
 
@@ -136,17 +136,17 @@ cargo clippy --workspace           # Lint (configured: all, pedantic, nursery)
 
 voxelicous-core (foundation: types, math, ECS re-exports)
 
-├── voxelicous-voxel (SVO-DAG storage, compression, GPU format)
+├── voxelicous-voxel (clipmap storage, compression, GPU format)
 
 ├── voxelicous-gpu (Vulkan abstraction via ash, memory via gpu-allocator)
 
-│   └── voxelicous-render (compute ray marching pipeline)
+│   └── voxelicous-render (clipmap compute ray marching pipeline)
 
 │       └── voxelicous-test (headless harness)
 
 ├── voxelicous-platform (windowing via winit)
 
-├── voxelicous-world (chunk streaming, terrain generation)
+├── voxelicous-world (clipmap streaming, terrain generation)
 
 ├── voxelicous-physics (collision via rapier3d, raycasting)
 

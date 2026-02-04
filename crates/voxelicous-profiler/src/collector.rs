@@ -2,7 +2,9 @@
 
 use std::collections::HashMap;
 
-use crate::events::{CategoryStats, EventCategory, MemoryStats, ProfilerSnapshot, QueueSizes, TimingEvent};
+use crate::events::{
+    CategoryStats, EventCategory, MemoryStats, ProfilerSnapshot, QueueSizes, TimingEvent,
+};
 use crate::ring_buffer::RingBuffer;
 
 /// Number of recent samples to keep for percentile calculations.
@@ -85,13 +87,15 @@ impl Collector {
 
         for event in events {
             // Update stats
-            let stats = self.stats
+            let stats = self
+                .stats
                 .entry(event.category)
                 .or_insert_with(|| CategoryStats::new(event.category));
             stats.record(event.duration_ns);
 
             // Store sample for percentile calculation
-            let samples = self.samples
+            let samples = self
+                .samples
                 .entry(event.category)
                 .or_insert_with(|| Vec::with_capacity(SAMPLE_HISTORY_SIZE));
             if samples.len() >= SAMPLE_HISTORY_SIZE {
@@ -128,11 +132,11 @@ impl Collector {
             EventCategory::FrameRender => 3,
             EventCategory::GpuSubmit => 4,
             EventCategory::FramePresent => 5,
-            EventCategory::ChunkGeneration => 10,
-            EventCategory::ChunkCompression => 11,
-            EventCategory::GpuUpload => 12,
-            EventCategory::GpuUnload => 13,
-            EventCategory::WorldUpdate => 14,
+            EventCategory::ClipmapPageBuild => 10,
+            EventCategory::ClipmapEncode => 11,
+            EventCategory::GpuClipmapUpload => 12,
+            EventCategory::GpuClipmapUnload => 13,
+            EventCategory::ClipmapUpdate => 14,
             EventCategory::Custom(id) => 100 + id as i32,
         });
 
@@ -163,7 +167,7 @@ mod tests {
 
         collector.record_duration(EventCategory::Frame, 16_000_000); // 16ms
         collector.record_duration(EventCategory::Frame, 17_000_000); // 17ms
-        collector.record_duration(EventCategory::ChunkGeneration, 5_000_000); // 5ms
+        collector.record_duration(EventCategory::ClipmapPageBuild, 5_000_000); // 5ms
 
         collector.flush();
 
@@ -172,7 +176,9 @@ mod tests {
         assert_eq!(frame_stats.min_ns, 16_000_000);
         assert_eq!(frame_stats.max_ns, 17_000_000);
 
-        let gen_stats = collector.get_stats(EventCategory::ChunkGeneration).unwrap();
+        let gen_stats = collector
+            .get_stats(EventCategory::ClipmapPageBuild)
+            .unwrap();
         assert_eq!(gen_stats.count, 1);
     }
 

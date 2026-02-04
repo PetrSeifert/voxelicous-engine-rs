@@ -17,7 +17,6 @@ glam.workspace = true
 bytemuck.workspace = true
 gpu-allocator.workspace = true
 tracing.workspace = true
-hashbrown.workspace = true
 image.workspace = true
 
 [dev-dependencies]

@@ -2,21 +2,19 @@
 //!
 //! This crate provides:
 //! - Compute shader ray marching
-//! - Multi-chunk world rendering
+//! - Clipmap world rendering
 //! - Post-processing effects
 //! - Camera and view management
 //! - Screenshot capture utilities
 
 pub mod camera;
+pub mod clipmap_ray_march_pipeline;
+pub mod clipmap_render;
 pub mod debug;
 pub mod screenshot;
-pub mod svo_upload;
-pub mod world_ray_march_pipeline;
-pub mod world_render;
 
 pub use camera::{Camera, CameraUniforms};
+pub use clipmap_ray_march_pipeline::ClipmapRayMarchPipeline;
+pub use clipmap_render::{ClipmapRenderPushConstants, ClipmapRenderer, GpuClipmapInfo};
 pub use debug::DebugMode;
 pub use screenshot::{parse_frame_indices, save_screenshot, ScreenshotConfig, ScreenshotError};
-pub use svo_upload::GpuSvoDag;
-pub use world_ray_march_pipeline::WorldRayMarchPipeline;
-pub use world_render::{GpuChunkInfo, WorldRenderPushConstants, WorldRenderer};

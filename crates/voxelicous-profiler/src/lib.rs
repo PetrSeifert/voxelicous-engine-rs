@@ -1,7 +1,7 @@
 //! Performance profiling for the Voxelicous engine.
 //!
 //! This crate provides instrumentation for measuring performance of various
-//! engine operations like frame timing, chunk generation, GPU uploads, etc.
+//! engine operations like frame timing, clipmap page builds, GPU uploads, etc.
 //!
 //! # Feature Flags
 //!

@@ -16,10 +16,7 @@ voxelicous-voxel.workspace = true
 voxelicous-profiler = { workspace = true, optional = true }
 noise.workspace = true
 rayon.workspace = true
-hashbrown.workspace = true
-parking_lot.workspace = true
 glam.workspace = true
-crossbeam.workspace = true
 
 [lints]
 workspace = true

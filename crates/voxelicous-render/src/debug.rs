@@ -1,7 +1,7 @@
 //! Debug rendering modes for visualization and profiling.
 //!
 //! Provides toggleable debug visualization modes for ray marching, including
-//! heatmaps and SVO visualization, controlled by hotkeys.
+//! heatmaps and clipmap boundary visualization, controlled by hotkeys.
 
 /// Debug visualization mode for rendering.
 ///
@@ -14,13 +14,13 @@ pub enum DebugMode {
     None = 0,
     /// Heatmap showing computational cost per pixel (traversal steps).
     TraversalSteps = 1,
-    /// Heatmap showing SVO depth reached.
+    /// Heatmap showing LOD index reached.
     NodeDepth = 2,
     /// Heatmap showing distance from camera.
     Distance = 3,
     /// Surface normals as RGB.
     Normals = 4,
-    /// Red wireframe overlay on chunk edges.
+    /// Red overlay on clipmap LOD boundaries.
     ChunkBoundaries = 5,
 }
 

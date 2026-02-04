@@ -90,11 +90,7 @@ pub fn record_duration(category: EventCategory, duration_ns: u64) {
 
 /// Record a duration with context.
 #[inline]
-pub fn record_duration_with_context(
-    category: EventCategory,
-    duration_ns: u64,
-    context: [i32; 3],
-) {
+pub fn record_duration_with_context(category: EventCategory, duration_ns: u64, context: [i32; 3]) {
     record(TimingEvent::with_context(category, duration_ns, context));
 }
 
@@ -116,7 +112,8 @@ pub fn report_memory(memory: MemoryStats) {
 pub fn end_frame(frame_number: u64, fps: f32, frame_time_ms: f32) {
     let mut guard = PROFILER.lock();
     if let Some(ctx) = guard.as_mut() {
-        ctx.collector.set_frame_info(frame_number, fps, frame_time_ms);
+        ctx.collector
+            .set_frame_info(frame_number, fps, frame_time_ms);
         ctx.collector.flush();
 
         // Send snapshot to connected clients

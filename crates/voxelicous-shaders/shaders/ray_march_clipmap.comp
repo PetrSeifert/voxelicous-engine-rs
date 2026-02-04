@@ -1,0 +1,777 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_ARB_gpu_shader_int64 : require
+
+// Constants
+const uint LOD_COUNT = 6u;
+const uint PAGE_GRID = 16u;
+const uint PAGE_BRICKS = 64u;
+const uint PAGE_BRICKS_AXIS = 4u;
+const uint BRICK_SIZE = 8u;
+const uint PAGE_VOXELS_AXIS = 32u;
+
+const uint STRIDE_PALETTE16 = 288u;
+const uint STRIDE_PALETTE32 = 384u;
+const uint STRIDE_RAW16 = 1024u;
+const float DDA_EPS = 1e-4;
+
+// Buffer references
+layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer ClipmapInfoBuffer {
+    uint64_t page_brick_indices_addr[LOD_COUNT];
+    uint64_t page_occ_addr[LOD_COUNT];
+    uint64_t page_coord_addr[LOD_COUNT];
+    uint64_t brick_header_addr;
+    uint64_t palette16_addr;
+    uint64_t palette32_addr;
+    uint64_t raw16_addr;
+    uint64_t _pad0[2];
+    ivec4 origin[LOD_COUNT];
+    uvec4 voxel_size[LOD_COUNT];
+    vec4 lod_aabb_min[LOD_COUNT];
+    vec4 lod_aabb_max[LOD_COUNT];
+};
+
+layout(buffer_reference, scalar, buffer_reference_align = 4) readonly buffer PageBrickBuffer {
+    uint data[];
+};
+
+layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer PageOccBuffer {
+    uvec2 data[];
+};
+
+layout(buffer_reference, scalar, buffer_reference_align = 16) readonly buffer PageCoordBuffer {
+    ivec4 data[];
+};
+
+layout(buffer_reference, scalar, buffer_reference_align = 4) readonly buffer ByteAddressBuffer {
+    uint data[];
+};
+
+// Debug mode constants
+const uint DEBUG_NONE = 0u;
+const uint DEBUG_TRAVERSAL_STEPS = 1u;
+const uint DEBUG_NODE_DEPTH = 2u;
+const uint DEBUG_DISTANCE = 3u;
+const uint DEBUG_NORMALS = 4u;
+const uint DEBUG_CHUNK_BOUNDARIES = 5u;
+
+// Push constants
+layout(push_constant) uniform PushConstants {
+    uvec2 screen_size;
+    uint max_steps;
+    uint _pad0;
+    uint64_t clipmap_info_address;
+    uint debug_mode;
+    uint _pad1;
+} pc;
+
+// Camera uniforms
+layout(set = 0, binding = 0) uniform CameraData {
+    mat4 view;
+    mat4 projection;
+    mat4 inverse_view;
+    mat4 inverse_projection;
+    vec4 position;
+    vec4 direction;
+} camera;
+
+// Output image
+layout(set = 0, binding = 1, rgba8) writeonly uniform image2D output_image;
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+// Helper functions
+bool ray_aabb_intersect(vec3 ray_origin, vec3 ray_dir_inv,
+                        vec3 box_min, vec3 box_max,
+                        out float t_near, out float t_far) {
+    vec3 t1 = (box_min - ray_origin) * ray_dir_inv;
+    vec3 t2 = (box_max - ray_origin) * ray_dir_inv;
+
+    vec3 t_min_v = min(t1, t2);
+    vec3 t_max_v = max(t1, t2);
+
+    t_near = max(max(t_min_v.x, t_min_v.y), t_min_v.z);
+    t_far = min(min(t_max_v.x, t_max_v.y), t_max_v.z);
+
+    return t_near <= t_far && t_far >= 0.0;
+}
+
+bool point_inside_aabb(vec3 p, vec3 box_min, vec3 box_max) {
+    return all(greaterThanEqual(p, box_min)) && all(lessThanEqual(p, box_max));
+}
+
+uint hash_u32(uint x) {
+    x ^= x >> 16u;
+    x *= 0x7FEB352Du;
+    x ^= x >> 15u;
+    x *= 0x846CA68Bu;
+    x ^= x >> 16u;
+    return x;
+}
+
+float hash_uvec3(uvec3 v) {
+    uint h = hash_u32(v.x ^ hash_u32(v.y) ^ hash_u32(v.z));
+    return float(h) * (1.0 / 4294967295.0);
+}
+
+uint read_u8(ByteAddressBuffer buf, uint byte_idx) {
+    uint word = buf.data[byte_idx >> 2];
+    uint shift = (byte_idx & 3u) * 8u;
+    return (word >> shift) & 0xFFu;
+}
+
+uint read_u16(ByteAddressBuffer buf, uint byte_idx) {
+    uint lo = read_u8(buf, byte_idx);
+    uint hi = read_u8(buf, byte_idx + 1u);
+    return lo | (hi << 8u);
+}
+
+uint read_u32(ByteAddressBuffer buf, uint byte_idx) {
+    uint b0 = read_u8(buf, byte_idx);
+    uint b1 = read_u8(buf, byte_idx + 1u);
+    uint b2 = read_u8(buf, byte_idx + 2u);
+    uint b3 = read_u8(buf, byte_idx + 3u);
+    return b0 | (b1 << 8u) | (b2 << 16u) | (b3 << 24u);
+}
+
+uint palette16_lookup(ByteAddressBuffer buf, uint base, uint voxel_idx) {
+    uint palette_idx = voxel_idx >> 1;
+    uint packed = read_u8(buf, base + 32u + palette_idx);
+    uint nibble = (voxel_idx & 1u) == 0u ? (packed & 0xFu) : ((packed >> 4u) & 0xFu);
+    return read_u16(buf, base + nibble * 2u);
+}
+
+uint palette32_lookup(ByteAddressBuffer buf, uint base, uint voxel_idx, uint palette_len) {
+    uint bit_idx = voxel_idx * 5u;
+    uint byte_idx = bit_idx >> 3u;
+    uint bit_off = bit_idx & 7u;
+    uint b0 = read_u8(buf, base + 64u + byte_idx);
+    uint b1 = (byte_idx + 1u < 320u) ? read_u8(buf, base + 64u + byte_idx + 1u) : 0u;
+    uint raw = b0 | (b1 << 8u);
+    uint idx = (raw >> bit_off) & 0x1Fu;
+    if (idx >= palette_len) {
+        idx = 0u;
+    }
+    return read_u16(buf, base + idx * 2u);
+}
+
+uint raw16_lookup(ByteAddressBuffer buf, uint base, uint voxel_idx) {
+    return read_u16(buf, base + voxel_idx * 2u);
+}
+
+uint read_brick_voxel(ByteAddressBuffer pool, uint base, uint voxel_idx, uint encoding, uint palette_len) {
+    if (encoding == 0u) {
+        return palette16_lookup(pool, base, voxel_idx);
+    } else if (encoding == 1u) {
+        return palette32_lookup(pool, base, voxel_idx, palette_len);
+    }
+    return raw16_lookup(pool, base, voxel_idx);
+}
+
+vec3 calculate_normal(vec3 hit_point, vec3 box_min, vec3 box_max) {
+    vec3 center = (box_min + box_max) * 0.5;
+    vec3 half_size = (box_max - box_min) * 0.5;
+    vec3 rel = hit_point - center;
+    vec3 abs_rel = abs(rel) / half_size;
+
+    if (abs_rel.x > abs_rel.y && abs_rel.x > abs_rel.z) {
+        return vec3(sign(rel.x), 0.0, 0.0);
+    } else if (abs_rel.y > abs_rel.z) {
+        return vec3(0.0, sign(rel.y), 0.0);
+    } else {
+        return vec3(0.0, 0.0, sign(rel.z));
+    }
+}
+
+struct RayHit {
+    bool hit;
+    uint block_id;
+    vec3 position;
+    vec3 normal;
+    float t;
+    uint traversal_steps;
+    uint lod;
+};
+
+struct Interval {
+    float t_near;
+    float t_far;
+    uint lod;
+};
+
+int wrap_index(int v, int size) {
+    int r = v % size;
+    return r < 0 ? r + size : r;
+}
+
+RayHit trace_brick(
+    vec3 ray_origin,
+    vec3 ray_dir,
+    float t_start,
+    float t_end,
+    vec3 brick_min,
+    float voxel_size,
+    uint brick_id,
+    uint max_steps,
+    inout uint steps,
+    ByteAddressBuffer header_buf,
+    ByteAddressBuffer pal16_buf,
+    ByteAddressBuffer pal32_buf,
+    ByteAddressBuffer raw_buf
+) {
+    RayHit hit;
+    hit.hit = false;
+    hit.block_id = 0u;
+    hit.t = t_end;
+    hit.position = vec3(0.0);
+    hit.normal = vec3(0.0);
+    hit.traversal_steps = 0u;
+    hit.lod = 0u;
+
+    uint header_base = brick_id * 32u;
+    uint palette_len = read_u8(header_buf, header_base + 0u);
+    uint encoding = read_u8(header_buf, header_base + 1u);
+    uint data_index = read_u32(header_buf, header_base + 4u);
+    uint occ_l0_lo = read_u32(header_buf, header_base + 8u);
+    uint occ_l0_hi = read_u32(header_buf, header_base + 12u);
+    if ((occ_l0_lo | occ_l0_hi) == 0u) {
+        return hit;
+    }
+
+    float local_eps = max(DDA_EPS, voxel_size * 0.01);
+    float t = t_start + local_eps;
+    vec3 inv_dir = 1.0 / ray_dir;
+    vec3 pos = ray_origin + ray_dir * t;
+
+    vec3 local = (pos - brick_min) / voxel_size;
+    ivec3 voxel = ivec3(floor(local));
+    voxel = clamp(voxel, ivec3(0), ivec3(int(BRICK_SIZE) - 1));
+
+    ivec3 step = ivec3(sign(ray_dir));
+    vec3 voxel_min = brick_min + vec3(voxel) * voxel_size;
+    vec3 next_boundary = voxel_min + vec3(step) * voxel_size;
+    next_boundary = mix(voxel_min, voxel_min + vec3(voxel_size), greaterThan(step, ivec3(0)));
+
+    vec3 t_max = vec3(t) + (next_boundary - pos) * inv_dir;
+    vec3 t_delta = abs(vec3(voxel_size) * inv_dir);
+
+    while (t <= t_end && steps < max_steps) {
+        steps++;
+
+        uint voxel_idx = uint(voxel.x + voxel.y * int(BRICK_SIZE) + voxel.z * int(BRICK_SIZE * BRICK_SIZE));
+        uint block_id = 0u;
+        if (encoding == 0u) {
+            block_id = read_brick_voxel(pal16_buf, data_index * STRIDE_PALETTE16, voxel_idx, encoding, palette_len);
+        } else if (encoding == 1u) {
+            block_id = read_brick_voxel(pal32_buf, data_index * STRIDE_PALETTE32, voxel_idx, encoding, palette_len);
+        } else {
+            block_id = read_brick_voxel(raw_buf, data_index * STRIDE_RAW16, voxel_idx, encoding, palette_len);
+        }
+
+        if (block_id != 0u) {
+            float hit_t = max(t, 0.001);
+            vec3 hit_pos = ray_origin + ray_dir * hit_t;
+            vec3 vmin = brick_min + vec3(voxel) * voxel_size;
+            vec3 vmax = vmin + vec3(voxel_size);
+
+            hit.hit = true;
+            hit.block_id = block_id;
+            hit.t = hit_t;
+            hit.position = hit_pos;
+            hit.normal = calculate_normal(hit_pos, vmin, vmax);
+            hit.traversal_steps = steps;
+            return hit;
+        }
+
+        float t_next = min(min(t_max.x, t_max.y), t_max.z);
+        if (t_next >= t_end) {
+            break;
+        }
+
+        // Advance to next voxel
+        if (t_max.x < t_max.y && t_max.x < t_max.z) {
+            t = t_max.x;
+            t_max.x += t_delta.x;
+            voxel.x += step.x;
+            if (voxel.x < 0 || voxel.x >= int(BRICK_SIZE)) {
+                break;
+            }
+        } else if (t_max.y < t_max.z) {
+            t = t_max.y;
+            t_max.y += t_delta.y;
+            voxel.y += step.y;
+            if (voxel.y < 0 || voxel.y >= int(BRICK_SIZE)) {
+                break;
+            }
+        } else {
+            t = t_max.z;
+            t_max.z += t_delta.z;
+            voxel.z += step.z;
+            if (voxel.z < 0 || voxel.z >= int(BRICK_SIZE)) {
+                break;
+            }
+        }
+    }
+
+    return hit;
+}
+
+RayHit trace_interval(
+    vec3 ray_origin,
+    vec3 ray_dir,
+    float t_start,
+    float t_end,
+    uint lod,
+    ClipmapInfoBuffer clipmap,
+    out bool had_missing_pages
+) {
+    RayHit miss;
+    miss.hit = false;
+    miss.block_id = 0u;
+    miss.t = t_end;
+    miss.position = vec3(0.0);
+    miss.normal = vec3(0.0);
+    miss.traversal_steps = 0u;
+    miss.lod = lod;
+    had_missing_pages = false;
+
+    vec3 inv_dir = 1.0 / ray_dir;
+    float voxel_size = float(clipmap.voxel_size[lod].x);
+    float page_size = voxel_size * float(PAGE_VOXELS_AXIS);
+    float brick_size = voxel_size * float(BRICK_SIZE);
+    float local_eps = max(DDA_EPS, voxel_size * 0.01);
+
+    float t = t_start + local_eps;
+    vec3 start_pos = ray_origin + ray_dir * t;
+    ivec3 page = ivec3(floor(start_pos / page_size));
+    ivec3 step = ivec3(sign(ray_dir));
+
+    vec3 page_min = vec3(page) * page_size;
+    vec3 next_boundary = mix(page_min, page_min + vec3(page_size), greaterThan(step, ivec3(0)));
+    vec3 t_max = vec3(t) + (next_boundary - start_pos) * inv_dir;
+    vec3 t_delta = abs(vec3(page_size) * inv_dir);
+    uint steps = 0u;
+
+    PageBrickBuffer page_bricks = PageBrickBuffer(clipmap.page_brick_indices_addr[lod]);
+    PageOccBuffer page_occ = PageOccBuffer(clipmap.page_occ_addr[lod]);
+    PageCoordBuffer page_coords = PageCoordBuffer(clipmap.page_coord_addr[lod]);
+    ByteAddressBuffer header_buf = ByteAddressBuffer(clipmap.brick_header_addr);
+    ByteAddressBuffer pal16_buf = ByteAddressBuffer(clipmap.palette16_addr);
+    ByteAddressBuffer pal32_buf = ByteAddressBuffer(clipmap.palette32_addr);
+    ByteAddressBuffer raw_buf = ByteAddressBuffer(clipmap.raw16_addr);
+
+    while (t <= t_end && steps < pc.max_steps) {
+        int px = wrap_index(page.x, int(PAGE_GRID));
+        int py = wrap_index(page.y, int(PAGE_GRID));
+        int pz = wrap_index(page.z, int(PAGE_GRID));
+        uint page_index = uint(px + py * int(PAGE_GRID) + pz * int(PAGE_GRID * PAGE_GRID));
+
+        float t_next = min(min(t_max.x, t_max.y), t_max.z);
+        float t_page_end = min(t_next, t_end);
+
+        ivec3 slot_coord = page_coords.data[page_index].xyz;
+        bool slot_matches = all(equal(slot_coord, page));
+        if (!slot_matches) {
+            had_missing_pages = true;
+        }
+        uvec2 occ = page_occ.data[page_index];
+        if (slot_matches && (occ.x | occ.y) != 0u) {
+            vec3 page_origin = vec3(page) * page_size;
+            vec3 page_start = ray_origin + ray_dir * (t + local_eps);
+            ivec3 brick = ivec3(floor((page_start - page_origin) / brick_size));
+            brick = clamp(brick, ivec3(0), ivec3(int(PAGE_BRICKS_AXIS) - 1));
+
+            ivec3 brick_step = ivec3(sign(ray_dir));
+            vec3 brick_min = page_origin + vec3(brick) * brick_size;
+            vec3 brick_boundary = mix(brick_min, brick_min + vec3(brick_size), greaterThan(brick_step, ivec3(0)));
+            vec3 brick_t_max = vec3(t) + (brick_boundary - page_start) * inv_dir;
+            vec3 brick_t_delta = abs(vec3(brick_size) * inv_dir);
+
+            float tb = t;
+            while (tb <= t_page_end && steps < pc.max_steps) {
+                uint brick_idx = uint(brick.x + brick.y * int(PAGE_BRICKS_AXIS) + brick.z * int(PAGE_BRICKS_AXIS * PAGE_BRICKS_AXIS));
+                uint brick_id = page_bricks.data[page_index * PAGE_BRICKS + brick_idx];
+
+                float tb_next = min(min(brick_t_max.x, brick_t_max.y), brick_t_max.z);
+                float tb_end = min(tb_next, t_page_end);
+
+                if (brick_id != 0u) {
+                    RayHit brick_hit = trace_brick(
+                        ray_origin,
+                        ray_dir,
+                        tb,
+                        tb_end,
+                        page_origin + vec3(brick) * brick_size,
+                        voxel_size,
+                        brick_id,
+                        pc.max_steps,
+                        steps,
+                        header_buf,
+                        pal16_buf,
+                        pal32_buf,
+                        raw_buf
+                    );
+
+                    if (brick_hit.hit) {
+                        brick_hit.lod = lod;
+                        brick_hit.traversal_steps = steps;
+                        return brick_hit;
+                    }
+                }
+
+                if (tb_next >= t_page_end) {
+                    break;
+                }
+
+                if (brick_t_max.x < brick_t_max.y && brick_t_max.x < brick_t_max.z) {
+                    tb = brick_t_max.x;
+                    brick_t_max.x += brick_t_delta.x;
+                    brick.x += brick_step.x;
+                    if (brick.x < 0 || brick.x >= int(PAGE_BRICKS_AXIS)) {
+                        break;
+                    }
+                } else if (brick_t_max.y < brick_t_max.z) {
+                    tb = brick_t_max.y;
+                    brick_t_max.y += brick_t_delta.y;
+                    brick.y += brick_step.y;
+                    if (brick.y < 0 || brick.y >= int(PAGE_BRICKS_AXIS)) {
+                        break;
+                    }
+                } else {
+                    tb = brick_t_max.z;
+                    brick_t_max.z += brick_t_delta.z;
+                    brick.z += brick_step.z;
+                    if (brick.z < 0 || brick.z >= int(PAGE_BRICKS_AXIS)) {
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (t_next >= t_end) {
+            break;
+        }
+
+        if (t_max.x < t_max.y && t_max.x < t_max.z) {
+            t = t_max.x;
+            t_max.x += t_delta.x;
+            page.x += step.x;
+        } else if (t_max.y < t_max.z) {
+            t = t_max.y;
+            t_max.y += t_delta.y;
+            page.y += step.y;
+        } else {
+            t = t_max.z;
+            t_max.z += t_delta.z;
+            page.z += step.z;
+        }
+
+        steps++;
+    }
+
+    miss.traversal_steps = steps;
+    return miss;
+}
+
+RayHit trace_clipmap(vec3 ray_origin, vec3 ray_dir, uvec2 pixel) {
+    RayHit closest;
+    closest.hit = false;
+    closest.block_id = 0u;
+    closest.t = 1e30;
+    closest.position = vec3(0.0);
+    closest.normal = vec3(0.0);
+    closest.traversal_steps = 0u;
+    closest.lod = 0u;
+
+    ClipmapInfoBuffer clipmap = ClipmapInfoBuffer(pc.clipmap_info_address);
+    vec3 inv_dir = 1.0 / ray_dir;
+
+    Interval intervals[12];
+    int interval_count = 0;
+
+    for (uint lod = 0u; lod < LOD_COUNT; lod++) {
+        if (clipmap.voxel_size[lod].x == 0u) {
+            continue;
+        }
+        vec3 box_min = clipmap.lod_aabb_min[lod].xyz;
+        vec3 box_max = clipmap.lod_aabb_max[lod].xyz;
+
+        float t_near;
+        float t_far;
+        if (!ray_aabb_intersect(ray_origin, inv_dir, box_min, box_max, t_near, t_far)) {
+            continue;
+        }
+
+        if (lod == 0u) {
+            intervals[interval_count++] = Interval(t_near, t_far, lod);
+        } else {
+            vec3 inner_min_full = clipmap.lod_aabb_min[lod - 1u].xyz;
+            vec3 inner_max_full = clipmap.lod_aabb_max[lod - 1u].xyz;
+            float transition_band = float(PAGE_VOXELS_AXIS) * float(clipmap.voxel_size[lod - 1u].x);
+            vec3 inner_min = inner_min_full + vec3(transition_band);
+            vec3 inner_max = inner_max_full - vec3(transition_band);
+            if (any(greaterThanEqual(inner_min, inner_max))) {
+                inner_min = inner_min_full;
+                inner_max = inner_max_full;
+            }
+
+            float t_in_near;
+            float t_in_far;
+            bool inner_hit = ray_aabb_intersect(ray_origin, inv_dir, inner_min, inner_max, t_in_near, t_in_far);
+            // Keep shell trimming small enough to avoid visible seam gaps at LOD boundaries.
+            float shell_eps = max(DDA_EPS, float(clipmap.voxel_size[lod].x) * 0.002);
+
+            if (!inner_hit) {
+                intervals[interval_count++] = Interval(t_near, t_far, lod);
+            } else {
+                if (t_in_near - shell_eps > t_near) {
+                    intervals[interval_count++] = Interval(t_near, t_in_near - shell_eps, lod);
+                }
+                if (t_in_far + shell_eps < t_far) {
+                    intervals[interval_count++] = Interval(t_in_far + shell_eps, t_far, lod);
+                }
+            }
+        }
+    }
+
+    // Sort intervals front-to-back (simple bubble for <=12)
+    for (int i = 0; i < interval_count - 1; i++) {
+        for (int j = 0; j < interval_count - i - 1; j++) {
+            if (intervals[j].t_near > intervals[j + 1].t_near) {
+                Interval tmp = intervals[j];
+                intervals[j] = intervals[j + 1];
+                intervals[j + 1] = tmp;
+            }
+        }
+    }
+
+    uint total_steps = 0u;
+    RayHit rejected_hit;
+    rejected_hit.hit = false;
+    rejected_hit.block_id = 0u;
+    rejected_hit.t = 1e30;
+    rejected_hit.position = vec3(0.0);
+    rejected_hit.normal = vec3(0.0);
+    rejected_hit.traversal_steps = 0u;
+    rejected_hit.lod = 0u;
+
+    for (int i = 0; i < interval_count; i++) {
+        Interval interval = intervals[i];
+        float t_start = max(interval.t_near, 0.0);
+        float t_end = interval.t_far;
+        if (t_start >= t_end) {
+            continue;
+        }
+
+        bool missing_pages = false;
+        bool used_missing_fallback = false;
+        RayHit hit = trace_interval(
+            ray_origin, ray_dir, t_start, t_end, interval.lod, clipmap, missing_pages
+        );
+        total_steps += hit.traversal_steps;
+
+        if (!hit.hit && missing_pages) {
+            for (uint fallback_lod = interval.lod + 1u; fallback_lod < LOD_COUNT; fallback_lod++) {
+                if (clipmap.voxel_size[fallback_lod].x == 0u) {
+                    continue;
+                }
+
+                bool fallback_missing = false;
+                RayHit fallback_hit = trace_interval(
+                    ray_origin, ray_dir, t_start, t_end, fallback_lod, clipmap, fallback_missing
+                );
+                total_steps += fallback_hit.traversal_steps;
+
+                if (fallback_hit.hit) {
+                    hit = fallback_hit;
+                    used_missing_fallback = true;
+                    break;
+                }
+
+                if (!fallback_missing) {
+                    break;
+                }
+            }
+        }
+
+        if (hit.hit) {
+            bool accept_hit = true;
+
+            if (!used_missing_fallback && hit.lod > 0u) {
+                vec3 inner_min = clipmap.lod_aabb_min[hit.lod - 1u].xyz;
+                vec3 inner_max = clipmap.lod_aabb_max[hit.lod - 1u].xyz;
+                float transition_band = float(PAGE_VOXELS_AXIS) * float(clipmap.voxel_size[hit.lod - 1u].x);
+
+                if (transition_band > 0.0 && point_inside_aabb(hit.position, inner_min, inner_max)) {
+                    vec3 edge_dist = min(hit.position - inner_min, inner_max - hit.position);
+                    float dist_to_edge = max(min(min(edge_dist.x, edge_dist.y), edge_dist.z), 0.0);
+                    // Prefer coarse near the seam edge, fade to fine toward clipmap interior.
+                    float coarse_prob = 1.0 - clamp(dist_to_edge / transition_band, 0.0, 1.0);
+
+                    float seed_voxel = max(float(clipmap.voxel_size[hit.lod - 1u].x), 1.0);
+                    ivec3 q = ivec3(floor(hit.position / seed_voxel));
+                    uvec3 seed = uvec3(
+                        pixel.x ^ (uint(q.x) * 73856093u),
+                        pixel.y ^ (uint(q.y) * 19349663u),
+                        (uint(q.z) * 83492791u) ^ (hit.lod * 2654435761u)
+                    );
+                    float rnd = hash_uvec3(seed);
+                    if (rnd > coarse_prob) {
+                        accept_hit = false;
+                    }
+                }
+            }
+
+            if (!accept_hit) {
+                // Keep a fallback so stochastic seam rejection does not create terrain holes
+                // when the finer LOD misses due precision/streaming edge cases.
+                if (!rejected_hit.hit || hit.t < rejected_hit.t) {
+                    rejected_hit = hit;
+                }
+                continue;
+            }
+        }
+
+        if (hit.hit && hit.t < closest.t) {
+            closest = hit;
+            closest.traversal_steps = total_steps;
+            break;
+        }
+    }
+
+    if (!closest.hit && rejected_hit.hit) {
+        closest = rejected_hit;
+    }
+
+    closest.traversal_steps = total_steps;
+    return closest;
+}
+
+// Debug visualization helpers
+vec3 turbo_colormap(float t) {
+    t = clamp(t, 0.0, 1.0);
+    const vec4 kRedVec4 = vec4(0.13572138, 4.61539260, -42.66032258, 132.13108234);
+    const vec4 kGreenVec4 = vec4(0.09140261, 2.19418839, 4.84296658, -14.18503333);
+    const vec4 kBlueVec4 = vec4(0.10667330, 12.64194608, -60.58204836, 110.36276771);
+    const vec2 kRedVec2 = vec2(-152.94239396, 59.28637943);
+    const vec2 kGreenVec2 = vec2(4.27729857, 2.82956604);
+    const vec2 kBlueVec2 = vec2(-89.90310912, 27.34824973);
+
+    float t2 = t * t;
+    float t3 = t2 * t;
+    float t4 = t3 * t;
+    float t5 = t4 * t;
+
+    vec3 color;
+    color.r = kRedVec4.x + kRedVec4.y * t + kRedVec4.z * t2 + kRedVec4.w * t3 + kRedVec2.x * t4 + kRedVec2.y * t5;
+    color.g = kGreenVec4.x + kGreenVec4.y * t + kGreenVec4.z * t2 + kGreenVec4.w * t3 + kGreenVec2.x * t4 + kGreenVec2.y * t5;
+    color.b = kBlueVec4.x + kBlueVec4.y * t + kBlueVec4.z * t2 + kBlueVec4.w * t3 + kBlueVec2.x * t4 + kBlueVec2.y * t5;
+
+    return clamp(color, 0.0, 1.0);
+}
+
+vec3 debug_normals(vec3 n) {
+    return n * 0.5 + 0.5;
+}
+
+bool is_on_lod_boundary(vec3 world_pos, ClipmapInfoBuffer clipmap, float threshold) {
+    for (uint i = 0u; i < LOD_COUNT; i++) {
+        vec3 minb = clipmap.lod_aabb_min[i].xyz;
+        vec3 maxb = clipmap.lod_aabb_max[i].xyz;
+        if (world_pos.x - minb.x < threshold || maxb.x - world_pos.x < threshold ||
+            world_pos.y - minb.y < threshold || maxb.y - world_pos.y < threshold ||
+            world_pos.z - minb.z < threshold || maxb.z - world_pos.z < threshold) {
+            return true;
+        }
+    }
+    return false;
+}
+
+vec3 get_block_color(uint block_id) {
+    switch (block_id) {
+        case 1u: return vec3(0.5, 0.5, 0.5);
+        case 2u: return vec3(0.54, 0.35, 0.17);
+        case 3u: return vec3(0.34, 0.49, 0.27);
+        default: return vec3(0.8, 0.2, 0.8);
+    }
+}
+
+vec3 shade(RayHit hit, vec3 ray_dir) {
+    if (!hit.hit) {
+        float t = 0.5 * (ray_dir.y + 1.0);
+        return mix(vec3(0.8, 0.85, 0.9), vec3(0.4, 0.6, 0.9), t);
+    }
+
+    vec3 base_color = get_block_color(hit.block_id);
+    vec3 light_dir = normalize(vec3(0.5, 1.0, 0.3));
+    float ndotl = max(dot(hit.normal, light_dir), 0.0);
+    float ambient = 0.3;
+    float diffuse = 0.7 * ndotl;
+    return base_color * (ambient + diffuse);
+}
+
+void main() {
+    uvec2 pixel = gl_GlobalInvocationID.xy;
+    if (pixel.x >= pc.screen_size.x || pixel.y >= pc.screen_size.y) {
+        return;
+    }
+
+    vec2 uv = (vec2(pixel) + 0.5) / vec2(pc.screen_size);
+    vec2 ndc = uv * 2.0 - 1.0;
+
+    vec4 clip = vec4(ndc.x, -ndc.y, 1.0, 1.0);
+    vec4 view_pos = camera.inverse_projection * clip;
+    view_pos = vec4(view_pos.xyz / view_pos.w, 0.0);
+
+    vec3 ray_origin = camera.position.xyz;
+    vec3 ray_dir = normalize((camera.inverse_view * view_pos).xyz);
+
+    RayHit hit = trace_clipmap(ray_origin, ray_dir, pixel);
+
+    vec3 color;
+    switch (pc.debug_mode) {
+        case DEBUG_TRAVERSAL_STEPS: {
+            float step_ratio = float(hit.traversal_steps) / float(pc.max_steps);
+            color = turbo_colormap(step_ratio);
+            break;
+        }
+        case DEBUG_NODE_DEPTH: {
+            float lod_ratio = float(hit.lod) / float(LOD_COUNT - 1u);
+            color = turbo_colormap(lod_ratio);
+            break;
+        }
+        case DEBUG_DISTANCE: {
+            float dist_ratio = hit.t / 500.0;
+            color = turbo_colormap(clamp(dist_ratio, 0.0, 1.0));
+            if (!hit.hit) {
+                color = vec3(0.1, 0.1, 0.2);
+            }
+            break;
+        }
+        case DEBUG_NORMALS: {
+            if (hit.hit) {
+                color = debug_normals(hit.normal);
+            } else {
+                float t = 0.5 * (ray_dir.y + 1.0);
+                color = mix(vec3(0.8, 0.85, 0.9), vec3(0.4, 0.6, 0.9), t);
+            }
+            break;
+        }
+        case DEBUG_CHUNK_BOUNDARIES: {
+            ClipmapInfoBuffer clipmap = ClipmapInfoBuffer(pc.clipmap_info_address);
+            color = shade(hit, ray_dir);
+            if (hit.hit && is_on_lod_boundary(hit.position, clipmap, 0.15)) {
+                color = mix(color, vec3(1.0, 0.2, 0.2), 0.7);
+            }
+            break;
+        }
+        case DEBUG_NONE:
+        default:
+            color = shade(hit, ray_dir);
+            break;
+    }
+
+    imageStore(output_image, ivec2(pixel), vec4(color, 1.0));
+}

@@ -1,12 +1,12 @@
 # Voxelicous Engine
 
-A high-performance voxel game engine written in Rust, featuring **pure voxel ray marching** that directly traverses Sparse Voxel Octree - Directed Acyclic Graphs (SVO-DAG) without mesh generation.
+A high-performance voxel game engine written in Rust, featuring **pure voxel ray marching** without mesh generation. The current rendering path is clipmap-based compute ray marching.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 ## 🌟 Key Features
 
-- **Pure Voxel Ray Marching**: Rays traverse SVO-DAG structures directly in compute
+- **Pure Voxel Ray Marching**: Clipmap brick-pool traversal in compute
 - **Cross-Platform**: Windows, Linux, and macOS support
 - **Modular Architecture**: Clean separation of concerns across multiple crates
 - **Performance Focused**: Thin LTO, optimized release builds
@@ -14,6 +14,8 @@ A high-performance voxel game engine written in Rust, featuring **pure voxel ray
 ## 📦 Applications
 
 - **`voxelicous-viewer`**: Demo viewer for exploring voxel worlds
+- **`voxelicous-editor`**: Editor application
+- **`voxelicous-benchmark`**: Benchmark harness
 - **`voxelicous-profiler-tui`**: Terminal-based profiling interface
 
 ## 🏗️ Architecture
@@ -22,12 +24,12 @@ A high-performance voxel game engine written in Rust, featuring **pure voxel ray
 
 ```
 voxelicous-core (foundation: types, math, ECS re-exports)
-├── voxelicous-voxel (SVO-DAG storage, compression, GPU format)
+├── voxelicous-voxel (clipmap brick storage/compression/GPU format)
 ├── voxelicous-gpu (Vulkan abstraction via ash, memory via gpu-allocator)
-│   └── voxelicous-render (compute ray marching pipeline)
+│   └── voxelicous-render (clipmap compute ray marching pipeline)
 │       └── voxelicous-test (headless harness)
 ├── voxelicous-platform (windowing via winit)
-├── voxelicous-world (chunk streaming, terrain generation)
+├── voxelicous-world (clipmap streaming, terrain generation)
 ├── voxelicous-physics (collision via rapier3d, raycasting)
 ├── voxelicous-audio (spatial audio via kira)
 ├── voxelicous-entity (ECS via hecs, Lua scripting via mlua)
@@ -35,6 +37,11 @@ voxelicous-core (foundation: types, math, ECS re-exports)
 ```
 
 ## 🚀 Getting Started
+
+### Current Status
+
+- Viewer uses the clipmap ray-march path under active rework.
+- Detailed rework progress and known issues are tracked in `clipmap_rework_status.md`.
 
 ### Prerequisites
 

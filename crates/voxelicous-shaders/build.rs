@@ -15,14 +15,13 @@ fn main() {
     // Create compiler
     let compiler = Compiler::new().expect("Failed to create shader compiler");
 
-    // Compile ray_march_world.comp (multi-chunk compute)
+    // Compile ray_march_clipmap.comp (clipmap compute)
     compile_shader(
         &compiler,
-        shader_dir.join("ray_march_world.comp"),
-        Path::new(&out_dir).join("ray_march_world.spv"),
+        shader_dir.join("ray_march_clipmap.comp"),
+        Path::new(&out_dir).join("ray_march_clipmap.spv"),
         ShaderKind::Compute,
     );
-
 }
 
 fn compile_shader(

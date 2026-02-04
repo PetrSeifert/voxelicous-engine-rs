@@ -18,16 +18,16 @@ pub enum EventCategory {
     GpuSync = 4,
     /// GPU queue submit.
     GpuSubmit = 5,
-    /// Chunk terrain generation.
-    ChunkGeneration = 10,
-    /// Chunk SVO compression.
-    ChunkCompression = 11,
-    /// GPU chunk upload.
-    GpuUpload = 12,
-    /// GPU chunk unload.
-    GpuUnload = 13,
-    /// World streaming update.
-    WorldUpdate = 14,
+    /// Clipmap page generation.
+    ClipmapPageBuild = 10,
+    /// Clipmap page/brick encoding work.
+    ClipmapEncode = 11,
+    /// GPU clipmap upload.
+    GpuClipmapUpload = 12,
+    /// GPU clipmap eviction/unload.
+    GpuClipmapUnload = 13,
+    /// Clipmap streaming/update tick.
+    ClipmapUpdate = 14,
     /// Custom event with ID.
     Custom(u32) = 255,
 }
@@ -43,11 +43,11 @@ impl EventCategory {
             Self::FramePresent => "Present",
             Self::GpuSync => "GPU Sync",
             Self::GpuSubmit => "GPU Submit",
-            Self::ChunkGeneration => "Generation",
-            Self::ChunkCompression => "Compression",
-            Self::GpuUpload => "GPU Upload",
-            Self::GpuUnload => "GPU Unload",
-            Self::WorldUpdate => "World Update",
+            Self::ClipmapPageBuild => "Page Build",
+            Self::ClipmapEncode => "Encode",
+            Self::GpuClipmapUpload => "GPU Upload",
+            Self::GpuClipmapUnload => "GPU Unload",
+            Self::ClipmapUpdate => "Clipmap Update",
             Self::Custom(_) => "Custom",
         }
     }
@@ -60,7 +60,7 @@ pub struct TimingEvent {
     pub category: EventCategory,
     /// Duration in nanoseconds.
     pub duration_ns: u64,
-    /// Optional context (e.g., chunk coordinates packed as i32s).
+    /// Optional context (e.g., page coordinates packed as i32s).
     pub context: [i32; 3],
 }
 
@@ -179,18 +179,18 @@ impl CategoryStats {
 /// Queue sizes for streaming operations.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct QueueSizes {
-    /// Chunks waiting to be uploaded to GPU.
-    pub pending_uploads: u32,
-    /// Chunks waiting to be unloaded from GPU.
-    pub pending_unloads: u32,
-    /// Chunks in the load queue.
-    pub load_queue_length: u32,
-    /// Chunks currently being generated.
-    pub chunks_generating: u32,
-    /// Total chunks loaded in world.
-    pub total_chunks: u32,
-    /// Chunks on GPU.
-    pub gpu_chunks: u32,
+    /// Pages waiting to be uploaded to GPU.
+    pub pending_page_uploads: u32,
+    /// Pages waiting to be unloaded from GPU.
+    pub pending_page_unloads: u32,
+    /// Pages queued for generation.
+    pub pending_page_builds: u32,
+    /// Pages currently being generated.
+    pub pages_building: u32,
+    /// Total pages currently resident.
+    pub resident_pages: u32,
+    /// Pages currently mirrored on GPU.
+    pub gpu_pages: u32,
 }
 
 /// Memory usage statistics.
@@ -198,8 +198,8 @@ pub struct QueueSizes {
 pub struct MemoryStats {
     /// GPU memory used in bytes.
     pub gpu_memory_bytes: u64,
-    /// CPU memory for chunks in bytes.
-    pub chunk_memory_bytes: u64,
+    /// CPU memory for clipmap structures in bytes.
+    pub clipmap_memory_bytes: u64,
 }
 
 /// Complete profiler snapshot sent to TUI.

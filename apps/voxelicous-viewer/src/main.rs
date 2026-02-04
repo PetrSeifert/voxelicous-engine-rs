@@ -1,7 +1,6 @@
 //! Voxelicous Engine Demo Viewer
 //!
-//! Renders procedurally generated terrain using compute ray marching with chunk streaming.
-//! Chunks are dynamically loaded and unloaded based on camera position.
+//! Renders procedurally generated terrain using clipmap compute ray marching.
 //!
 //! ## Usage
 //!
@@ -17,11 +16,7 @@
 //! - `-f, --frames <FRAMES>`: Frame indices to capture (e.g., "0,10,20" or "0-5")
 //! - `--exit-after`: Exit after capturing all specified frames
 //!
-//! ### Streaming options
-//! - `--load-radius <N>`: Horizontal chunk load radius (default: 8)
-//! - `--unload-radius <N>`: Horizontal chunk unload radius (default: 12)
-//! - `--vertical-radius <N>`: Vertical chunk radius (default: 4)
-//! - `--max-gen-per-frame <N>`: Max chunks to generate per frame (default: 4)
+//! ### World options
 //! - `--seed <N>`: World generation seed (default: 42)
 //!
 //! ### Other
@@ -30,14 +25,11 @@
 //! ## Examples
 //!
 //! ```bash
-//! # Basic viewer with default streaming
+//! # Basic viewer
 //! cargo run -p voxelicous-viewer
 //!
-//! # Smaller view distance for better performance
-//! cargo run -p voxelicous-viewer -- --load-radius 4
-//!
-//! # Larger view distance
-//! cargo run -p voxelicous-viewer -- --load-radius 12 --unload-radius 16
+//! # Use a custom seed
+//! cargo run -p voxelicous-viewer -- --seed 1234
 //!
 //! # Capture frame 0
 //! cargo run -p voxelicous-viewer -- -S
@@ -68,7 +60,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     run_app::<Viewer>(
-        AppConfig::new("Voxelicous Engine - Streaming Demo")
+        AppConfig::new("Voxelicous Engine - Clipmap Demo")
             .with_size(WIDTH, HEIGHT)
             .with_target_fps(TARGET_FPS),
     )
@@ -76,7 +68,7 @@ fn main() -> anyhow::Result<()> {
 
 fn print_help() {
     eprintln!(
-        "Voxelicous Engine Demo Viewer with Chunk Streaming
+        "Voxelicous Engine Demo Viewer with Clipmap Ray Marching
 
 USAGE:
     cargo run -p voxelicous-viewer -- [OPTIONS]
@@ -90,28 +82,18 @@ SCREENSHOT OPTIONS:
                             Default: 0
     --exit-after            Exit after capturing all specified frames
 
-STREAMING OPTIONS:
-    --load-radius <N>       Horizontal chunk load radius (default: 4)
-    --unload-radius <N>     Horizontal chunk unload radius (default: 6)
-    --vertical-radius <N>   Vertical chunk radius (default: 2)
-    --max-gen-per-frame <N> Max chunks to generate per frame (default: 8)
+WORLD OPTIONS:
     --seed <N>              World generation seed (default: 42)
-
-NOTE: Large load radii (>8) may cause performance issues due to the O(pixels*chunks)
-      complexity of the ray marching shader.
 
 OTHER:
     -h, --help              Print this help message
 
 EXAMPLES:
-    # Basic viewer with default streaming
+    # Basic viewer
     cargo run -p voxelicous-viewer
 
-    # Smaller view distance for better performance
-    cargo run -p voxelicous-viewer -- --load-radius 4
-
-    # Larger view distance
-    cargo run -p voxelicous-viewer -- --load-radius 12 --unload-radius 16
+    # Use a custom seed
+    cargo run -p voxelicous-viewer -- --seed 1234
 
     # Capture frames during orbit
     cargo run -p voxelicous-viewer -- -S -f 0,50,100,150,200 -o stream_{{}}.png --exit-after

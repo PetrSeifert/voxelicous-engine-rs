@@ -153,7 +153,7 @@ impl GpuCapabilities {
             return false;
         }
 
-        // Require buffer device address for SVO-DAG
+        // Require buffer device address for clipmap/storage buffer references.
         if !self.supports_buffer_device_address {
             return false;
         }

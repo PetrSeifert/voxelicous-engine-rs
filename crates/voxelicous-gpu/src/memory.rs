@@ -235,6 +235,36 @@ impl GpuBuffer {
 
         Ok(())
     }
+
+    /// Write raw bytes to the buffer at the given offset (must be host-visible).
+    pub fn write_bytes(&self, offset: u64, data: &[u8]) -> Result<()> {
+        let ptr = self
+            .mapped_ptr()
+            .ok_or_else(|| GpuError::InvalidState("Buffer not mapped".to_string()))?;
+
+        let end = offset
+            .checked_add(data.len() as u64)
+            .ok_or_else(|| GpuError::InvalidState("Offset overflow".to_string()))?;
+        if end > self.size {
+            return Err(GpuError::InvalidState(
+                "Data range too large for buffer".to_string(),
+            ));
+        }
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(offset as usize), data.len());
+        }
+
+        Ok(())
+    }
+
+    /// Write typed data to the buffer at the given offset (must be host-visible).
+    pub fn write_range<T: Copy>(&self, offset: u64, data: &[T]) -> Result<()> {
+        let bytes = std::mem::size_of_val(data);
+        self.write_bytes(offset, unsafe {
+            std::slice::from_raw_parts(data.as_ptr() as *const u8, bytes)
+        })
+    }
 }
 
 /// A GPU image with its allocation.
