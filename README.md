@@ -16,7 +16,7 @@ A high-performance voxel game engine written in Rust, featuring **pure voxel ray
 - **`voxelicous-viewer`**: Demo viewer for exploring voxel worlds
 - **`voxelicous-editor`**: Editor application
 - **`voxelicous-benchmark`**: Benchmark harness
-- **`voxelicous-profiler-tui`**: Terminal-based profiling interface
+- **`voxelicous-profiler-tui`**: Terminal-based profiling interface (legacy)
 
 ## 🏗️ Architecture
 
@@ -80,9 +80,18 @@ cargo run -p voxelicous-profiler-tui
 # Enable profiling features
 cargo build --features voxelicous-app/profiling
 
+# Enable Tracy profiling (fan-out from app crates)
+cargo run -p voxelicous-viewer --features profiling-tracy
+
 # Headless mode (for testing/servers)
 cargo build --features voxelicous-gpu/headless
 ```
+
+### Tracy Profiling (Recommended)
+
+1. Launch the Tracy UI.
+2. Run an app with the `profiling-tracy` feature enabled.
+3. Capture the session to view call trees and flamegraph-style timelines.
 
 ## 🧪 Testing
 

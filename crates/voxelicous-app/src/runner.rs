@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 use ash::vk;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
+#[cfg(feature = "profiling-tracy")]
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use voxelicous_gpu::GpuContextBuilder;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
@@ -92,11 +94,29 @@ impl AppConfig {
 /// and runs the event loop until the application exits.
 pub fn run_app<A: VoxelApp + 'static>(config: AppConfig) -> anyhow::Result<()> {
     // Initialize logging
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+    #[cfg(feature = "profiling-tracy")]
+    {
+        let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            EnvFilter::new(
+                "info,voxelicous_app=trace,voxelicous_world=trace,voxelicous_render=trace,voxelicous_gpu=trace,voxelicous_viewer=trace,voxelicous_editor=trace,voxelicous_benchmark=trace",
+            )
+        });
+        let tracy_layer = tracing_tracy::TracyLayer::default();
+
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(tracing_subscriber::fmt::layer())
+            .with(tracy_layer)
+            .init();
+    }
+    #[cfg(not(feature = "profiling-tracy"))]
+    {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            )
+            .init();
+    }
 
     // Initialize profiler
     #[cfg(feature = "profiling")]
@@ -255,6 +275,7 @@ impl<A: VoxelApp + 'static> AppRunner<A> {
 }
 
 impl<A: VoxelApp> AppState<A> {
+    #[cfg_attr(feature = "profiling-tracy", tracing::instrument(level = "trace", skip_all))]
     fn render_frame(&mut self) -> anyhow::Result<()> {
         #[cfg(feature = "profiling")]
         profile_scope!(EventCategory::Frame);

@@ -9,6 +9,7 @@ license.workspace = true
 [features]
 default = []
 profiling = ["dep:voxelicous-profiler", "voxelicous-profiler/profiling", "voxelicous-app/profiling", "voxelicous-world/profiling"]
+profiling-tracy = ["voxelicous-app/profiling-tracy", "voxelicous-world/profiling-tracy", "voxelicous-render/profiling-tracy", "voxelicous-gpu/profiling-tracy"]
 
 [dependencies]
 voxelicous-app.workspace = true

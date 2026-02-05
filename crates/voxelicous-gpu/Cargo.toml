@@ -9,6 +9,7 @@ license.workspace = true
 [features]
 default = []
 headless = []
+profiling-tracy = []
 
 [dependencies]
 voxelicous-core.workspace = true

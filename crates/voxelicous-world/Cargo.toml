@@ -9,6 +9,7 @@ license.workspace = true
 [features]
 default = []
 profiling = ["dep:voxelicous-profiler", "voxelicous-profiler/profiling"]
+profiling-tracy = []
 
 [dependencies]
 voxelicous-core.workspace = true
@@ -17,6 +18,7 @@ voxelicous-profiler = { workspace = true, optional = true }
 noise.workspace = true
 rayon.workspace = true
 glam.workspace = true
+tracing.workspace = true
 
 [lints]
 workspace = true

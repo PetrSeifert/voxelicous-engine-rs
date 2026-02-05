@@ -6,6 +6,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+default = []
+profiling-tracy = []
+
 [dependencies]
 voxelicous-core.workspace = true
 voxelicous-gpu.workspace = true

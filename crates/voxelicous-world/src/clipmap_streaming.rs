@@ -124,6 +124,7 @@ impl ClipmapStreamingController {
     }
 
     /// Update the clipmap around the given camera position (world units).
+    #[cfg_attr(feature = "profiling-tracy", tracing::instrument(level = "trace", skip_all))]
     pub fn update(&mut self, camera_pos: Vec3) {
         self.process_deferred_brick_frees();
 
@@ -260,6 +261,7 @@ impl ClipmapStreamingController {
         self.lods[lod].loaded_pages > 0
     }
 
+    #[cfg_attr(feature = "profiling-tracy", tracing::instrument(level = "trace", skip_all))]
     fn update_lod(&mut self, lod: usize, camera_voxel: WorldCoord, force: bool) {
         let voxel_size = self.lod_voxel_size(lod);
         let page_size = PAGE_VOXELS_PER_AXIS as i64 * voxel_size;
@@ -415,6 +417,7 @@ impl ClipmapStreamingController {
         self.lods[lod].pending_pages.extend(coords);
     }
 
+    #[cfg_attr(feature = "profiling-tracy", tracing::instrument(level = "trace", skip_all))]
     fn process_pending_pages(&mut self, mut apply_budget: usize) {
         self.spawn_pending_jobs();
 
@@ -663,6 +666,7 @@ fn page_distance_to_camera_sq(
     dx * dx + dy * dy + dz * dz
 }
 
+#[cfg_attr(feature = "profiling-tracy", tracing::instrument(level = "trace", skip_all))]
 fn build_page_voxels(
     generator: &TerrainGenerator,
     page_coord: (i64, i64, i64),
@@ -728,6 +732,7 @@ fn build_page_voxels(
     }
 }
 
+#[cfg_attr(feature = "profiling-tracy", tracing::instrument(level = "trace", skip_all))]
 fn build_page_voxels_unit_lod(
     generator: &TerrainGenerator,
     page_coord: (i64, i64, i64),

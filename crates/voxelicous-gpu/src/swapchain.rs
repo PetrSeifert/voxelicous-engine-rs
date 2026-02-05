@@ -120,6 +120,7 @@ impl Swapchain {
     ///
     /// # Safety
     /// All handles must be valid.
+    #[cfg_attr(feature = "profiling-tracy", tracing::instrument(level = "trace", skip_all))]
     pub unsafe fn present(
         &self,
         swapchain_loader: &ash::khr::swapchain::Device,

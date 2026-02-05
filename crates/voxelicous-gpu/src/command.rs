@@ -124,6 +124,7 @@ pub unsafe fn end_command_buffer(device: &ash::Device, cmd: vk::CommandBuffer) -
 ///
 /// # Safety
 /// All handles must be valid.
+#[cfg_attr(feature = "profiling-tracy", tracing::instrument(level = "trace", skip_all))]
 pub unsafe fn submit_command_buffers(
     device: &ash::Device,
     queue: vk::Queue,

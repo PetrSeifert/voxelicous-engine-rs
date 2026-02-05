@@ -10,7 +10,8 @@ use voxelicous_app::{
 };
 use voxelicous_input::{ActionMap, CursorMode, InputManager, KeyCode};
 use voxelicous_render::{
-    save_screenshot, ClipmapRayMarchPipeline, ClipmapRenderer, DebugMode, ScreenshotConfig,
+    save_screenshot, CameraUniforms, ClipmapRayMarchPipeline, ClipmapRenderer, DebugMode,
+    ScreenshotConfig,
 };
 use voxelicous_world::{ClipmapStreamingController, TerrainConfig, TerrainGenerator};
 
@@ -215,6 +216,7 @@ impl VoxelApp for Viewer {
         })
     }
 
+    #[cfg_attr(feature = "profiling-tracy", tracing::instrument(level = "trace", skip_all))]
     fn update(&mut self, ctx: &AppContext, dt: f32) {
         // Update input action states (must be called before querying actions)
         self.input.update();
@@ -316,51 +318,158 @@ impl VoxelApp for Viewer {
         }
     }
 
+    #[cfg_attr(feature = "profiling-tracy", tracing::instrument(level = "trace", skip_all))]
     fn render(&mut self, ctx: &AppContext, frame: &mut FrameContext) -> anyhow::Result<()> {
-        let device = ctx.gpu.device();
-        let cmd = frame.command_buffer;
-        let camera_uniforms = self.camera.uniforms();
         let frame_index = frame.frame_index;
         let frame_number = frame.frame_number;
+        let capturing = self.screenshot_config.should_capture(frame_number);
+        let camera_uniforms = self.camera.uniforms();
 
-        // Sync clipmap GPU buffers before rendering
-        {
-            let mut allocator = ctx.gpu.allocator().lock();
+        self.render_sync_clipmap_buffers(ctx, frame_index, frame_number);
+        self.render_record_ray_march(ctx, frame, frame_index, &camera_uniforms)?;
+        self.render_record_output_blit(ctx, frame);
+        self.render_record_readback(ctx, frame, capturing);
+        self.render_record_present_transition(ctx, frame);
 
-            if let Err(e) = self
-                .clipmap_renderer
-                .process_deferred_deletions(&mut allocator, frame_number)
-            {
-                error!("Failed to process deferred deletions: {}", e);
-            }
-
-            let dirty = self.clipmap.take_dirty_state();
-            if let Err(e) = self.clipmap_renderer.sync_from_controller(
-                &mut allocator,
-                device,
-                &self.clipmap,
-                dirty,
-                frame_index,
-                frame_number,
-            ) {
-                error!("Failed to sync clipmap GPU buffers: {e}");
-            }
+        // Handle screenshot capture
+        if capturing {
+            self.capture_screenshot(ctx, frame_number)?;
         }
 
+        // Check if we should exit after capturing
+        if self.screenshot_config.exit_after_capture && self.screenshot_config.all_captured(frame_number) {
+            info!("All screenshots captured, requesting exit...");
+            self.should_exit = true;
+        }
+
+        Ok(())
+    }
+
+    fn on_resize(&mut self, ctx: &mut AppContext, width: u32, height: u32) -> anyhow::Result<()> {
+        // Recreate pipeline with new size
+        unsafe {
+            let mut allocator = ctx.gpu.allocator().lock();
+
+            // Destroy old pipeline
+            if let Some(old_pipeline) = self.pipeline.take() {
+                old_pipeline.destroy(ctx.gpu.device(), &mut allocator)?;
+            }
+
+            // Create new pipeline with frames_in_flight
+            let new_pipeline = ClipmapRayMarchPipeline::new(
+                ctx.gpu.device(),
+                &mut allocator,
+                width,
+                height,
+                ctx.frames_in_flight(),
+            )?;
+            self.pipeline = Some(new_pipeline);
+        }
+
+        // Update camera aspect ratio
+        self.camera.set_aspect(width as f32 / height as f32);
+
+        Ok(())
+    }
+
+    fn on_event(&mut self, event: &WindowEvent) -> bool {
+        if self.should_exit {
+            return false;
+        }
+        self.input.process_window_event(event)
+    }
+
+    fn on_device_event(&mut self, _device_id: DeviceId, event: &DeviceEvent) {
+        self.input.process_device_event(event);
+    }
+
+    fn cleanup(&mut self, ctx: &mut AppContext) {
+        let mut allocator = ctx.gpu.allocator().lock();
+
+        // Destroy clipmap renderer (frees all clipmap GPU resources)
+        // Replace with a dummy renderer (will never be used)
+        let clipmap_renderer =
+            std::mem::replace(&mut self.clipmap_renderer, ClipmapRenderer::new(1));
+        if let Err(e) = clipmap_renderer.destroy(&mut allocator) {
+            error!("Failed to destroy clipmap renderer: {e}");
+        }
+
+        // Destroy pipeline
+        if let Some(pipeline) = self.pipeline.take() {
+            unsafe {
+                if let Err(e) = pipeline.destroy(ctx.gpu.device(), &mut allocator) {
+                    error!("Failed to destroy pipeline: {e}");
+                }
+            }
+        }
+    }
+}
+
+impl Viewer {
+    #[cfg_attr(feature = "profiling-tracy", tracing::instrument(level = "trace", skip_all))]
+    fn render_sync_clipmap_buffers(
+        &mut self,
+        ctx: &AppContext,
+        frame_index: usize,
+        frame_number: u64,
+    ) {
+        let device = ctx.gpu.device();
+        let mut allocator = ctx.gpu.allocator().lock();
+
+        if let Err(e) = self
+            .clipmap_renderer
+            .process_deferred_deletions(&mut allocator, frame_number)
+        {
+            error!("Failed to process deferred deletions: {}", e);
+        }
+
+        let dirty = self.clipmap.take_dirty_state();
+        if let Err(e) = self.clipmap_renderer.sync_from_controller(
+            &mut allocator,
+            device,
+            &self.clipmap,
+            dirty,
+            frame_index,
+            frame_number,
+        ) {
+            error!("Failed to sync clipmap GPU buffers: {e}");
+        }
+    }
+
+    #[cfg_attr(feature = "profiling-tracy", tracing::instrument(level = "trace", skip_all))]
+    fn render_record_ray_march(
+        &self,
+        ctx: &AppContext,
+        frame: &FrameContext,
+        frame_index: usize,
+        camera_uniforms: &CameraUniforms,
+    ) -> anyhow::Result<()> {
+        let device = ctx.gpu.device();
+        let cmd = frame.command_buffer;
         let pipeline = self.pipeline.as_ref().expect("Pipeline should exist");
 
         unsafe {
-            // Record rendering commands
             pipeline.record(
                 device,
                 cmd,
-                &camera_uniforms,
+                camera_uniforms,
                 &self.clipmap_renderer,
                 MAX_STEPS,
                 frame_index,
                 self.debug_mode,
             )?;
+        }
 
+        Ok(())
+    }
+
+    #[cfg_attr(feature = "profiling-tracy", tracing::instrument(level = "trace", skip_all))]
+    fn render_record_output_blit(&self, ctx: &AppContext, frame: &FrameContext) {
+        let device = ctx.gpu.device();
+        let cmd = frame.command_buffer;
+        let pipeline = self.pipeline.as_ref().expect("Pipeline should exist");
+
+        unsafe {
             // Transition output image for transfer
             let barrier = vk::ImageMemoryBarrier2::default()
                 .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
@@ -440,13 +549,35 @@ impl VoxelApp for Viewer {
                 &[blit],
                 vk::Filter::LINEAR,
             );
+        }
+    }
 
-            // Record readback if capturing this frame
-            let capturing = self.screenshot_config.should_capture(frame.frame_number);
-            if capturing {
-                pipeline.record_readback_from_transfer_src(device, cmd);
-            }
+    #[cfg_attr(feature = "profiling-tracy", tracing::instrument(level = "trace", skip_all))]
+    fn render_record_readback(
+        &self,
+        ctx: &AppContext,
+        frame: &FrameContext,
+        capturing: bool,
+    ) {
+        if !capturing {
+            return;
+        }
 
+        let device = ctx.gpu.device();
+        let cmd = frame.command_buffer;
+        let pipeline = self.pipeline.as_ref().expect("Pipeline should exist");
+
+        unsafe {
+            pipeline.record_readback_from_transfer_src(device, cmd);
+        }
+    }
+
+    #[cfg_attr(feature = "profiling-tracy", tracing::instrument(level = "trace", skip_all))]
+    fn render_record_present_transition(&self, ctx: &AppContext, frame: &FrameContext) {
+        let device = ctx.gpu.device();
+        let cmd = frame.command_buffer;
+
+        unsafe {
             // Transition swapchain image for present
             let present_barrier = vk::ImageMemoryBarrier2::default()
                 .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
@@ -468,84 +599,8 @@ impl VoxelApp for Viewer {
                 .image_memory_barriers(std::slice::from_ref(&present_barrier));
             device.cmd_pipeline_barrier2(cmd, &dependency_info);
         }
-
-        // Handle screenshot capture
-        if self.screenshot_config.should_capture(frame.frame_number) {
-            self.capture_screenshot(ctx, frame.frame_number)?;
-        }
-
-        // Check if we should exit after capturing
-        if self.screenshot_config.exit_after_capture
-            && self.screenshot_config.all_captured(frame.frame_number)
-        {
-            info!("All screenshots captured, requesting exit...");
-            self.should_exit = true;
-        }
-
-        Ok(())
     }
 
-    fn on_resize(&mut self, ctx: &mut AppContext, width: u32, height: u32) -> anyhow::Result<()> {
-        // Recreate pipeline with new size
-        unsafe {
-            let mut allocator = ctx.gpu.allocator().lock();
-
-            // Destroy old pipeline
-            if let Some(old_pipeline) = self.pipeline.take() {
-                old_pipeline.destroy(ctx.gpu.device(), &mut allocator)?;
-            }
-
-            // Create new pipeline with frames_in_flight
-            let new_pipeline = ClipmapRayMarchPipeline::new(
-                ctx.gpu.device(),
-                &mut allocator,
-                width,
-                height,
-                ctx.frames_in_flight(),
-            )?;
-            self.pipeline = Some(new_pipeline);
-        }
-
-        // Update camera aspect ratio
-        self.camera.set_aspect(width as f32 / height as f32);
-
-        Ok(())
-    }
-
-    fn on_event(&mut self, event: &WindowEvent) -> bool {
-        if self.should_exit {
-            return false;
-        }
-        self.input.process_window_event(event)
-    }
-
-    fn on_device_event(&mut self, _device_id: DeviceId, event: &DeviceEvent) {
-        self.input.process_device_event(event);
-    }
-
-    fn cleanup(&mut self, ctx: &mut AppContext) {
-        let mut allocator = ctx.gpu.allocator().lock();
-
-        // Destroy clipmap renderer (frees all clipmap GPU resources)
-        // Replace with a dummy renderer (will never be used)
-        let clipmap_renderer =
-            std::mem::replace(&mut self.clipmap_renderer, ClipmapRenderer::new(1));
-        if let Err(e) = clipmap_renderer.destroy(&mut allocator) {
-            error!("Failed to destroy clipmap renderer: {e}");
-        }
-
-        // Destroy pipeline
-        if let Some(pipeline) = self.pipeline.take() {
-            unsafe {
-                if let Err(e) = pipeline.destroy(ctx.gpu.device(), &mut allocator) {
-                    error!("Failed to destroy pipeline: {e}");
-                }
-            }
-        }
-    }
-}
-
-impl Viewer {
     fn capture_screenshot(&self, ctx: &AppContext, frame_number: u64) -> anyhow::Result<()> {
         ctx.gpu.wait_idle()?;
 

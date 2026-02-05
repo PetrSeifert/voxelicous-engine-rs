@@ -6,6 +6,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+default = []
+profiling-tracy = ["dep:tracing-tracy", "voxelicous-render/profiling-tracy", "voxelicous-gpu/profiling-tracy"]
+
 [dependencies]
 voxelicous-core.workspace = true
 voxelicous-gpu.workspace = true
@@ -16,3 +20,4 @@ voxelicous-entity.workspace = true
 winit.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+tracing-tracy = { workspace = true, optional = true }

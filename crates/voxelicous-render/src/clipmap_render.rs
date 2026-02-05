@@ -95,6 +95,7 @@ impl ClipmapRenderer {
     }
 
     /// Ensure all GPU buffers exist and are large enough.
+    #[cfg_attr(feature = "profiling-tracy", tracing::instrument(level = "trace", skip_all))]
     pub fn sync_from_controller(
         &mut self,
         allocator: &mut GpuAllocator,
@@ -364,6 +365,7 @@ impl ClipmapRenderer {
         Ok(false)
     }
 
+    #[cfg_attr(feature = "profiling-tracy", tracing::instrument(level = "trace", skip_all))]
     fn upload_page_tables(
         &self,
         controller: &ClipmapStreamingController,
@@ -410,6 +412,7 @@ impl ClipmapRenderer {
         Ok(())
     }
 
+    #[cfg_attr(feature = "profiling-tracy", tracing::instrument(level = "trace", skip_all))]
     fn upload_brick_headers(
         &self,
         store: &ClipmapVoxelStore,
@@ -439,6 +442,7 @@ impl ClipmapRenderer {
         Ok(())
     }
 
+    #[cfg_attr(feature = "profiling-tracy", tracing::instrument(level = "trace", skip_all))]
     fn upload_pool_entries(
         &self,
         pool: &[u8],
@@ -466,6 +470,7 @@ impl ClipmapRenderer {
         Ok(())
     }
 
+    #[cfg_attr(feature = "profiling-tracy", tracing::instrument(level = "trace", skip_all))]
     fn build_gpu_info(
         &self,
         device: &ash::Device,
