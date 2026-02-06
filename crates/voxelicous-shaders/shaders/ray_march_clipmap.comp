@@ -102,20 +102,6 @@ bool point_inside_aabb(vec3 p, vec3 box_min, vec3 box_max) {
     return all(greaterThanEqual(p, box_min)) && all(lessThanEqual(p, box_max));
 }
 
-uint hash_u32(uint x) {
-    x ^= x >> 16u;
-    x *= 0x7FEB352Du;
-    x ^= x >> 15u;
-    x *= 0x846CA68Bu;
-    x ^= x >> 16u;
-    return x;
-}
-
-float hash_uvec3(uvec3 v) {
-    uint h = hash_u32(v.x ^ hash_u32(v.y) ^ hash_u32(v.z));
-    return float(h) * (1.0 / 4294967295.0);
-}
-
 uint read_u8(ByteAddressBuffer buf, uint byte_idx) {
     uint word = buf.data[byte_idx >> 2];
     uint shift = (byte_idx & 3u) * 8u;
@@ -204,6 +190,24 @@ struct Interval {
 int wrap_index(int v, int size) {
     int r = v % size;
     return r < 0 ? r + size : r;
+}
+
+bool is_page_missing_at_position(ClipmapInfoBuffer clipmap, uint lod, vec3 world_pos) {
+    if (lod >= LOD_COUNT || clipmap.voxel_size[lod].x == 0u) {
+        return true;
+    }
+
+    float page_size = float(clipmap.voxel_size[lod].x) * float(PAGE_VOXELS_AXIS);
+    ivec3 page = ivec3(floor(world_pos / page_size));
+
+    int px = wrap_index(page.x, int(PAGE_GRID));
+    int py = wrap_index(page.y, int(PAGE_GRID));
+    int pz = wrap_index(page.z, int(PAGE_GRID));
+    uint page_index = uint(px + py * int(PAGE_GRID) + pz * int(PAGE_GRID * PAGE_GRID));
+
+    PageCoordBuffer page_coords = PageCoordBuffer(clipmap.page_coord_addr[lod]);
+    ivec3 slot_coord = page_coords.data[page_index].xyz;
+    return !all(equal(slot_coord, page));
 }
 
 RayHit trace_brick(
@@ -487,7 +491,7 @@ RayHit trace_interval(
     return miss;
 }
 
-RayHit trace_clipmap(vec3 ray_origin, vec3 ray_dir, uvec2 pixel) {
+RayHit trace_clipmap(vec3 ray_origin, vec3 ray_dir) {
     RayHit closest;
     closest.hit = false;
     closest.block_id = 0u;
@@ -560,14 +564,6 @@ RayHit trace_clipmap(vec3 ray_origin, vec3 ray_dir, uvec2 pixel) {
     }
 
     uint total_steps = 0u;
-    RayHit rejected_hit;
-    rejected_hit.hit = false;
-    rejected_hit.block_id = 0u;
-    rejected_hit.t = 1e30;
-    rejected_hit.position = vec3(0.0);
-    rejected_hit.normal = vec3(0.0);
-    rejected_hit.traversal_steps = 0u;
-    rejected_hit.lod = 0u;
 
     for (int i = 0; i < interval_count; i++) {
         Interval interval = intervals[i];
@@ -578,7 +574,6 @@ RayHit trace_clipmap(vec3 ray_origin, vec3 ray_dir, uvec2 pixel) {
         }
 
         bool missing_pages = false;
-        bool used_missing_fallback = false;
         RayHit hit = trace_interval(
             ray_origin, ray_dir, t_start, t_end, interval.lod, clipmap, missing_pages
         );
@@ -597,8 +592,14 @@ RayHit trace_clipmap(vec3 ray_origin, vec3 ray_dir, uvec2 pixel) {
                 total_steps += fallback_hit.traversal_steps;
 
                 if (fallback_hit.hit) {
+                    // Only allow fallback if the fine LOD page at the hit position is genuinely missing.
+                    // This prevents coarse voxels from leaking over valid fine data.
+                    float fine_voxel = max(float(clipmap.voxel_size[interval.lod].x), 1.0);
+                    vec3 probe_pos = fallback_hit.position - ray_dir * (fine_voxel * 0.25);
+                    if (!is_page_missing_at_position(clipmap, interval.lod, probe_pos)) {
+                        continue;
+                    }
                     hit = fallback_hit;
-                    used_missing_fallback = true;
                     break;
                 }
 
@@ -608,53 +609,11 @@ RayHit trace_clipmap(vec3 ray_origin, vec3 ray_dir, uvec2 pixel) {
             }
         }
 
-        if (hit.hit) {
-            bool accept_hit = true;
-
-            if (!used_missing_fallback && hit.lod > 0u) {
-                vec3 inner_min = clipmap.lod_aabb_min[hit.lod - 1u].xyz;
-                vec3 inner_max = clipmap.lod_aabb_max[hit.lod - 1u].xyz;
-                float transition_band = float(PAGE_VOXELS_AXIS) * float(clipmap.voxel_size[hit.lod - 1u].x);
-
-                if (transition_band > 0.0 && point_inside_aabb(hit.position, inner_min, inner_max)) {
-                    vec3 edge_dist = min(hit.position - inner_min, inner_max - hit.position);
-                    float dist_to_edge = max(min(min(edge_dist.x, edge_dist.y), edge_dist.z), 0.0);
-                    // Prefer coarse near the seam edge, fade to fine toward clipmap interior.
-                    float coarse_prob = 1.0 - clamp(dist_to_edge / transition_band, 0.0, 1.0);
-
-                    float seed_voxel = max(float(clipmap.voxel_size[hit.lod - 1u].x), 1.0);
-                    ivec3 q = ivec3(floor(hit.position / seed_voxel));
-                    uvec3 seed = uvec3(
-                        pixel.x ^ (uint(q.x) * 73856093u),
-                        pixel.y ^ (uint(q.y) * 19349663u),
-                        (uint(q.z) * 83492791u) ^ (hit.lod * 2654435761u)
-                    );
-                    float rnd = hash_uvec3(seed);
-                    if (rnd > coarse_prob) {
-                        accept_hit = false;
-                    }
-                }
-            }
-
-            if (!accept_hit) {
-                // Keep a fallback so stochastic seam rejection does not create terrain holes
-                // when the finer LOD misses due precision/streaming edge cases.
-                if (!rejected_hit.hit || hit.t < rejected_hit.t) {
-                    rejected_hit = hit;
-                }
-                continue;
-            }
-        }
-
         if (hit.hit && hit.t < closest.t) {
             closest = hit;
             closest.traversal_steps = total_steps;
             break;
         }
-    }
-
-    if (!closest.hit && rejected_hit.hit) {
-        closest = rejected_hit;
     }
 
     closest.traversal_steps = total_steps;
@@ -744,7 +703,7 @@ void main() {
     vec3 ray_origin = camera.position.xyz;
     vec3 ray_dir = normalize((camera.inverse_view * view_pos).xyz);
 
-    RayHit hit = trace_clipmap(ray_origin, ray_dir, pixel);
+    RayHit hit = trace_clipmap(ray_origin, ray_dir);
 
     vec3 color;
     switch (pc.debug_mode) {
@@ -754,8 +713,12 @@ void main() {
             break;
         }
         case DEBUG_NODE_DEPTH: {
-            float lod_ratio = float(hit.lod) / float(LOD_COUNT - 1u);
-            color = turbo_colormap(lod_ratio);
+            if (hit.hit) {
+                float lod_ratio = float(hit.lod) / float(LOD_COUNT - 1u);
+                color = turbo_colormap(lod_ratio);
+            } else {
+                color = vec3(0.0);
+            }
             break;
         }
         case DEBUG_DISTANCE: {
