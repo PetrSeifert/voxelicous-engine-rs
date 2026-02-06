@@ -98,10 +98,6 @@ bool ray_aabb_intersect(vec3 ray_origin, vec3 ray_dir_inv,
     return t_near <= t_far && t_far >= 0.0;
 }
 
-bool point_inside_aabb(vec3 p, vec3 box_min, vec3 box_max) {
-    return all(greaterThanEqual(p, box_min)) && all(lessThanEqual(p, box_max));
-}
-
 uint read_u8(ByteAddressBuffer buf, uint byte_idx) {
     uint word = buf.data[byte_idx >> 2];
     uint shift = (byte_idx & 3u) * 8u;
@@ -147,15 +143,6 @@ uint raw16_lookup(ByteAddressBuffer buf, uint base, uint voxel_idx) {
     return read_u16(buf, base + voxel_idx * 2u);
 }
 
-uint read_brick_voxel(ByteAddressBuffer pool, uint base, uint voxel_idx, uint encoding, uint palette_len) {
-    if (encoding == 0u) {
-        return palette16_lookup(pool, base, voxel_idx);
-    } else if (encoding == 1u) {
-        return palette32_lookup(pool, base, voxel_idx, palette_len);
-    }
-    return raw16_lookup(pool, base, voxel_idx);
-}
-
 vec3 calculate_normal(vec3 hit_point, vec3 box_min, vec3 box_max) {
     vec3 center = (box_min + box_max) * 0.5;
     vec3 half_size = (box_max - box_min) * 0.5;
@@ -192,6 +179,49 @@ int wrap_index(int v, int size) {
     return r < 0 ? r + size : r;
 }
 
+uint wrapped_page_index(ivec3 page) {
+    int px = wrap_index(page.x, int(PAGE_GRID));
+    int py = wrap_index(page.y, int(PAGE_GRID));
+    int pz = wrap_index(page.z, int(PAGE_GRID));
+    return uint(px + py * int(PAGE_GRID) + pz * int(PAGE_GRID * PAGE_GRID));
+}
+
+float min3(vec3 v) {
+    return min(min(v.x, v.y), v.z);
+}
+
+bvec3 dda_step_axes(vec3 t_max) {
+    return bvec3(
+        t_max.x <= t_max.y && t_max.x <= t_max.z,
+        t_max.y <= t_max.x && t_max.y <= t_max.z,
+        t_max.z <= t_max.x && t_max.z <= t_max.y
+    );
+}
+
+void advance_dda(
+    inout float t,
+    float t_next,
+    inout ivec3 cell,
+    ivec3 step,
+    inout vec3 t_max,
+    vec3 t_delta,
+    bvec3 axes
+) {
+    t = t_next;
+    if (axes.x) {
+        t_max.x += t_delta.x;
+        cell.x += step.x;
+    }
+    if (axes.y) {
+        t_max.y += t_delta.y;
+        cell.y += step.y;
+    }
+    if (axes.z) {
+        t_max.z += t_delta.z;
+        cell.z += step.z;
+    }
+}
+
 bool is_page_missing_at_position(ClipmapInfoBuffer clipmap, uint lod, vec3 world_pos) {
     if (lod >= LOD_COUNT || clipmap.voxel_size[lod].x == 0u) {
         return true;
@@ -199,11 +229,7 @@ bool is_page_missing_at_position(ClipmapInfoBuffer clipmap, uint lod, vec3 world
 
     float page_size = float(clipmap.voxel_size[lod].x) * float(PAGE_VOXELS_AXIS);
     ivec3 page = ivec3(floor(world_pos / page_size));
-
-    int px = wrap_index(page.x, int(PAGE_GRID));
-    int py = wrap_index(page.y, int(PAGE_GRID));
-    int pz = wrap_index(page.z, int(PAGE_GRID));
-    uint page_index = uint(px + py * int(PAGE_GRID) + pz * int(PAGE_GRID * PAGE_GRID));
+    uint page_index = wrapped_page_index(page);
 
     PageCoordBuffer page_coords = PageCoordBuffer(clipmap.page_coord_addr[lod]);
     ivec3 slot_coord = page_coords.data[page_index].xyz;
@@ -259,8 +285,7 @@ RayHit trace_brick(
 
     ivec3 step = ivec3(sign(ray_dir));
     vec3 voxel_min = brick_min + vec3(voxel) * voxel_size;
-    vec3 next_boundary = voxel_min + vec3(step) * voxel_size;
-    next_boundary = mix(voxel_min, voxel_min + vec3(voxel_size), greaterThan(step, ivec3(0)));
+    vec3 next_boundary = mix(voxel_min, voxel_min + vec3(voxel_size), greaterThan(step, ivec3(0)));
 
     vec3 t_max = vec3(t) + (next_boundary - pos) * inv_dir;
     vec3 t_delta = abs(vec3(voxel_size) * inv_dir);
@@ -271,11 +296,11 @@ RayHit trace_brick(
         uint voxel_idx = uint(voxel.x + voxel.y * int(BRICK_SIZE) + voxel.z * int(BRICK_SIZE * BRICK_SIZE));
         uint block_id = 0u;
         if (encoding == 0u) {
-            block_id = read_brick_voxel(pal16_buf, data_index * STRIDE_PALETTE16, voxel_idx, encoding, palette_len);
+            block_id = palette16_lookup(pal16_buf, data_index * STRIDE_PALETTE16, voxel_idx);
         } else if (encoding == 1u) {
-            block_id = read_brick_voxel(pal32_buf, data_index * STRIDE_PALETTE32, voxel_idx, encoding, palette_len);
+            block_id = palette32_lookup(pal32_buf, data_index * STRIDE_PALETTE32, voxel_idx, palette_len);
         } else {
-            block_id = read_brick_voxel(raw_buf, data_index * STRIDE_RAW16, voxel_idx, encoding, palette_len);
+            block_id = raw16_lookup(raw_buf, data_index * STRIDE_RAW16, voxel_idx);
         }
 
         if (block_id != 0u) {
@@ -293,29 +318,14 @@ RayHit trace_brick(
             return hit;
         }
 
-        float t_next = min(min(t_max.x, t_max.y), t_max.z);
+        float t_next = min3(t_max);
         if (t_next >= t_end) {
             break;
         }
 
         // Advance to next voxel
-        bool step_x = t_max.x <= t_max.y && t_max.x <= t_max.z;
-        bool step_y = t_max.y <= t_max.x && t_max.y <= t_max.z;
-        bool step_z = t_max.z <= t_max.x && t_max.z <= t_max.y;
-
-        t = t_next;
-        if (step_x) {
-            t_max.x += t_delta.x;
-            voxel.x += step.x;
-        }
-        if (step_y) {
-            t_max.y += t_delta.y;
-            voxel.y += step.y;
-        }
-        if (step_z) {
-            t_max.z += t_delta.z;
-            voxel.z += step.z;
-        }
+        bvec3 axes = dda_step_axes(t_max);
+        advance_dda(t, t_next, voxel, step, t_max, t_delta, axes);
         if (voxel.x < 0 || voxel.x >= int(BRICK_SIZE) ||
             voxel.y < 0 || voxel.y >= int(BRICK_SIZE) ||
             voxel.z < 0 || voxel.z >= int(BRICK_SIZE)) {
@@ -373,12 +383,9 @@ RayHit trace_interval(
     ByteAddressBuffer raw_buf = ByteAddressBuffer(clipmap.raw16_addr);
 
     while (t <= t_end && steps < pc.max_steps) {
-        int px = wrap_index(page.x, int(PAGE_GRID));
-        int py = wrap_index(page.y, int(PAGE_GRID));
-        int pz = wrap_index(page.z, int(PAGE_GRID));
-        uint page_index = uint(px + py * int(PAGE_GRID) + pz * int(PAGE_GRID * PAGE_GRID));
+        uint page_index = wrapped_page_index(page);
 
-        float t_next = min(min(t_max.x, t_max.y), t_max.z);
+        float t_next = min3(t_max);
         float t_page_end = min(t_next, t_end);
 
         ivec3 slot_coord = page_coords.data[page_index].xyz;
@@ -386,78 +393,65 @@ RayHit trace_interval(
         if (!slot_matches) {
             had_missing_pages = true;
         }
-        uvec2 occ = page_occ.data[page_index];
-        if (slot_matches && (occ.x | occ.y) != 0u) {
-            vec3 page_origin = vec3(page) * page_size;
-            float brick_interval_len = max(t_page_end - t, 0.0);
-            float brick_start_nudge = min(local_eps, brick_interval_len * 0.25);
-            vec3 page_start = ray_origin + ray_dir * (t + brick_start_nudge);
-            ivec3 brick = ivec3(floor((page_start - page_origin) / brick_size));
-            brick = clamp(brick, ivec3(0), ivec3(int(PAGE_BRICKS_AXIS) - 1));
+        if (slot_matches) {
+            uvec2 occ = page_occ.data[page_index];
+            if ((occ.x | occ.y) != 0u) {
+                vec3 page_origin = vec3(page) * page_size;
+                float brick_interval_len = max(t_page_end - t, 0.0);
+                float brick_start_nudge = min(local_eps, brick_interval_len * 0.25);
+                vec3 page_start = ray_origin + ray_dir * (t + brick_start_nudge);
+                ivec3 brick = ivec3(floor((page_start - page_origin) / brick_size));
+                brick = clamp(brick, ivec3(0), ivec3(int(PAGE_BRICKS_AXIS) - 1));
 
-            ivec3 brick_step = ivec3(sign(ray_dir));
-            vec3 brick_min = page_origin + vec3(brick) * brick_size;
-            vec3 brick_boundary = mix(brick_min, brick_min + vec3(brick_size), greaterThan(brick_step, ivec3(0)));
-            vec3 brick_t_max = vec3(t) + (brick_boundary - page_start) * inv_dir;
-            vec3 brick_t_delta = abs(vec3(brick_size) * inv_dir);
+                ivec3 brick_step = ivec3(sign(ray_dir));
+                vec3 brick_min = page_origin + vec3(brick) * brick_size;
+                vec3 brick_boundary = mix(brick_min, brick_min + vec3(brick_size), greaterThan(brick_step, ivec3(0)));
+                vec3 brick_t_max = vec3(t) + (brick_boundary - page_start) * inv_dir;
+                vec3 brick_t_delta = abs(vec3(brick_size) * inv_dir);
 
-            float tb = t;
-            while (tb <= t_page_end && steps < pc.max_steps) {
-                uint brick_idx = uint(brick.x + brick.y * int(PAGE_BRICKS_AXIS) + brick.z * int(PAGE_BRICKS_AXIS * PAGE_BRICKS_AXIS));
-                uint brick_id = page_bricks.data[page_index * PAGE_BRICKS + brick_idx];
+                float tb = t;
+                while (tb <= t_page_end && steps < pc.max_steps) {
+                    uint brick_idx = uint(brick.x + brick.y * int(PAGE_BRICKS_AXIS) + brick.z * int(PAGE_BRICKS_AXIS * PAGE_BRICKS_AXIS));
+                    uint brick_id = page_bricks.data[page_index * PAGE_BRICKS + brick_idx];
 
-                float tb_next = min(min(brick_t_max.x, brick_t_max.y), brick_t_max.z);
-                float tb_end = min(tb_next, t_page_end);
+                    float tb_next = min3(brick_t_max);
+                    float tb_end = min(tb_next, t_page_end);
 
-                if (brick_id != 0u) {
-                    RayHit brick_hit = trace_brick(
-                        ray_origin,
-                        ray_dir,
-                        tb,
-                        tb_end,
-                        page_origin + vec3(brick) * brick_size,
-                        voxel_size,
-                        brick_id,
-                        pc.max_steps,
-                        steps,
-                        header_buf,
-                        pal16_buf,
-                        pal32_buf,
-                        raw_buf
-                    );
+                    if (brick_id != 0u) {
+                        RayHit brick_hit = trace_brick(
+                            ray_origin,
+                            ray_dir,
+                            tb,
+                            tb_end,
+                            page_origin + vec3(brick) * brick_size,
+                            voxel_size,
+                            brick_id,
+                            pc.max_steps,
+                            steps,
+                            header_buf,
+                            pal16_buf,
+                            pal32_buf,
+                            raw_buf
+                        );
 
-                    if (brick_hit.hit) {
-                        brick_hit.lod = lod;
-                        brick_hit.traversal_steps = steps;
-                        return brick_hit;
+                        if (brick_hit.hit) {
+                            brick_hit.lod = lod;
+                            brick_hit.traversal_steps = steps;
+                            return brick_hit;
+                        }
                     }
-                }
 
-                if (tb_next >= t_page_end) {
-                    break;
-                }
+                    if (tb_next >= t_page_end) {
+                        break;
+                    }
 
-                bool step_x = brick_t_max.x <= brick_t_max.y && brick_t_max.x <= brick_t_max.z;
-                bool step_y = brick_t_max.y <= brick_t_max.x && brick_t_max.y <= brick_t_max.z;
-                bool step_z = brick_t_max.z <= brick_t_max.x && brick_t_max.z <= brick_t_max.y;
-
-                tb = tb_next;
-                if (step_x) {
-                    brick_t_max.x += brick_t_delta.x;
-                    brick.x += brick_step.x;
-                }
-                if (step_y) {
-                    brick_t_max.y += brick_t_delta.y;
-                    brick.y += brick_step.y;
-                }
-                if (step_z) {
-                    brick_t_max.z += brick_t_delta.z;
-                    brick.z += brick_step.z;
-                }
-                if (brick.x < 0 || brick.x >= int(PAGE_BRICKS_AXIS) ||
-                    brick.y < 0 || brick.y >= int(PAGE_BRICKS_AXIS) ||
-                    brick.z < 0 || brick.z >= int(PAGE_BRICKS_AXIS)) {
-                    break;
+                    bvec3 brick_axes = dda_step_axes(brick_t_max);
+                    advance_dda(tb, tb_next, brick, brick_step, brick_t_max, brick_t_delta, brick_axes);
+                    if (brick.x < 0 || brick.x >= int(PAGE_BRICKS_AXIS) ||
+                        brick.y < 0 || brick.y >= int(PAGE_BRICKS_AXIS) ||
+                        brick.z < 0 || brick.z >= int(PAGE_BRICKS_AXIS)) {
+                        break;
+                    }
                 }
             }
         }
@@ -466,23 +460,8 @@ RayHit trace_interval(
             break;
         }
 
-        bool step_x = t_max.x <= t_max.y && t_max.x <= t_max.z;
-        bool step_y = t_max.y <= t_max.x && t_max.y <= t_max.z;
-        bool step_z = t_max.z <= t_max.x && t_max.z <= t_max.y;
-
-        t = t_next;
-        if (step_x) {
-            t_max.x += t_delta.x;
-            page.x += step.x;
-        }
-        if (step_y) {
-            t_max.y += t_delta.y;
-            page.y += step.y;
-        }
-        if (step_z) {
-            t_max.z += t_delta.z;
-            page.z += step.z;
-        }
+        bvec3 page_axes = dda_step_axes(t_max);
+        advance_dda(t, t_next, page, step, t_max, t_delta, page_axes);
 
         steps++;
     }
