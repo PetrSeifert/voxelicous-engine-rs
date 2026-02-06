@@ -1,0 +1,37 @@
+#version 450
+
+layout(set = 0, binding = 0, rgba8) uniform image2D output_image;
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+void plot(ivec2 pixel, ivec2 size, vec4 color) {
+    if (pixel.x < 0 || pixel.y < 0 || pixel.x >= size.x || pixel.y >= size.y) {
+        return;
+    }
+    imageStore(output_image, pixel, color);
+}
+
+void draw_cross(ivec2 center, ivec2 size, int arm_len, int gap, vec4 color) {
+    for (int i = gap; i <= arm_len; i++) {
+        plot(center + ivec2(i, 0), size, color);
+        plot(center + ivec2(-i, 0), size, color);
+        plot(center + ivec2(0, i), size, color);
+        plot(center + ivec2(0, -i), size, color);
+    }
+}
+
+void main() {
+    // Single invocation draws the full reticle.
+    if (any(notEqual(gl_GlobalInvocationID.xy, uvec2(0u, 0u)))) {
+        return;
+    }
+
+    ivec2 size = imageSize(output_image);
+    ivec2 center = size / 2;
+
+    // Black outline for contrast.
+    draw_cross(center, size, 8, 1, vec4(0.0, 0.0, 0.0, 1.0));
+    draw_cross(center, size, 9, 1, vec4(0.0, 0.0, 0.0, 1.0));
+    // White core.
+    draw_cross(center, size, 8, 2, vec4(1.0, 1.0, 1.0, 1.0));
+}

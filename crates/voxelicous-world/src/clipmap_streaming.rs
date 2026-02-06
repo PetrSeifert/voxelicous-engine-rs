@@ -1,8 +1,9 @@
 //! Clipmap streaming controller for brick/page management.
 
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     sync::mpsc::{self, Receiver, Sender, TryRecvError},
+    sync::Arc,
 };
 
 use glam::Vec3;
@@ -76,6 +77,8 @@ struct PageBuildResult {
 /// Clipmap streaming controller (toroidal page tables + brick pools).
 pub struct ClipmapStreamingController {
     generator: TerrainGenerator,
+    edits: HashMap<WorldCoord, BlockId>,
+    edit_snapshot: Arc<HashMap<WorldCoord, BlockId>>,
     store: ClipmapVoxelStore,
     lods: Vec<ClipmapLodState>,
     camera_voxel: WorldCoord,
@@ -97,6 +100,7 @@ impl ClipmapStreamingController {
     const PAGE_APPLY_BUDGET_BOOTSTRAP: usize = 12;
     const MAX_INFLIGHT_PAGE_JOBS: usize = 16;
     const BRICK_FREE_DELAY_FRAMES: u64 = 3;
+    const SYNC_EDIT_LODS: usize = 2;
 
     /// Create a new clipmap streaming controller.
     pub fn new(generator: TerrainGenerator) -> Self {
@@ -106,6 +110,8 @@ impl ClipmapStreamingController {
             .collect();
         Self {
             generator,
+            edits: HashMap::new(),
+            edit_snapshot: Arc::new(HashMap::new()),
             store: ClipmapVoxelStore::new(),
             lods,
             camera_voxel: WorldCoord { x: 0, y: 0, z: 0 },
@@ -121,6 +127,49 @@ impl ClipmapStreamingController {
             inflight_jobs: 0,
             pending_brick_frees: VecDeque::new(),
         }
+    }
+
+    /// Sample block id at world voxel coordinates, including runtime edits.
+    pub fn block_at_world(&self, x: i64, y: i64, z: i64) -> BlockId {
+        let coord = WorldCoord { x, y, z };
+        self.edits
+            .get(&coord)
+            .copied()
+            .unwrap_or_else(|| self.generator.block_at_world(x, y, z))
+    }
+
+    /// Set a block id at world voxel coordinates.
+    ///
+    /// Returns `true` when the effective block value changed.
+    pub fn set_block_at_world(&mut self, x: i64, y: i64, z: i64, block: BlockId) -> bool {
+        let coord = WorldCoord { x, y, z };
+        let previous = self.block_at_world(x, y, z);
+        if previous == block {
+            return false;
+        }
+
+        // Store only differences from procedural terrain.
+        let generated = self.generator.block_at_world(x, y, z);
+        if block == generated {
+            self.edits.remove(&coord);
+        } else {
+            self.edits.insert(coord, block);
+        }
+        self.edit_snapshot = Arc::new(self.edits.clone());
+
+        self.apply_edit_immediate(coord);
+        self.enqueue_pages_affected_by_edit(coord);
+        true
+    }
+
+    /// Destroy (set to air) the block at world voxel coordinates.
+    ///
+    /// Returns `true` when a solid block was destroyed.
+    pub fn destroy_block_at_world(&mut self, x: i64, y: i64, z: i64) -> bool {
+        if self.block_at_world(x, y, z).is_air() {
+            return false;
+        }
+        self.set_block_at_world(x, y, z, BlockId::AIR)
     }
 
     /// Update the clipmap around the given camera position (world units).
@@ -468,8 +517,9 @@ impl ClipmapStreamingController {
 
             let tx = self.page_build_tx.clone();
             let generator = self.generator.clone();
+            let edits = Arc::clone(&self.edit_snapshot);
             rayon::spawn(move || {
-                let page = build_page_voxels(&generator, coord, voxel_size);
+                let page = build_page_voxels(&generator, &edits, coord, voxel_size);
                 let _ = tx.send(PageBuildResult {
                     lod,
                     generation,
@@ -637,6 +687,84 @@ impl ClipmapStreamingController {
             }
         }
     }
+
+    fn apply_edit_immediate(&mut self, world: WorldCoord) {
+        let sync_lods = Self::SYNC_EDIT_LODS.min(CLIPMAP_LOD_COUNT);
+        let edits_snapshot = Arc::clone(&self.edit_snapshot);
+
+        for lod in 0..sync_lods {
+            let affected_pages = self.affected_pages_for_edit(lod, world);
+            let voxel_size = self.lod_voxel_size(lod);
+            for page_coord in affected_pages {
+                if !self.is_page_in_coverage(lod, page_coord) {
+                    continue;
+                }
+
+                let page =
+                    build_page_voxels(&self.generator, &edits_snapshot, page_coord, voxel_size);
+                self.apply_built_page(lod, page);
+                self.lods[lod]
+                    .pending_pages
+                    .retain(|&coord| coord != page_coord);
+            }
+            self.lods[lod].ready = false;
+        }
+    }
+
+    fn enqueue_pages_affected_by_edit(&mut self, world: WorldCoord) {
+        for lod in Self::SYNC_EDIT_LODS.min(CLIPMAP_LOD_COUNT)..CLIPMAP_LOD_COUNT {
+            if self.lods[lod].origin.is_none() {
+                continue;
+            }
+
+            for page_coord in self.affected_pages_for_edit(lod, world) {
+                if !self.is_page_in_coverage(lod, page_coord) {
+                    continue;
+                }
+                if !self.lods[lod].pending_pages.contains(&page_coord) {
+                    self.lods[lod].pending_pages.push_front(page_coord);
+                }
+                self.lods[lod].ready = false;
+            }
+        }
+    }
+
+    fn affected_pages_for_edit(&self, lod: usize, world: WorldCoord) -> Vec<(i64, i64, i64)> {
+        let voxel_size = self.lod_voxel_size(lod);
+        let half = voxel_size / 2;
+        let mut xs = vec![world.x];
+        let mut ys = vec![world.y];
+        let mut zs = vec![world.z];
+        if half > 0 {
+            xs.push(world.x - half);
+            ys.push(world.y - half);
+            zs.push(world.z - half);
+        }
+
+        let mut affected_pages = Vec::with_capacity(8);
+        let page_size = PAGE_VOXELS_PER_AXIS as i64 * voxel_size;
+        for &x in &xs {
+            for &y in &ys {
+                for &z in &zs {
+                    let sample_origin = (
+                        div_floor(x, voxel_size) * voxel_size,
+                        div_floor(y, voxel_size) * voxel_size,
+                        div_floor(z, voxel_size) * voxel_size,
+                    );
+                    let page_coord = (
+                        div_floor(sample_origin.0, page_size),
+                        div_floor(sample_origin.1, page_size),
+                        div_floor(sample_origin.2, page_size),
+                    );
+                    if !affected_pages.contains(&page_coord) {
+                        affected_pages.push(page_coord);
+                    }
+                }
+            }
+        }
+
+        affected_pages
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -681,6 +809,7 @@ fn page_distance_to_camera_sq(
 )]
 fn build_page_voxels(
     generator: &TerrainGenerator,
+    edits: &HashMap<WorldCoord, BlockId>,
     page_coord: (i64, i64, i64),
     voxel_size: i64,
 ) -> BuiltPage {
@@ -692,7 +821,7 @@ fn build_page_voxels(
     };
 
     if voxel_size == 1 {
-        return build_page_voxels_unit_lod(generator, page_coord, page_origin);
+        return build_page_voxels_unit_lod(generator, edits, page_coord, page_origin);
     }
 
     let mut occ: u64 = 0;
@@ -718,7 +847,7 @@ fn build_page_voxels(
 
                             let idx = x + y * BRICK_SIZE + z * BRICK_SIZE * BRICK_SIZE;
                             let block = sample_voxel_from_generator(
-                                generator, world_x, world_y, world_z, voxel_size,
+                                generator, edits, world_x, world_y, world_z, voxel_size,
                             );
                             voxels[idx] = block;
                             any_solid |= block.is_solid();
@@ -750,6 +879,7 @@ fn build_page_voxels(
 )]
 fn build_page_voxels_unit_lod(
     generator: &TerrainGenerator,
+    edits: &HashMap<WorldCoord, BlockId>,
     page_coord: (i64, i64, i64),
     page_origin: WorldCoord,
 ) -> BuiltPage {
@@ -784,19 +914,23 @@ fn build_page_voxels_unit_lod(
                 for z in 0..BRICK_SIZE {
                     for y in 0..BRICK_SIZE {
                         for x in 0..BRICK_SIZE {
+                            let world_x = brick_origin.x + x as i64;
                             let world_y = brick_origin.y + y as i64;
+                            let world_z = brick_origin.z + z as i64;
                             let page_x = bx * BRICK_SIZE + x;
                             let page_z = bz * BRICK_SIZE + z;
                             let index = page_x + page_z * PAGE_VOXELS_PER_AXIS;
                             let surface_height = i64::from(surface_heights[index]);
                             let surface_block = surface_blocks[index];
                             let idx = x + y * BRICK_SIZE + z * BRICK_SIZE * BRICK_SIZE;
-                            let block = block_from_surface_height(
+                            let generated = block_from_surface_height(
                                 world_y,
                                 surface_height,
                                 dirt_depth,
                                 surface_block,
                             );
+                            let block =
+                                overrides_or_generated(edits, world_x, world_y, world_z, generated);
                             voxels[idx] = block;
                             any_solid |= block.is_solid();
                         }
@@ -823,13 +957,14 @@ fn build_page_voxels_unit_lod(
 
 fn sample_voxel_from_generator(
     generator: &TerrainGenerator,
+    edits: &HashMap<WorldCoord, BlockId>,
     world_x: i64,
     world_y: i64,
     world_z: i64,
     voxel_size: i64,
 ) -> BlockId {
     if voxel_size <= 1 {
-        return generator.block_at_world(world_x, world_y, world_z);
+        return sample_base_voxel(generator, edits, world_x, world_y, world_z);
     }
 
     let child = voxel_size / 2;
@@ -841,13 +976,47 @@ fn sample_voxel_from_generator(
                 let cx = world_x + dx * child;
                 let cy = world_y + dy * child;
                 let cz = world_z + dz * child;
-                children[idx] = generator.block_at_world(cx, cy, cz);
+                children[idx] = sample_base_voxel(generator, edits, cx, cy, cz);
                 idx += 1;
             }
         }
     }
 
     downsample_voxel(&children)
+}
+
+fn sample_base_voxel(
+    generator: &TerrainGenerator,
+    edits: &HashMap<WorldCoord, BlockId>,
+    world_x: i64,
+    world_y: i64,
+    world_z: i64,
+) -> BlockId {
+    edits
+        .get(&WorldCoord {
+            x: world_x,
+            y: world_y,
+            z: world_z,
+        })
+        .copied()
+        .unwrap_or_else(|| generator.block_at_world(world_x, world_y, world_z))
+}
+
+fn overrides_or_generated(
+    edits: &HashMap<WorldCoord, BlockId>,
+    world_x: i64,
+    world_y: i64,
+    world_z: i64,
+    generated: BlockId,
+) -> BlockId {
+    edits
+        .get(&WorldCoord {
+            x: world_x,
+            y: world_y,
+            z: world_z,
+        })
+        .copied()
+        .unwrap_or(generated)
 }
 
 fn block_from_surface_height(
@@ -1006,5 +1175,23 @@ mod tests {
             );
             previous_distance = distance;
         }
+    }
+
+    #[test]
+    fn runtime_edit_overrides_generated_block() {
+        let gen = TerrainGenerator::new(TerrainConfig::default());
+        let mut controller = ClipmapStreamingController::new(gen);
+
+        // Deep underground should be solid for generated terrain.
+        let x = 0;
+        let y = -128;
+        let z = 0;
+        assert!(controller.block_at_world(x, y, z).is_solid());
+
+        assert!(controller.destroy_block_at_world(x, y, z));
+        assert!(controller.block_at_world(x, y, z).is_air());
+
+        assert!(controller.set_block_at_world(x, y, z, BlockId::STONE));
+        assert_eq!(controller.block_at_world(x, y, z), BlockId::STONE);
     }
 }

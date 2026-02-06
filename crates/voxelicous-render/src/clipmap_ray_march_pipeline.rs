@@ -15,15 +15,18 @@ use crate::debug::DebugMode;
 
 /// Clipmap ray marching compute pipeline.
 pub struct ClipmapRayMarchPipeline {
-    pipeline: ComputePipeline,
+    ray_march_pipeline: ComputePipeline,
+    crosshair_pipeline: ComputePipeline,
     descriptor_set_layout: vk::DescriptorSetLayout,
+    crosshair_descriptor_set_layout: vk::DescriptorSetLayout,
     descriptor_pool: DescriptorPool,
+    crosshair_descriptor_pool: DescriptorPool,
     descriptor_sets: Vec<vk::DescriptorSet>,
+    crosshair_descriptor_sets: Vec<vk::DescriptorSet>,
     camera_buffers: Vec<GpuBuffer>,
     output_image: GpuImage,
     output_image_view: vk::ImageView,
     readback_buffer: GpuBuffer,
-    frames_in_flight: usize,
     width: u32,
     height: u32,
 }
@@ -51,11 +54,23 @@ impl ClipmapRayMarchPipeline {
             .size(ClipmapRenderPushConstants::SIZE);
 
         let shader_code = voxelicous_shaders::ray_march_clipmap_shader();
-        let pipeline = ComputePipeline::new(
+        let ray_march_pipeline = ComputePipeline::new(
             device,
             shader_code,
             &[descriptor_set_layout],
             &[push_constant_range],
+        )?;
+
+        let crosshair_descriptor_set_layout = DescriptorSetLayoutBuilder::new()
+            .storage_image(0, vk::ShaderStageFlags::COMPUTE)
+            .build(device)?;
+
+        let crosshair_shader_code = voxelicous_shaders::crosshair_overlay_shader();
+        let crosshair_pipeline = ComputePipeline::new(
+            device,
+            crosshair_shader_code,
+            &[crosshair_descriptor_set_layout],
+            &[],
         )?;
 
         let mut camera_buffers = Vec::with_capacity(frames_in_flight);
@@ -125,6 +140,17 @@ impl ClipmapRayMarchPipeline {
             .collect();
         let descriptor_sets = descriptor_pool.allocate(device, &layouts)?;
 
+        let crosshair_pool_sizes = [vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::STORAGE_IMAGE)
+            .descriptor_count(frames_in_flight as u32)];
+        let crosshair_descriptor_pool =
+            DescriptorPool::new(device, frames_in_flight as u32, &crosshair_pool_sizes)?;
+        let crosshair_layouts: Vec<_> = (0..frames_in_flight)
+            .map(|_| crosshair_descriptor_set_layout)
+            .collect();
+        let crosshair_descriptor_sets =
+            crosshair_descriptor_pool.allocate(device, &crosshair_layouts)?;
+
         let image_info_desc = vk::DescriptorImageInfo::default()
             .image_view(output_image_view)
             .image_layout(vk::ImageLayout::GENERAL);
@@ -151,16 +177,28 @@ impl ClipmapRayMarchPipeline {
             device.update_descriptor_sets(&writes, &[]);
         }
 
+        for &descriptor_set in &crosshair_descriptor_sets {
+            let write = vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .image_info(std::slice::from_ref(&image_info_desc));
+            device.update_descriptor_sets(std::slice::from_ref(&write), &[]);
+        }
+
         Ok(Self {
-            pipeline,
+            ray_march_pipeline,
+            crosshair_pipeline,
             descriptor_set_layout,
+            crosshair_descriptor_set_layout,
             descriptor_pool,
+            crosshair_descriptor_pool,
             descriptor_sets,
+            crosshair_descriptor_sets,
             camera_buffers,
             output_image,
             output_image_view,
             readback_buffer,
-            frames_in_flight,
             width,
             height,
         })
@@ -203,11 +241,15 @@ impl ClipmapRayMarchPipeline {
 
         device.cmd_pipeline_barrier2(cmd, &dependency_info);
 
-        device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.pipeline.pipeline);
+        device.cmd_bind_pipeline(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            self.ray_march_pipeline.pipeline,
+        );
         device.cmd_bind_descriptor_sets(
             cmd,
             vk::PipelineBindPoint::COMPUTE,
-            self.pipeline.layout,
+            self.ray_march_pipeline.layout,
             0,
             &[self.descriptor_sets[frame_index]],
             &[],
@@ -218,7 +260,7 @@ impl ClipmapRayMarchPipeline {
 
         device.cmd_push_constants(
             cmd,
-            self.pipeline.layout,
+            self.ray_march_pipeline.layout,
             vk::ShaderStageFlags::COMPUTE,
             0,
             bytemuck::bytes_of(&push_constants),
@@ -227,6 +269,42 @@ impl ClipmapRayMarchPipeline {
         let workgroup_x = (self.width + 7) / 8;
         let workgroup_y = (self.height + 7) / 8;
         device.cmd_dispatch(cmd, workgroup_x, workgroup_y, 1);
+
+        let overlay_barrier = vk::ImageMemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+            .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+            .dst_access_mask(
+                vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_STORAGE_WRITE,
+            )
+            .old_layout(vk::ImageLayout::GENERAL)
+            .new_layout(vk::ImageLayout::GENERAL)
+            .image(self.output_image.image)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            });
+        let overlay_dependency = vk::DependencyInfo::default()
+            .image_memory_barriers(std::slice::from_ref(&overlay_barrier));
+        device.cmd_pipeline_barrier2(cmd, &overlay_dependency);
+
+        device.cmd_bind_pipeline(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            self.crosshair_pipeline.pipeline,
+        );
+        device.cmd_bind_descriptor_sets(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            self.crosshair_pipeline.layout,
+            0,
+            &[self.crosshair_descriptor_sets[frame_index]],
+            &[],
+        );
+        device.cmd_dispatch(cmd, 1, 1, 1);
 
         Ok(())
     }
@@ -305,9 +383,12 @@ impl ClipmapRayMarchPipeline {
             allocator.free_buffer(camera_buffer)?;
         }
         allocator.free_buffer(&mut self.readback_buffer)?;
+        self.crosshair_descriptor_pool.destroy(device);
+        device.destroy_descriptor_set_layout(self.crosshair_descriptor_set_layout, None);
+        self.crosshair_pipeline.destroy(device);
         self.descriptor_pool.destroy(device);
         device.destroy_descriptor_set_layout(self.descriptor_set_layout, None);
-        self.pipeline.destroy(device);
+        self.ray_march_pipeline.destroy(device);
         Ok(())
     }
 }

@@ -22,6 +22,14 @@ fn main() {
         Path::new(&out_dir).join("ray_march_clipmap.spv"),
         ShaderKind::Compute,
     );
+
+    // Compile crosshair_overlay.comp (post ray-march overlay)
+    compile_shader(
+        &compiler,
+        shader_dir.join("crosshair_overlay.comp"),
+        Path::new(&out_dir).join("crosshair_overlay.spv"),
+        ShaderKind::Compute,
+    );
 }
 
 fn compile_shader(

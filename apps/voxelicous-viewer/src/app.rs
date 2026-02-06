@@ -8,7 +8,7 @@ use winit::window::{CursorGrabMode, Window};
 use voxelicous_app::{
     AppContext, Camera, DeviceEvent, DeviceId, FrameContext, VoxelApp, WindowEvent,
 };
-use voxelicous_input::{ActionMap, CursorMode, InputManager, KeyCode};
+use voxelicous_input::{ActionMap, CursorMode, InputManager, KeyCode, MouseButton};
 use voxelicous_render::{
     save_screenshot, CameraUniforms, ClipmapRayMarchPipeline, ClipmapRenderer, DebugMode,
     ScreenshotConfig,
@@ -29,6 +29,8 @@ const CAMERA_SPRINT_MULT: f32 = 2.5;
 
 /// Mouse sensitivity for camera rotation (radians per pixel).
 const MOUSE_SENSITIVITY: f32 = 0.002;
+/// Max distance for block editing raycasts.
+const BLOCK_EDIT_REACH: f32 = 10.0;
 
 /// Configuration for clipmap rendering (from CLI or defaults).
 #[derive(Debug, Clone)]
@@ -172,6 +174,7 @@ impl VoxelApp for Viewer {
             .bind("sprint", KeyCode::ShiftRight)
             .bind("toggle_cursor", KeyCode::Escape)
             .bind("debug_cycle", KeyCode::F3)
+            .bind("destroy_block", MouseButton::Left)
             .build();
         let mut input = InputManager::with_actions(actions);
 
@@ -216,7 +219,10 @@ impl VoxelApp for Viewer {
         })
     }
 
-    #[cfg_attr(feature = "profiling-tracy", tracing::instrument(level = "trace", skip_all))]
+    #[cfg_attr(
+        feature = "profiling-tracy",
+        tracing::instrument(level = "trace", skip_all)
+    )]
     fn update(&mut self, ctx: &AppContext, dt: f32) {
         // Update input action states (must be called before querying actions)
         self.input.update();
@@ -297,6 +303,13 @@ impl VoxelApp for Viewer {
             self.camera.position += movement;
         }
 
+        // Destroy block at crosshair (left mouse).
+        if self.input.cursor_mode() == CursorMode::Locked
+            && self.input.is_action_just_pressed("destroy_block")
+        {
+            self.try_destroy_aimed_block();
+        }
+
         // End input frame (must be called at end of update)
         self.input.end_frame();
 
@@ -318,7 +331,10 @@ impl VoxelApp for Viewer {
         }
     }
 
-    #[cfg_attr(feature = "profiling-tracy", tracing::instrument(level = "trace", skip_all))]
+    #[cfg_attr(
+        feature = "profiling-tracy",
+        tracing::instrument(level = "trace", skip_all)
+    )]
     fn render(&mut self, ctx: &AppContext, frame: &mut FrameContext) -> anyhow::Result<()> {
         let frame_index = frame.frame_index;
         let frame_number = frame.frame_number;
@@ -337,7 +353,9 @@ impl VoxelApp for Viewer {
         }
 
         // Check if we should exit after capturing
-        if self.screenshot_config.exit_after_capture && self.screenshot_config.all_captured(frame_number) {
+        if self.screenshot_config.exit_after_capture
+            && self.screenshot_config.all_captured(frame_number)
+        {
             info!("All screenshots captured, requesting exit...");
             self.should_exit = true;
         }
@@ -406,7 +424,24 @@ impl VoxelApp for Viewer {
 }
 
 impl Viewer {
-    #[cfg_attr(feature = "profiling-tracy", tracing::instrument(level = "trace", skip_all))]
+    fn try_destroy_aimed_block(&mut self) {
+        let origin = self.camera.position;
+        let direction = self.camera.direction;
+        let Some((x, y, z)) =
+            raycast_first_solid_voxel(&self.clipmap, origin, direction, BLOCK_EDIT_REACH)
+        else {
+            return;
+        };
+
+        if self.clipmap.destroy_block_at_world(x, y, z) {
+            info!("Destroyed block at ({x}, {y}, {z})");
+        }
+    }
+
+    #[cfg_attr(
+        feature = "profiling-tracy",
+        tracing::instrument(level = "trace", skip_all)
+    )]
     fn render_sync_clipmap_buffers(
         &mut self,
         ctx: &AppContext,
@@ -452,7 +487,10 @@ impl Viewer {
         }
     }
 
-    #[cfg_attr(feature = "profiling-tracy", tracing::instrument(level = "trace", skip_all))]
+    #[cfg_attr(
+        feature = "profiling-tracy",
+        tracing::instrument(level = "trace", skip_all)
+    )]
     fn render_record_ray_march(
         &self,
         ctx: &AppContext,
@@ -479,7 +517,10 @@ impl Viewer {
         Ok(())
     }
 
-    #[cfg_attr(feature = "profiling-tracy", tracing::instrument(level = "trace", skip_all))]
+    #[cfg_attr(
+        feature = "profiling-tracy",
+        tracing::instrument(level = "trace", skip_all)
+    )]
     fn render_record_output_blit(&self, ctx: &AppContext, frame: &FrameContext) {
         let device = ctx.gpu.device();
         let cmd = frame.command_buffer;
@@ -568,13 +609,11 @@ impl Viewer {
         }
     }
 
-    #[cfg_attr(feature = "profiling-tracy", tracing::instrument(level = "trace", skip_all))]
-    fn render_record_readback(
-        &self,
-        ctx: &AppContext,
-        frame: &FrameContext,
-        capturing: bool,
-    ) {
+    #[cfg_attr(
+        feature = "profiling-tracy",
+        tracing::instrument(level = "trace", skip_all)
+    )]
+    fn render_record_readback(&self, ctx: &AppContext, frame: &FrameContext, capturing: bool) {
         if !capturing {
             return;
         }
@@ -588,7 +627,10 @@ impl Viewer {
         }
     }
 
-    #[cfg_attr(feature = "profiling-tracy", tracing::instrument(level = "trace", skip_all))]
+    #[cfg_attr(
+        feature = "profiling-tracy",
+        tracing::instrument(level = "trace", skip_all)
+    )]
     fn render_record_present_transition(&self, ctx: &AppContext, frame: &FrameContext) {
         let device = ctx.gpu.device();
         let cmd = frame.command_buffer;
@@ -636,6 +678,123 @@ impl Viewer {
         }
 
         Ok(())
+    }
+}
+
+fn raycast_first_solid_voxel(
+    clipmap: &ClipmapStreamingController,
+    origin: Vec3,
+    direction: Vec3,
+    max_distance: f32,
+) -> Option<(i64, i64, i64)> {
+    if direction.length_squared() <= 1e-8 {
+        return None;
+    }
+
+    let dir = direction.normalize();
+    let start = origin + dir * 0.05;
+    let mut voxel_x = start.x.floor() as i64;
+    let mut voxel_y = start.y.floor() as i64;
+    let mut voxel_z = start.z.floor() as i64;
+
+    let step_x = if dir.x > 0.0 {
+        1i64
+    } else if dir.x < 0.0 {
+        -1i64
+    } else {
+        0i64
+    };
+    let step_y = if dir.y > 0.0 {
+        1i64
+    } else if dir.y < 0.0 {
+        -1i64
+    } else {
+        0i64
+    };
+    let step_z = if dir.z > 0.0 {
+        1i64
+    } else if dir.z < 0.0 {
+        -1i64
+    } else {
+        0i64
+    };
+
+    let t_delta_x = if step_x != 0 {
+        1.0 / dir.x.abs()
+    } else {
+        f32::INFINITY
+    };
+    let t_delta_y = if step_y != 0 {
+        1.0 / dir.y.abs()
+    } else {
+        f32::INFINITY
+    };
+    let t_delta_z = if step_z != 0 {
+        1.0 / dir.z.abs()
+    } else {
+        f32::INFINITY
+    };
+
+    let next_x = if step_x > 0 {
+        voxel_x as f32 + 1.0
+    } else {
+        voxel_x as f32
+    };
+    let next_y = if step_y > 0 {
+        voxel_y as f32 + 1.0
+    } else {
+        voxel_y as f32
+    };
+    let next_z = if step_z > 0 {
+        voxel_z as f32 + 1.0
+    } else {
+        voxel_z as f32
+    };
+
+    let mut t_max_x = if step_x != 0 {
+        (next_x - start.x) / dir.x
+    } else {
+        f32::INFINITY
+    };
+    let mut t_max_y = if step_y != 0 {
+        (next_y - start.y) / dir.y
+    } else {
+        f32::INFINITY
+    };
+    let mut t_max_z = if step_z != 0 {
+        (next_z - start.z) / dir.z
+    } else {
+        f32::INFINITY
+    };
+
+    let mut t = 0.0f32;
+    loop {
+        if t > max_distance {
+            return None;
+        }
+
+        if clipmap.block_at_world(voxel_x, voxel_y, voxel_z).is_solid() {
+            return Some((voxel_x, voxel_y, voxel_z));
+        }
+
+        let t_next = t_max_x.min(t_max_y.min(t_max_z));
+        if !t_next.is_finite() {
+            return None;
+        }
+
+        t = t_next;
+        if t_max_x <= t_next {
+            voxel_x += step_x;
+            t_max_x += t_delta_x;
+        }
+        if t_max_y <= t_next {
+            voxel_y += step_y;
+            t_max_y += t_delta_y;
+        }
+        if t_max_z <= t_next {
+            voxel_z += step_z;
+            t_max_z += t_delta_z;
+        }
     }
 }
 
