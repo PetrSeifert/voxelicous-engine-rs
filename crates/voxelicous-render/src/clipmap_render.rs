@@ -105,67 +105,116 @@ impl ClipmapRenderer {
         frame_index: usize,
         frame_number: u64,
     ) -> Result<()> {
-        self.ensure_page_buffers(allocator)?;
-        self.ensure_info_buffers(allocator, device)?;
+        {
+            #[cfg(feature = "profiling-tracy")]
+            let _span = tracing::trace_span!("clipmap_sync.ensure_page_buffers").entered();
+            self.ensure_page_buffers(allocator)?;
+        }
+        {
+            #[cfg(feature = "profiling-tracy")]
+            let _span = tracing::trace_span!("clipmap_sync.ensure_info_buffers").entered();
+            self.ensure_info_buffers(allocator, device)?;
+        }
 
         let store = controller.store();
 
-        let header_realloc =
-            self.ensure_brick_header_buffer(allocator, frame_number, store.headers())?;
-        let pal16_realloc = Self::ensure_pool_buffer(
-            allocator,
-            &mut self.deferred_deletions,
-            frame_number,
-            &mut self.palette16_buffer,
-            store.palette16_pool().len() as u64,
-            PALETTE16_STRIDE as u64,
-            "clipmap_palette16",
-        )?;
-        let pal32_realloc = Self::ensure_pool_buffer(
-            allocator,
-            &mut self.deferred_deletions,
-            frame_number,
-            &mut self.palette32_buffer,
-            store.palette32_pool().len() as u64,
-            PALETTE32_STRIDE as u64,
-            "clipmap_palette32",
-        )?;
-        let raw_realloc = Self::ensure_pool_buffer(
-            allocator,
-            &mut self.deferred_deletions,
-            frame_number,
-            &mut self.raw16_buffer,
-            store.raw16_pool().len() as u64,
-            RAW16_STRIDE as u64,
-            "clipmap_raw16",
-        )?;
+        let header_realloc = {
+            #[cfg(feature = "profiling-tracy")]
+            let _span = tracing::trace_span!("clipmap_sync.ensure_brick_header_buffer").entered();
+            self.ensure_brick_header_buffer(allocator, frame_number, store.headers())?
+        };
+        let pal16_realloc = {
+            #[cfg(feature = "profiling-tracy")]
+            let _span = tracing::trace_span!("clipmap_sync.ensure_palette16_buffer").entered();
+            Self::ensure_pool_buffer(
+                allocator,
+                &mut self.deferred_deletions,
+                frame_number,
+                &mut self.palette16_buffer,
+                store.palette16_pool().len() as u64,
+                PALETTE16_STRIDE as u64,
+                "clipmap_palette16",
+            )?
+        };
+        let pal32_realloc = {
+            #[cfg(feature = "profiling-tracy")]
+            let _span = tracing::trace_span!("clipmap_sync.ensure_palette32_buffer").entered();
+            Self::ensure_pool_buffer(
+                allocator,
+                &mut self.deferred_deletions,
+                frame_number,
+                &mut self.palette32_buffer,
+                store.palette32_pool().len() as u64,
+                PALETTE32_STRIDE as u64,
+                "clipmap_palette32",
+            )?
+        };
+        let raw_realloc = {
+            #[cfg(feature = "profiling-tracy")]
+            let _span = tracing::trace_span!("clipmap_sync.ensure_raw16_buffer").entered();
+            Self::ensure_pool_buffer(
+                allocator,
+                &mut self.deferred_deletions,
+                frame_number,
+                &mut self.raw16_buffer,
+                store.raw16_pool().len() as u64,
+                RAW16_STRIDE as u64,
+                "clipmap_raw16",
+            )?
+        };
 
-        self.upload_page_tables(controller, dirty.dirty_pages)?;
-        self.upload_brick_headers(store, dirty.dirty_headers, header_realloc)?;
-        self.upload_pool_entries(
-            store.palette16_pool(),
-            PALETTE16_STRIDE,
-            self.palette16_buffer.as_ref().unwrap(),
-            dirty.dirty_palette16_entries,
-            pal16_realloc,
-        )?;
-        self.upload_pool_entries(
-            store.palette32_pool(),
-            PALETTE32_STRIDE,
-            self.palette32_buffer.as_ref().unwrap(),
-            dirty.dirty_palette32_entries,
-            pal32_realloc,
-        )?;
-        self.upload_pool_entries(
-            store.raw16_pool(),
-            RAW16_STRIDE,
-            self.raw16_buffer.as_ref().unwrap(),
-            dirty.dirty_raw16_entries,
-            raw_realloc,
-        )?;
+        {
+            #[cfg(feature = "profiling-tracy")]
+            let _span = tracing::trace_span!("clipmap_sync.upload_page_tables").entered();
+            self.upload_page_tables(controller, dirty.dirty_pages)?;
+        }
+        {
+            #[cfg(feature = "profiling-tracy")]
+            let _span = tracing::trace_span!("clipmap_sync.upload_brick_headers").entered();
+            self.upload_brick_headers(store, dirty.dirty_headers, header_realloc)?;
+        }
+        {
+            #[cfg(feature = "profiling-tracy")]
+            let _span = tracing::trace_span!("clipmap_sync.upload_palette16_entries").entered();
+            self.upload_pool_entries(
+                store.palette16_pool(),
+                PALETTE16_STRIDE,
+                self.palette16_buffer.as_ref().unwrap(),
+                dirty.dirty_palette16_entries,
+                pal16_realloc,
+            )?;
+        }
+        {
+            #[cfg(feature = "profiling-tracy")]
+            let _span = tracing::trace_span!("clipmap_sync.upload_palette32_entries").entered();
+            self.upload_pool_entries(
+                store.palette32_pool(),
+                PALETTE32_STRIDE,
+                self.palette32_buffer.as_ref().unwrap(),
+                dirty.dirty_palette32_entries,
+                pal32_realloc,
+            )?;
+        }
+        {
+            #[cfg(feature = "profiling-tracy")]
+            let _span = tracing::trace_span!("clipmap_sync.upload_raw16_entries").entered();
+            self.upload_pool_entries(
+                store.raw16_pool(),
+                RAW16_STRIDE,
+                self.raw16_buffer.as_ref().unwrap(),
+                dirty.dirty_raw16_entries,
+                raw_realloc,
+            )?;
+        }
 
-        let info = self.build_gpu_info(device, controller);
+        let info = {
+            #[cfg(feature = "profiling-tracy")]
+            let _span = tracing::trace_span!("clipmap_sync.build_gpu_info").entered();
+            self.build_gpu_info(device, controller)
+        };
         if let Some(info_buffer) = &self.clipmap_info_buffers[frame_index] {
+            #[cfg(feature = "profiling-tracy")]
+            let _span = tracing::trace_span!("clipmap_sync.write_gpu_info").entered();
             info_buffer.write(std::slice::from_ref(&info))?;
             self.clipmap_info_addresses[frame_index] = info_buffer.device_address(device);
         }
@@ -322,10 +371,17 @@ impl ClipmapRenderer {
         let buffer = &mut self.brick_header_buffer;
 
         if buffer.as_ref().map_or(true, |b| b.size < required) {
+            let current_size = buffer.as_ref().map_or(0, |b| b.size);
             if let Some(old) = buffer.take() {
                 self.deferred_deletions.queue(old, frame_number);
             }
-            let size = required.max(std::mem::size_of::<BrickHeader>() as u64);
+            let min_size = std::mem::size_of::<BrickHeader>() as u64;
+            let required_size = required.max(min_size);
+            let size = if current_size == 0 {
+                required_size
+            } else {
+                current_size.saturating_mul(2).max(required_size)
+            };
             let new_buffer = allocator.create_buffer(
                 size,
                 usage,
@@ -353,11 +409,17 @@ impl ClipmapRenderer {
             vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS;
 
         if buffer.as_ref().map_or(true, |b| b.size < required) {
+            let current_size = buffer.as_ref().map_or(0, |b| b.size);
             if let Some(old) = buffer.take() {
                 deferred.queue(old, frame_number);
             }
+            let grow_size = if current_size == 0 {
+                required
+            } else {
+                current_size.saturating_mul(2).max(required)
+            };
             let new_buffer =
-                allocator.create_buffer(required, usage, MemoryLocation::CpuToGpu, name)?;
+                allocator.create_buffer(grow_size, usage, MemoryLocation::CpuToGpu, name)?;
             *buffer = Some(new_buffer);
             return Ok(true);
         }
@@ -388,12 +450,23 @@ impl ClipmapRenderer {
             let page_occ = controller.page_occ(lod);
             let page_coords = controller.page_coords(lod);
 
-            if dirty_pages.get(lod).map_or(true, |p| p.is_empty()) {
+            let Some(lod_dirty_pages) = dirty_pages.get(lod) else {
+                continue;
+            };
+            if lod_dirty_pages.is_empty() {
                 // No dirty pages; skip.
                 continue;
             }
 
-            for &page_index in &dirty_pages[lod] {
+            #[cfg(feature = "profiling-tracy")]
+            let _span = tracing::trace_span!(
+                "upload_page_tables_lod",
+                lod = lod as u32,
+                dirty_pages = lod_dirty_pages.len() as u32
+            )
+            .entered();
+
+            for &page_index in lod_dirty_pages {
                 if page_index >= page_count {
                     continue;
                 }
@@ -425,11 +498,20 @@ impl ClipmapRenderer {
         let headers = store.headers();
 
         if full_upload {
+            #[cfg(feature = "profiling-tracy")]
+            let _span = tracing::trace_span!("upload_brick_headers_full", headers = headers.len() as u32)
+                .entered();
             header_buffer.write(headers)?;
             return Ok(());
         }
 
         let header_size = std::mem::size_of::<BrickHeader>();
+        #[cfg(feature = "profiling-tracy")]
+        let _span = tracing::trace_span!(
+            "upload_brick_headers_incremental",
+            dirty_headers = dirty_headers.len() as u32
+        )
+        .entered();
         for id in dirty_headers {
             let idx = id.0 as usize;
             if idx >= headers.len() {
@@ -456,10 +538,20 @@ impl ClipmapRenderer {
         }
 
         if full_upload {
+            #[cfg(feature = "profiling-tracy")]
+            let _span = tracing::trace_span!("upload_pool_entries_full", bytes = pool.len() as u32)
+                .entered();
             buffer.write_bytes(0, pool)?;
             return Ok(());
         }
 
+        #[cfg(feature = "profiling-tracy")]
+        let _span = tracing::trace_span!(
+            "upload_pool_entries_incremental",
+            entries = entries.len() as u32,
+            stride = stride as u32
+        )
+        .entered();
         for entry in entries {
             let offset = entry as usize * stride;
             if offset + stride <= pool.len() {

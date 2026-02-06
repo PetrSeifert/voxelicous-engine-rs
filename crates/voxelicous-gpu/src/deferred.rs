@@ -6,6 +6,7 @@
 
 use crate::error::Result;
 use crate::memory::{GpuAllocator, GpuBuffer};
+use std::collections::VecDeque;
 
 /// A buffer pending deletion.
 pub struct PendingDeletion {
@@ -21,7 +22,7 @@ pub struct PendingDeletion {
 /// have passed to guarantee they are no longer in use by any in-flight frame.
 pub struct DeferredDeletionQueue {
     /// Buffers pending deletion.
-    pending: Vec<PendingDeletion>,
+    pending: VecDeque<PendingDeletion>,
     /// Number of frames in flight (determines how long to wait before freeing).
     frames_in_flight: usize,
 }
@@ -34,7 +35,7 @@ impl DeferredDeletionQueue {
     ///   Buffers will be kept for this many frames before being freed.
     pub fn new(frames_in_flight: usize) -> Self {
         Self {
-            pending: Vec::new(),
+            pending: VecDeque::new(),
             frames_in_flight,
         }
     }
@@ -47,7 +48,7 @@ impl DeferredDeletionQueue {
     /// * `buffer` - The buffer to queue for deletion.
     /// * `frame_number` - Current frame number when queuing.
     pub fn queue(&mut self, buffer: GpuBuffer, frame_number: u64) {
-        self.pending.push(PendingDeletion {
+        self.pending.push_back(PendingDeletion {
             buffer,
             frame_queued: frame_number,
         });
@@ -68,19 +69,9 @@ impl DeferredDeletionQueue {
         // Keep buffers that were queued within the last `frames_in_flight` frames
         let cutoff = current_frame_number.saturating_sub(self.frames_in_flight as u64);
 
-        // Collect items to free
-        let mut to_free = Vec::new();
-        let mut i = 0;
-        while i < self.pending.len() {
-            if self.pending[i].frame_queued < cutoff {
-                to_free.push(self.pending.remove(i));
-            } else {
-                i += 1;
-            }
-        }
-
-        // Actually free the buffers
-        for mut pending in to_free {
+        // Queue order is FIFO and frame numbers are non-decreasing, so only the front can mature.
+        while matches!(self.pending.front(), Some(p) if p.frame_queued < cutoff) {
+            let mut pending = self.pending.pop_front().expect("front just matched");
             allocator.free_buffer(&mut pending.buffer)?;
         }
 
@@ -95,7 +86,7 @@ impl DeferredDeletionQueue {
     /// # Arguments
     /// * `allocator` - GPU allocator for freeing buffers.
     pub fn flush(&mut self, allocator: &mut GpuAllocator) -> Result<()> {
-        for mut pending in self.pending.drain(..) {
+        while let Some(mut pending) = self.pending.pop_front() {
             allocator.free_buffer(&mut pending.buffer)?;
         }
         Ok(())

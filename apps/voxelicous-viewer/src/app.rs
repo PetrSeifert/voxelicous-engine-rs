@@ -414,24 +414,40 @@ impl Viewer {
         frame_number: u64,
     ) {
         let device = ctx.gpu.device();
-        let mut allocator = ctx.gpu.allocator().lock();
+        let mut allocator = {
+            #[cfg(feature = "profiling-tracy")]
+            let _span = tracing::trace_span!("clipmap_sync.lock_allocator").entered();
+            ctx.gpu.allocator().lock()
+        };
 
-        if let Err(e) = self
-            .clipmap_renderer
-            .process_deferred_deletions(&mut allocator, frame_number)
-        {
+        let deferred_result = {
+            #[cfg(feature = "profiling-tracy")]
+            let _span = tracing::trace_span!("clipmap_sync.process_deferred_deletions").entered();
+            self.clipmap_renderer
+                .process_deferred_deletions(&mut allocator, frame_number)
+        };
+        if let Err(e) = deferred_result {
             error!("Failed to process deferred deletions: {}", e);
         }
 
-        let dirty = self.clipmap.take_dirty_state();
-        if let Err(e) = self.clipmap_renderer.sync_from_controller(
-            &mut allocator,
-            device,
-            &self.clipmap,
-            dirty,
-            frame_index,
-            frame_number,
-        ) {
+        let dirty = {
+            #[cfg(feature = "profiling-tracy")]
+            let _span = tracing::trace_span!("clipmap_sync.take_dirty_state").entered();
+            self.clipmap.take_dirty_state()
+        };
+        let sync_result = {
+            #[cfg(feature = "profiling-tracy")]
+            let _span = tracing::trace_span!("clipmap_sync.sync_from_controller").entered();
+            self.clipmap_renderer.sync_from_controller(
+                &mut allocator,
+                device,
+                &self.clipmap,
+                dirty,
+                frame_index,
+                frame_number,
+            )
+        };
+        if let Err(e) = sync_result {
             error!("Failed to sync clipmap GPU buffers: {e}");
         }
     }
