@@ -240,8 +240,12 @@ RayHit trace_brick(
         return hit;
     }
 
-    float local_eps = max(DDA_EPS, voxel_size * 0.01);
-    float t = t_start + local_eps;
+    float local_eps = max(DDA_EPS * 0.25, voxel_size * 1e-5);
+    float interval_len = max(t_end - t_start, 0.0);
+    // Keep the start nudge smaller than the traversed segment to avoid skipping
+    // thin edge voxels at brick boundaries.
+    float start_nudge = min(local_eps, interval_len * 0.25);
+    float t = t_start + start_nudge;
     vec3 inv_dir = 1.0 / ray_dir;
     vec3 pos = ray_origin + ray_dir * t;
 
@@ -291,27 +295,27 @@ RayHit trace_brick(
         }
 
         // Advance to next voxel
-        if (t_max.x < t_max.y && t_max.x < t_max.z) {
-            t = t_max.x;
+        bool step_x = t_max.x <= t_max.y && t_max.x <= t_max.z;
+        bool step_y = t_max.y <= t_max.x && t_max.y <= t_max.z;
+        bool step_z = t_max.z <= t_max.x && t_max.z <= t_max.y;
+
+        t = t_next;
+        if (step_x) {
             t_max.x += t_delta.x;
             voxel.x += step.x;
-            if (voxel.x < 0 || voxel.x >= int(BRICK_SIZE)) {
-                break;
-            }
-        } else if (t_max.y < t_max.z) {
-            t = t_max.y;
+        }
+        if (step_y) {
             t_max.y += t_delta.y;
             voxel.y += step.y;
-            if (voxel.y < 0 || voxel.y >= int(BRICK_SIZE)) {
-                break;
-            }
-        } else {
-            t = t_max.z;
+        }
+        if (step_z) {
             t_max.z += t_delta.z;
             voxel.z += step.z;
-            if (voxel.z < 0 || voxel.z >= int(BRICK_SIZE)) {
-                break;
-            }
+        }
+        if (voxel.x < 0 || voxel.x >= int(BRICK_SIZE) ||
+            voxel.y < 0 || voxel.y >= int(BRICK_SIZE) ||
+            voxel.z < 0 || voxel.z >= int(BRICK_SIZE)) {
+            break;
         }
     }
 
@@ -341,9 +345,11 @@ RayHit trace_interval(
     float voxel_size = float(clipmap.voxel_size[lod].x);
     float page_size = voxel_size * float(PAGE_VOXELS_AXIS);
     float brick_size = voxel_size * float(BRICK_SIZE);
-    float local_eps = max(DDA_EPS, voxel_size * 0.01);
+    float local_eps = max(DDA_EPS * 0.25, voxel_size * 1e-5);
+    float interval_len = max(t_end - t_start, 0.0);
+    float start_nudge = min(local_eps, interval_len * 0.25);
 
-    float t = t_start + local_eps;
+    float t = t_start + start_nudge;
     vec3 start_pos = ray_origin + ray_dir * t;
     ivec3 page = ivec3(floor(start_pos / page_size));
     ivec3 step = ivec3(sign(ray_dir));
@@ -379,7 +385,9 @@ RayHit trace_interval(
         uvec2 occ = page_occ.data[page_index];
         if (slot_matches && (occ.x | occ.y) != 0u) {
             vec3 page_origin = vec3(page) * page_size;
-            vec3 page_start = ray_origin + ray_dir * (t + local_eps);
+            float brick_interval_len = max(t_page_end - t, 0.0);
+            float brick_start_nudge = min(local_eps, brick_interval_len * 0.25);
+            vec3 page_start = ray_origin + ray_dir * (t + brick_start_nudge);
             ivec3 brick = ivec3(floor((page_start - page_origin) / brick_size));
             brick = clamp(brick, ivec3(0), ivec3(int(PAGE_BRICKS_AXIS) - 1));
 
@@ -425,27 +433,27 @@ RayHit trace_interval(
                     break;
                 }
 
-                if (brick_t_max.x < brick_t_max.y && brick_t_max.x < brick_t_max.z) {
-                    tb = brick_t_max.x;
+                bool step_x = brick_t_max.x <= brick_t_max.y && brick_t_max.x <= brick_t_max.z;
+                bool step_y = brick_t_max.y <= brick_t_max.x && brick_t_max.y <= brick_t_max.z;
+                bool step_z = brick_t_max.z <= brick_t_max.x && brick_t_max.z <= brick_t_max.y;
+
+                tb = tb_next;
+                if (step_x) {
                     brick_t_max.x += brick_t_delta.x;
                     brick.x += brick_step.x;
-                    if (brick.x < 0 || brick.x >= int(PAGE_BRICKS_AXIS)) {
-                        break;
-                    }
-                } else if (brick_t_max.y < brick_t_max.z) {
-                    tb = brick_t_max.y;
+                }
+                if (step_y) {
                     brick_t_max.y += brick_t_delta.y;
                     brick.y += brick_step.y;
-                    if (brick.y < 0 || brick.y >= int(PAGE_BRICKS_AXIS)) {
-                        break;
-                    }
-                } else {
-                    tb = brick_t_max.z;
+                }
+                if (step_z) {
                     brick_t_max.z += brick_t_delta.z;
                     brick.z += brick_step.z;
-                    if (brick.z < 0 || brick.z >= int(PAGE_BRICKS_AXIS)) {
-                        break;
-                    }
+                }
+                if (brick.x < 0 || brick.x >= int(PAGE_BRICKS_AXIS) ||
+                    brick.y < 0 || brick.y >= int(PAGE_BRICKS_AXIS) ||
+                    brick.z < 0 || brick.z >= int(PAGE_BRICKS_AXIS)) {
+                    break;
                 }
             }
         }
@@ -454,16 +462,20 @@ RayHit trace_interval(
             break;
         }
 
-        if (t_max.x < t_max.y && t_max.x < t_max.z) {
-            t = t_max.x;
+        bool step_x = t_max.x <= t_max.y && t_max.x <= t_max.z;
+        bool step_y = t_max.y <= t_max.x && t_max.y <= t_max.z;
+        bool step_z = t_max.z <= t_max.x && t_max.z <= t_max.y;
+
+        t = t_next;
+        if (step_x) {
             t_max.x += t_delta.x;
             page.x += step.x;
-        } else if (t_max.y < t_max.z) {
-            t = t_max.y;
+        }
+        if (step_y) {
             t_max.y += t_delta.y;
             page.y += step.y;
-        } else {
-            t = t_max.z;
+        }
+        if (step_z) {
             t_max.z += t_delta.z;
             page.z += step.z;
         }
@@ -698,10 +710,14 @@ vec3 get_block_color(uint block_id) {
     }
 }
 
+vec3 sky_color(vec3 ray_dir) {
+    float t = 0.5 * (ray_dir.y + 1.0);
+    return mix(vec3(0.8, 0.85, 0.9), vec3(0.4, 0.6, 0.9), t);
+}
+
 vec3 shade(RayHit hit, vec3 ray_dir) {
     if (!hit.hit) {
-        float t = 0.5 * (ray_dir.y + 1.0);
-        return mix(vec3(0.8, 0.85, 0.9), vec3(0.4, 0.6, 0.9), t);
+        return sky_color(ray_dir);
     }
 
     vec3 base_color = get_block_color(hit.block_id);
@@ -754,8 +770,7 @@ void main() {
             if (hit.hit) {
                 color = debug_normals(hit.normal);
             } else {
-                float t = 0.5 * (ray_dir.y + 1.0);
-                color = mix(vec3(0.8, 0.85, 0.9), vec3(0.4, 0.6, 0.9), t);
+                color = sky_color(ray_dir);
             }
             break;
         }
