@@ -50,6 +50,7 @@ use crate::app::Viewer;
 
 const WIDTH: u32 = 1280;
 const HEIGHT: u32 = 720;
+#[cfg(not(feature = "profiling-tracy"))]
 const TARGET_FPS: u32 = 980;
 
 fn main() -> anyhow::Result<()> {
@@ -59,11 +60,13 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    run_app::<Viewer>(
-        AppConfig::new("Voxelicous Engine - Clipmap Demo")
-            .with_size(WIDTH, HEIGHT)
-            .with_target_fps(TARGET_FPS),
-    )
+    let config = AppConfig::new("Voxelicous Engine - Clipmap Demo").with_size(WIDTH, HEIGHT);
+    #[cfg(feature = "profiling-tracy")]
+    let config = config;
+    #[cfg(not(feature = "profiling-tracy"))]
+    let config = config.with_target_fps(TARGET_FPS);
+
+    run_app::<Viewer>(config)
 }
 
 fn print_help() {

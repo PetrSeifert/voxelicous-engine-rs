@@ -608,12 +608,12 @@ pub fn downsample_voxel(children: &[BlockId; 8]) -> BlockId {
     let mut counts: HashMap<BlockId, usize> = HashMap::new();
     let mut solid_count = 0;
     let mut has_air = false;
-    let mut has_grass = false;
+    let mut has_surface = false;
     for v in children {
         if v.is_solid() {
             solid_count += 1;
             *counts.entry(*v).or_insert(0) += 1;
-            has_grass |= *v == BlockId::GRASS;
+            has_surface |= *v == BlockId::GRASS || *v == BlockId::SNOW;
         } else {
             has_air = true;
         }
@@ -623,8 +623,13 @@ pub fn downsample_voxel(children: &[BlockId; 8]) -> BlockId {
         return BlockId::AIR;
     }
 
-    // Preserve thin grass shells on coarse LODs where air+surface blocks mix.
-    if has_air && has_grass {
+    // Preserve thin top surface shells on coarse LODs where air+surface blocks mix.
+    if has_air && has_surface {
+        if counts.get(&BlockId::SNOW).copied().unwrap_or(0)
+            >= counts.get(&BlockId::GRASS).copied().unwrap_or(0)
+        {
+            return BlockId::SNOW;
+        }
         return BlockId::GRASS;
     }
 
@@ -763,5 +768,21 @@ mod tests {
         ];
         let out = downsample_voxel(&children);
         assert_eq!(out, BlockId::GRASS);
+    }
+
+    #[test]
+    fn downsample_preserves_surface_snow() {
+        let children = [
+            BlockId::AIR,
+            BlockId::AIR,
+            BlockId::SNOW,
+            BlockId::DIRT,
+            BlockId::STONE,
+            BlockId::STONE,
+            BlockId::AIR,
+            BlockId::AIR,
+        ];
+        let out = downsample_voxel(&children);
+        assert_eq!(out, BlockId::SNOW);
     }
 }

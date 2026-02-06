@@ -21,6 +21,8 @@ impl BlockId {
     pub const DIRT: Self = Self(2);
     /// Grass block
     pub const GRASS: Self = Self(3);
+    /// Snow block
+    pub const SNOW: Self = Self(4);
 
     /// Returns true if this block is air (empty)
     #[inline]
@@ -69,6 +71,14 @@ impl Material {
     pub const GRASS: Self = Self {
         color: [86, 125, 70],
         roughness: 0.85,
+        metallic: 0.0,
+        emission: 0.0,
+    };
+
+    /// Default snow material
+    pub const SNOW: Self = Self {
+        color: [236, 238, 245],
+        roughness: 0.95,
         metallic: 0.0,
         emission: 0.0,
     };

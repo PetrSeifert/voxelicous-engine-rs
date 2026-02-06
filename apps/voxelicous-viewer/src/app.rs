@@ -112,7 +112,7 @@ impl VoxelApp for Viewer {
         let terrain_config = TerrainConfig {
             seed: clipmap_params.seed,
             sea_level: 64,
-            terrain_scale: 50.0,
+            terrain_scale: 80.0,
             terrain_height: 32.0,
             ..Default::default()
         };

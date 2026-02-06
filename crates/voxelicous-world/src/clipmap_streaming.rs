@@ -124,7 +124,10 @@ impl ClipmapStreamingController {
     }
 
     /// Update the clipmap around the given camera position (world units).
-    #[cfg_attr(feature = "profiling-tracy", tracing::instrument(level = "trace", skip_all))]
+    #[cfg_attr(
+        feature = "profiling-tracy",
+        tracing::instrument(level = "trace", skip_all)
+    )]
     pub fn update(&mut self, camera_pos: Vec3) {
         self.process_deferred_brick_frees();
 
@@ -261,7 +264,10 @@ impl ClipmapStreamingController {
         self.lods[lod].loaded_pages > 0
     }
 
-    #[cfg_attr(feature = "profiling-tracy", tracing::instrument(level = "trace", skip_all))]
+    #[cfg_attr(
+        feature = "profiling-tracy",
+        tracing::instrument(level = "trace", skip_all)
+    )]
     fn update_lod(&mut self, lod: usize, camera_voxel: WorldCoord, force: bool) {
         let voxel_size = self.lod_voxel_size(lod);
         let page_size = PAGE_VOXELS_PER_AXIS as i64 * voxel_size;
@@ -417,7 +423,10 @@ impl ClipmapStreamingController {
         self.lods[lod].pending_pages.extend(coords);
     }
 
-    #[cfg_attr(feature = "profiling-tracy", tracing::instrument(level = "trace", skip_all))]
+    #[cfg_attr(
+        feature = "profiling-tracy",
+        tracing::instrument(level = "trace", skip_all)
+    )]
     fn process_pending_pages(&mut self, mut apply_budget: usize) {
         self.spawn_pending_jobs();
 
@@ -666,7 +675,10 @@ fn page_distance_to_camera_sq(
     dx * dx + dy * dy + dz * dz
 }
 
-#[cfg_attr(feature = "profiling-tracy", tracing::instrument(level = "trace", skip_all))]
+#[cfg_attr(
+    feature = "profiling-tracy",
+    tracing::instrument(level = "trace", skip_all)
+)]
 fn build_page_voxels(
     generator: &TerrainGenerator,
     page_coord: (i64, i64, i64),
@@ -732,7 +744,10 @@ fn build_page_voxels(
     }
 }
 
-#[cfg_attr(feature = "profiling-tracy", tracing::instrument(level = "trace", skip_all))]
+#[cfg_attr(
+    feature = "profiling-tracy",
+    tracing::instrument(level = "trace", skip_all)
+)]
 fn build_page_voxels_unit_lod(
     generator: &TerrainGenerator,
     page_coord: (i64, i64, i64),
@@ -740,13 +755,17 @@ fn build_page_voxels_unit_lod(
 ) -> BuiltPage {
     let mut occ: u64 = 0;
     let mut bricks = Vec::with_capacity(PAGE_BRICKS);
-    let mut heights = vec![0i32; PAGE_VOXELS_PER_AXIS * PAGE_VOXELS_PER_AXIS];
+    let mut surface_heights = vec![0i32; PAGE_VOXELS_PER_AXIS * PAGE_VOXELS_PER_AXIS];
+    let mut surface_blocks = vec![BlockId::AIR; PAGE_VOXELS_PER_AXIS * PAGE_VOXELS_PER_AXIS];
 
     for z in 0..PAGE_VOXELS_PER_AXIS {
         for x in 0..PAGE_VOXELS_PER_AXIS {
             let world_x = page_origin.x + x as i64;
             let world_z = page_origin.z + z as i64;
-            heights[x + z * PAGE_VOXELS_PER_AXIS] = generator.height_at(world_x, world_z);
+            let sample = generator.surface_at(world_x, world_z);
+            let index = x + z * PAGE_VOXELS_PER_AXIS;
+            surface_heights[index] = sample.surface_height;
+            surface_blocks[index] = sample.top_block;
         }
     }
 
@@ -768,11 +787,16 @@ fn build_page_voxels_unit_lod(
                             let world_y = brick_origin.y + y as i64;
                             let page_x = bx * BRICK_SIZE + x;
                             let page_z = bz * BRICK_SIZE + z;
-                            let surface_height =
-                                i64::from(heights[page_x + page_z * PAGE_VOXELS_PER_AXIS]);
+                            let index = page_x + page_z * PAGE_VOXELS_PER_AXIS;
+                            let surface_height = i64::from(surface_heights[index]);
+                            let surface_block = surface_blocks[index];
                             let idx = x + y * BRICK_SIZE + z * BRICK_SIZE * BRICK_SIZE;
-                            let block =
-                                block_from_surface_height(world_y, surface_height, dirt_depth);
+                            let block = block_from_surface_height(
+                                world_y,
+                                surface_height,
+                                dirt_depth,
+                                surface_block,
+                            );
                             voxels[idx] = block;
                             any_solid |= block.is_solid();
                         }
@@ -826,11 +850,16 @@ fn sample_voxel_from_generator(
     downsample_voxel(&children)
 }
 
-fn block_from_surface_height(world_y: i64, surface_height: i64, dirt_depth: i64) -> BlockId {
+fn block_from_surface_height(
+    world_y: i64,
+    surface_height: i64,
+    dirt_depth: i64,
+    surface_block: BlockId,
+) -> BlockId {
     if world_y > surface_height {
         BlockId::AIR
     } else if world_y == surface_height {
-        BlockId::GRASS
+        surface_block
     } else if world_y > surface_height - dirt_depth {
         BlockId::DIRT
     } else {

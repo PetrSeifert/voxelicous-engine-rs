@@ -9,6 +9,8 @@ use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 #[cfg(feature = "profiling-tracy")]
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use voxelicous_gpu::command::submit_command_buffers;
+use voxelicous_gpu::sync::{reset_fence, wait_for_fence};
 use voxelicous_gpu::GpuContextBuilder;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
@@ -280,27 +282,45 @@ impl<A: VoxelApp> AppState<A> {
         #[cfg(feature = "profiling")]
         profile_scope!(EventCategory::Frame);
 
+        #[cfg(feature = "profiling-tracy")]
+        let _frame_span = tracing::trace_span!(
+            "frame.sections",
+            frame_index = self.ctx.current_frame_index as u32,
+            frame_number = self.ctx.frame_count
+        )
+        .entered();
+
         let frame_start = Instant::now();
 
         // Calculate delta time
-        let now = Instant::now();
-        let dt = now.duration_since(self.ctx.last_frame_time).as_secs_f32();
-        self.ctx.last_frame_time = now;
-
-        // Update FPS tracking
         #[allow(unused_variables)]
-        let fps = if dt > 0.0 {
-            let fps = 1.0 / dt as f64;
-            self.min_fps = self.min_fps.min(fps);
-            self.max_fps = self.max_fps.max(fps);
-            self.fps_sum += fps;
-            fps as f32
-        } else {
-            0.0
+        let (dt, fps) = {
+            #[cfg(feature = "profiling-tracy")]
+            let _span = tracing::trace_span!("frame.timing").entered();
+
+            let now = Instant::now();
+            let dt = now.duration_since(self.ctx.last_frame_time).as_secs_f32();
+            self.ctx.last_frame_time = now;
+
+            // Update FPS tracking
+            let fps = if dt > 0.0 {
+                let fps = 1.0 / dt as f64;
+                self.min_fps = self.min_fps.min(fps);
+                self.max_fps = self.max_fps.max(fps);
+                self.fps_sum += fps;
+                fps as f32
+            } else {
+                0.0
+            };
+
+            (dt, fps)
         };
 
         // Update the application
         {
+            #[cfg(feature = "profiling-tracy")]
+            let _span = tracing::trace_span!("frame.update").entered();
+
             #[cfg(feature = "profiling")]
             profile_scope!(EventCategory::FrameUpdate);
             self.app.update(&self.ctx, dt);
@@ -311,22 +331,37 @@ impl<A: VoxelApp> AppState<A> {
 
         // GPU synchronization: wait for previous frame and acquire next image
         let image_index = {
+            #[cfg(feature = "profiling-tracy")]
+            let _span = tracing::trace_span!("frame.gpu_sync").entered();
+
             #[cfg(feature = "profiling")]
             profile_scope!(EventCategory::GpuSync);
 
             unsafe {
                 // Wait for this frame slot's fence
-                device.wait_for_fences(&[frame_data.in_flight_fence], true, u64::MAX)?;
+                {
+                    #[cfg(feature = "profiling-tracy")]
+                    let _span = tracing::trace_span!("frame.gpu_sync.wait_fence").entered();
+                    wait_for_fence(device, frame_data.in_flight_fence, u64::MAX)?;
+                }
 
                 // Acquire swapchain image
-                let (image_index, _suboptimal) = self.ctx.swapchain.acquire_next_image(
-                    &self.ctx.surface.swapchain_loader,
-                    frame_data.image_available,
-                    u64::MAX,
-                )?;
+                let (image_index, _suboptimal) = {
+                    #[cfg(feature = "profiling-tracy")]
+                    let _span = tracing::trace_span!("frame.gpu_sync.acquire_image").entered();
+                    self.ctx.swapchain.acquire_next_image(
+                        &self.ctx.surface.swapchain_loader,
+                        frame_data.image_available,
+                        u64::MAX,
+                    )?
+                };
 
                 // Reset fence after successful acquire
-                device.reset_fences(&[frame_data.in_flight_fence])?;
+                {
+                    #[cfg(feature = "profiling-tracy")]
+                    let _span = tracing::trace_span!("frame.gpu_sync.reset_fence").entered();
+                    reset_fence(device, frame_data.in_flight_fence)?;
+                }
 
                 image_index
             }
@@ -334,35 +369,54 @@ impl<A: VoxelApp> AppState<A> {
 
         // Render: record command buffer
         {
+            #[cfg(feature = "profiling-tracy")]
+            let _span = tracing::trace_span!("frame.record").entered();
+
             #[cfg(feature = "profiling")]
             profile_scope!(EventCategory::FrameRender);
 
             unsafe {
                 // Reset and begin command buffer
-                device.reset_command_buffer(
-                    frame_data.command_buffer,
-                    vk::CommandBufferResetFlags::empty(),
-                )?;
+                {
+                    #[cfg(feature = "profiling-tracy")]
+                    let _span = tracing::trace_span!("frame.record.begin_cmd").entered();
+                    device.reset_command_buffer(
+                        frame_data.command_buffer,
+                        vk::CommandBufferResetFlags::empty(),
+                    )?;
 
-                let begin_info = vk::CommandBufferBeginInfo::default()
-                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-                device.begin_command_buffer(frame_data.command_buffer, &begin_info)?;
+                    let begin_info = vk::CommandBufferBeginInfo::default()
+                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+                    device.begin_command_buffer(frame_data.command_buffer, &begin_info)?;
+                }
 
                 // Create frame context
-                let mut frame_ctx = FrameContext::new(
-                    frame_data.command_buffer,
-                    image_index,
-                    self.ctx.swapchain.images[image_index as usize],
-                    dt,
-                    self.ctx.frame_count,
-                    self.ctx.current_frame_index,
-                );
+                let mut frame_ctx = {
+                    #[cfg(feature = "profiling-tracy")]
+                    let _span = tracing::trace_span!("frame.record.build_context").entered();
+                    FrameContext::new(
+                        frame_data.command_buffer,
+                        image_index,
+                        self.ctx.swapchain.images[image_index as usize],
+                        dt,
+                        self.ctx.frame_count,
+                        self.ctx.current_frame_index,
+                    )
+                };
 
                 // Render the frame
-                self.app.render(&self.ctx, &mut frame_ctx)?;
+                {
+                    #[cfg(feature = "profiling-tracy")]
+                    let _span = tracing::trace_span!("frame.record.app_render").entered();
+                    self.app.render(&self.ctx, &mut frame_ctx)?;
+                }
 
                 // End command buffer
-                device.end_command_buffer(frame_data.command_buffer)?;
+                {
+                    #[cfg(feature = "profiling-tracy")]
+                    let _span = tracing::trace_span!("frame.record.end_cmd").entered();
+                    device.end_command_buffer(frame_data.command_buffer)?;
+                }
             }
         }
 
@@ -371,6 +425,9 @@ impl<A: VoxelApp> AppState<A> {
 
         // Submit command buffer to GPU
         {
+            #[cfg(feature = "profiling-tracy")]
+            let _span = tracing::trace_span!("frame.submit").entered();
+
             #[cfg(feature = "profiling")]
             profile_scope!(EventCategory::GpuSubmit);
 
@@ -379,16 +436,14 @@ impl<A: VoxelApp> AppState<A> {
             let signal_semaphores = [render_finished];
             let command_buffers = [frame_data.command_buffer];
 
-            let submit_info = vk::SubmitInfo::default()
-                .wait_semaphores(&wait_semaphores)
-                .wait_dst_stage_mask(&wait_stages)
-                .command_buffers(&command_buffers)
-                .signal_semaphores(&signal_semaphores);
-
             unsafe {
-                device.queue_submit(
+                submit_command_buffers(
+                    device,
                     self.ctx.gpu.graphics_queue(),
-                    &[submit_info],
+                    &command_buffers,
+                    &wait_semaphores,
+                    &wait_stages,
+                    &signal_semaphores,
                     frame_data.in_flight_fence,
                 )?;
             }
@@ -396,6 +451,9 @@ impl<A: VoxelApp> AppState<A> {
 
         // Present to swapchain
         {
+            #[cfg(feature = "profiling-tracy")]
+            let _span = tracing::trace_span!("frame.present").entered();
+
             #[cfg(feature = "profiling")]
             profile_scope!(EventCategory::FramePresent);
 
@@ -409,20 +467,30 @@ impl<A: VoxelApp> AppState<A> {
             }
         }
 
-        self.ctx.current_frame_index = (self.ctx.current_frame_index + 1) % self.ctx.frames.len();
-        self.ctx.frame_count += 1;
+        {
+            #[cfg(feature = "profiling-tracy")]
+            let _span = tracing::trace_span!("frame.advance").entered();
+            self.ctx.current_frame_index = (self.ctx.current_frame_index + 1) % self.ctx.frames.len();
+            self.ctx.frame_count += 1;
+        }
 
         // Frame pacing
         if let Some(target) = self.target_frame_time {
             let elapsed = frame_start.elapsed();
             if elapsed < target {
+                #[cfg(feature = "profiling-tracy")]
+                let _span = tracing::trace_span!("frame.pacing").entered();
                 thread::sleep(target - elapsed);
             }
         }
 
         // Report frame to profiler
-        #[cfg(feature = "profiling")]
-        voxelicous_profiler::end_frame(self.ctx.frame_count, fps, dt * 1000.0);
+        {
+            #[cfg(feature = "profiling-tracy")]
+            let _span = tracing::trace_span!("frame.profiler.end_frame").entered();
+            #[cfg(feature = "profiling")]
+            voxelicous_profiler::end_frame(self.ctx.frame_count, fps, dt * 1000.0);
+        }
 
         Ok(())
     }
