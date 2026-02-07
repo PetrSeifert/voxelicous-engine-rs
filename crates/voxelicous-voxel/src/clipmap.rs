@@ -15,8 +15,8 @@ pub const BRICK_VOXELS: usize = BRICK_SIZE * BRICK_SIZE * BRICK_SIZE;
 
 /// Clipmap LOD count.
 pub const CLIPMAP_LOD_COUNT: usize = 6;
-/// Page grid size per axis.
-pub const CLIPMAP_PAGE_GRID: usize = 16;
+/// Page grid capacity per axis (toroidal pool size).
+pub const CLIPMAP_PAGE_GRID: usize = 64;
 /// Bricks per page per axis (4x4x4 = 64 bricks).
 pub const PAGE_BRICKS_PER_AXIS: usize = 4;
 /// Total bricks per page.

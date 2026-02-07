@@ -111,7 +111,7 @@ impl ClipmapRenderer {
         {
             #[cfg(feature = "profiling-tracy")]
             let _span = tracing::trace_span!("clipmap_sync.ensure_page_buffers").entered();
-            self.ensure_page_buffers(allocator)?;
+            self.ensure_page_buffers(allocator, controller.active_lod_count(), frame_number)?;
         }
         {
             #[cfg(feature = "profiling-tracy")]
@@ -293,7 +293,12 @@ impl ClipmapRenderer {
         Ok(())
     }
 
-    fn ensure_page_buffers(&mut self, allocator: &mut GpuAllocator) -> Result<()> {
+    fn ensure_page_buffers(
+        &mut self,
+        allocator: &mut GpuAllocator,
+        active_lod_count: usize,
+        frame_number: u64,
+    ) -> Result<()> {
         let page_count = CLIPMAP_PAGE_GRID * CLIPMAP_PAGE_GRID * CLIPMAP_PAGE_GRID;
         let brick_bytes = (page_count * PAGE_BRICKS * std::mem::size_of::<u32>()) as u64;
         let occ_bytes = (page_count * 2 * std::mem::size_of::<u32>()) as u64;
@@ -301,7 +306,7 @@ impl ClipmapRenderer {
         let usage =
             vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS;
 
-        for lod in 0..CLIPMAP_LOD_COUNT {
+        for lod in 0..active_lod_count {
             if self.page_brick_buffers[lod].is_none() {
                 let buffer = allocator.create_buffer(
                     brick_bytes,
@@ -328,6 +333,18 @@ impl ClipmapRenderer {
                     &format!("clipmap_page_coord_lod{lod}"),
                 )?;
                 self.page_coord_buffers[lod] = Some(buffer);
+            }
+        }
+
+        for lod in active_lod_count..CLIPMAP_LOD_COUNT {
+            if let Some(buffer) = self.page_brick_buffers[lod].take() {
+                self.deferred_deletions.queue(buffer, frame_number);
+            }
+            if let Some(buffer) = self.page_occ_buffers[lod].take() {
+                self.deferred_deletions.queue(buffer, frame_number);
+            }
+            if let Some(buffer) = self.page_coord_buffers[lod].take() {
+                self.deferred_deletions.queue(buffer, frame_number);
             }
         }
 

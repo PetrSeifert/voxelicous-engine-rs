@@ -81,6 +81,8 @@ pub struct ClipmapStreamingController {
     edit_snapshot: Arc<HashMap<WorldCoord, BlockId>>,
     store: ClipmapVoxelStore,
     lods: Vec<ClipmapLodState>,
+    visible_page_grid: usize,
+    active_lod_count: usize,
     camera_voxel: WorldCoord,
     frame_counter: u64,
     coarse_lod_cursor: usize,
@@ -114,9 +116,11 @@ impl ClipmapStreamingController {
             edit_snapshot: Arc::new(HashMap::new()),
             store: ClipmapVoxelStore::new(),
             lods,
+            visible_page_grid: CLIPMAP_PAGE_GRID,
+            active_lod_count: 1,
             camera_voxel: WorldCoord { x: 0, y: 0, z: 0 },
             frame_counter: 0,
-            coarse_lod_cursor: 1,
+            coarse_lod_cursor: 0,
             bootstrap_lod: 0,
             dirty_headers: Vec::new(),
             dirty_palette16_entries: Vec::new(),
@@ -186,9 +190,13 @@ impl ClipmapStreamingController {
             z: camera_pos.z.floor() as i64,
         };
         self.camera_voxel = camera_voxel;
+        let active_lod_count = self.active_lod_limit();
         // First update: seed origins and enqueue LOD0 only to avoid long stalls.
-        if self.lods.iter().any(|lod| lod.origin.is_none()) {
-            for lod in 0..CLIPMAP_LOD_COUNT {
+        if self.lods[..active_lod_count]
+            .iter()
+            .any(|lod| lod.origin.is_none())
+        {
+            for lod in 0..active_lod_count {
                 let voxel_size = self.lod_voxel_size(lod);
                 let page_size = PAGE_VOXELS_PER_AXIS as i64 * voxel_size;
                 let coverage = self.lod_coverage(lod);
@@ -202,7 +210,7 @@ impl ClipmapStreamingController {
             let origin0 = aligned_origin(camera_voxel, coverage0, page_size0);
             self.enqueue_full_rebuild(0, origin0, voxel_size0, page_size0);
             self.bootstrap_lod = 0;
-        } else if self.bootstrap_lod < CLIPMAP_LOD_COUNT {
+        } else if self.bootstrap_lod < active_lod_count {
             // While bootstrapping, keep LOD0 updated and enqueue next LOD once current is filled.
             self.update_lod(0, camera_voxel, false);
 
@@ -212,7 +220,7 @@ impl ClipmapStreamingController {
 
             if self.lods[self.bootstrap_lod].pending_pages.is_empty() {
                 self.bootstrap_lod += 1;
-                if self.bootstrap_lod < CLIPMAP_LOD_COUNT {
+                if self.bootstrap_lod < active_lod_count {
                     let voxel_size = self.lod_voxel_size(self.bootstrap_lod);
                     let page_size = PAGE_VOXELS_PER_AXIS as i64 * voxel_size;
                     let coverage = self.lod_coverage(self.bootstrap_lod);
@@ -226,15 +234,20 @@ impl ClipmapStreamingController {
             self.update_lod(0, camera_voxel, false);
 
             // Stagger coarse LOD updates.
-            let lod = self.coarse_lod_cursor;
-            self.update_lod(lod, camera_voxel, false);
-            self.coarse_lod_cursor += 1;
-            if self.coarse_lod_cursor >= CLIPMAP_LOD_COUNT {
-                self.coarse_lod_cursor = 1;
+            if active_lod_count > 1 {
+                if self.coarse_lod_cursor == 0 || self.coarse_lod_cursor >= active_lod_count {
+                    self.coarse_lod_cursor = 1;
+                }
+                let lod = self.coarse_lod_cursor;
+                self.update_lod(lod, camera_voxel, false);
+                self.coarse_lod_cursor += 1;
+                if self.coarse_lod_cursor >= active_lod_count {
+                    self.coarse_lod_cursor = 1;
+                }
             }
         }
 
-        let apply_budget = if self.bootstrap_lod < CLIPMAP_LOD_COUNT {
+        let apply_budget = if self.bootstrap_lod < active_lod_count {
             Self::PAGE_APPLY_BUDGET_BOOTSTRAP
         } else {
             Self::PAGE_APPLY_BUDGET_STEADY
@@ -297,20 +310,63 @@ impl ClipmapStreamingController {
         1i64 << lod
     }
 
+    /// Get active visible page grid size per axis.
+    pub fn visible_page_grid(&self) -> usize {
+        self.visible_page_grid
+    }
+
+    /// Set active visible page grid size per axis.
+    ///
+    /// Values are clamped to `1..=CLIPMAP_PAGE_GRID`.
+    /// Returns `true` when the effective value changed.
+    pub fn set_visible_page_grid(&mut self, page_grid: usize) -> bool {
+        let clamped = page_grid.clamp(1, CLIPMAP_PAGE_GRID);
+        if clamped == self.visible_page_grid {
+            return false;
+        }
+        self.visible_page_grid = clamped;
+        self.reconfigure_visible_coverage_all_lods();
+        true
+    }
+
+    /// Returns whether multi-LOD rendering is enabled.
+    pub fn lod_enabled(&self) -> bool {
+        self.active_lod_limit() > 1
+    }
+
+    /// Get number of active LOD levels.
+    pub fn active_lod_count(&self) -> usize {
+        self.active_lod_limit()
+    }
+
+    /// Enable or disable multi-LOD rendering at runtime.
+    ///
+    /// When disabled, only LOD0 is updated and rendered.
+    /// Returns `true` when the effective mode changed.
+    pub fn set_lod_enabled(&mut self, enabled: bool) -> bool {
+        let target_lod_count = if enabled { CLIPMAP_LOD_COUNT } else { 1 };
+        if target_lod_count == self.active_lod_count {
+            return false;
+        }
+        self.active_lod_count = target_lod_count;
+        self.reconfigure_visible_coverage_all_lods();
+        true
+    }
+
     /// Get coverage (extent) for a given LOD in base voxels.
     pub fn lod_coverage(&self, lod: usize) -> i64 {
-        let voxels = (CLIPMAP_PAGE_GRID * PAGE_VOXELS_PER_AXIS) as i64;
+        let voxels = (self.visible_page_grid * PAGE_VOXELS_PER_AXIS) as i64;
         voxels * self.lod_voxel_size(lod)
     }
 
     /// Returns true if this LOD has completed at least one full build.
     pub fn lod_ready(&self, lod: usize) -> bool {
-        self.lods[lod].ready
+        lod < self.active_lod_limit() && self.lods[lod].ready
     }
 
     /// Returns true if this LOD has at least one loaded page.
     pub fn lod_renderable(&self, lod: usize) -> bool {
-        self.lods[lod].loaded_pages > 0
+        lod < self.active_lod_limit() && self.lods[lod].loaded_pages > 0
     }
 
     #[cfg_attr(
@@ -325,11 +381,8 @@ impl ClipmapStreamingController {
 
         let old_origin = self.lods[lod].origin.unwrap_or(origin);
         let shift = if force {
-            (
-                CLIPMAP_PAGE_GRID as i64,
-                CLIPMAP_PAGE_GRID as i64,
-                CLIPMAP_PAGE_GRID as i64,
-            )
+            let grid = self.visible_page_grid as i64;
+            (grid, grid, grid)
         } else {
             (
                 (origin.x - old_origin.x) / page_size,
@@ -339,8 +392,9 @@ impl ClipmapStreamingController {
         };
 
         let max_shift = shift.0.abs().max(shift.1.abs()).max(shift.2.abs());
+        let visible_grid = self.visible_page_grid;
 
-        if force || max_shift as usize >= CLIPMAP_PAGE_GRID {
+        if force || max_shift as usize >= visible_grid {
             self.enqueue_full_rebuild(lod, origin, voxel_size, page_size);
             return;
         }
@@ -415,10 +469,11 @@ impl ClipmapStreamingController {
             lod_state.ready = false;
         }
 
-        let mut coords = Vec::with_capacity(page_count);
-        for z in 0..CLIPMAP_PAGE_GRID {
-            for y in 0..CLIPMAP_PAGE_GRID {
-                for x in 0..CLIPMAP_PAGE_GRID {
+        let visible_grid = self.visible_page_grid;
+        let mut coords = Vec::with_capacity(visible_grid * visible_grid * visible_grid);
+        for z in 0..visible_grid {
+            for y in 0..visible_grid {
+                for x in 0..visible_grid {
                     coords.push((
                         page_origin.0 + x as i64,
                         page_origin.1 + y as i64,
@@ -437,7 +492,7 @@ impl ClipmapStreamingController {
 
     fn enqueue_slice(&mut self, lod: usize, page_origin: (i64, i64, i64), axis: Axis, shift: i64) {
         let count = shift.unsigned_abs() as usize;
-        let grid = CLIPMAP_PAGE_GRID as i64;
+        let grid = self.visible_page_grid as i64;
 
         let (start, end) = if shift > 0 {
             (grid - count as i64, grid)
@@ -445,10 +500,11 @@ impl ClipmapStreamingController {
             (0, count as i64)
         };
 
-        let mut coords = Vec::with_capacity(count * CLIPMAP_PAGE_GRID * CLIPMAP_PAGE_GRID);
+        let visible_grid = self.visible_page_grid;
+        let mut coords = Vec::with_capacity(count * visible_grid * visible_grid);
         for idx in start..end {
-            for j in 0..CLIPMAP_PAGE_GRID as i64 {
-                for k in 0..CLIPMAP_PAGE_GRID as i64 {
+            for j in 0..visible_grid as i64 {
+                for k in 0..visible_grid as i64 {
                     let (px, py, pz) = match axis {
                         Axis::X => (page_origin.0 + idx, page_origin.1 + j, page_origin.2 + k),
                         Axis::Y => (page_origin.0 + j, page_origin.1 + idx, page_origin.2 + k),
@@ -497,7 +553,7 @@ impl ClipmapStreamingController {
             apply_budget -= 1;
         }
 
-        for lod in 0..CLIPMAP_LOD_COUNT {
+        for lod in 0..self.active_lod_limit() {
             let state = &mut self.lods[lod];
             if state.origin.is_some() && state.pending_pages.is_empty() && state.inflight_pages == 0
             {
@@ -530,7 +586,7 @@ impl ClipmapStreamingController {
     }
 
     fn pop_next_pending_page(&mut self) -> Option<(usize, (i64, i64, i64), i64, u64)> {
-        for lod in 0..CLIPMAP_LOD_COUNT {
+        for lod in 0..self.active_lod_limit() {
             let voxel_size = self.lod_voxel_size(lod);
             let generation = self.lods[lod].generation;
             while let Some(coord) = self.lods[lod].pending_pages.pop_front() {
@@ -660,14 +716,126 @@ impl ClipmapStreamingController {
             div_floor(origin.y, page_size),
             div_floor(origin.z, page_size),
         );
-        let grid = CLIPMAP_PAGE_GRID as i64;
+        let grid = self.visible_page_grid as i64;
 
-        page_coord.0 >= origin_page.0
-            && page_coord.0 < origin_page.0 + grid
-            && page_coord.1 >= origin_page.1
-            && page_coord.1 < origin_page.1 + grid
-            && page_coord.2 >= origin_page.2
-            && page_coord.2 < origin_page.2 + grid
+        is_page_coord_in_range(page_coord, origin_page, grid)
+    }
+
+    fn active_lod_limit(&self) -> usize {
+        self.active_lod_count.clamp(1, CLIPMAP_LOD_COUNT)
+    }
+
+    fn reconfigure_visible_coverage_all_lods(&mut self) {
+        let active_lod_count = self.active_lod_limit();
+        for lod in 0..active_lod_count {
+            self.reconfigure_visible_coverage_for_lod(lod);
+        }
+        for lod in active_lod_count..CLIPMAP_LOD_COUNT {
+            self.deactivate_lod(lod);
+        }
+        // Reconfiguration already seeds origins/pending queues for active LODs.
+        // Keep update() on the steady path to avoid re-entering bootstrap full rebuilds.
+        self.bootstrap_lod = active_lod_count;
+        self.coarse_lod_cursor = if active_lod_count > 1 { 1 } else { 0 };
+    }
+
+    fn reconfigure_visible_coverage_for_lod(&mut self, lod: usize) {
+        let voxel_size = self.lod_voxel_size(lod);
+        let page_size = PAGE_VOXELS_PER_AXIS as i64 * voxel_size;
+        let coverage = self.lod_coverage(lod);
+        let origin = aligned_origin(self.camera_voxel, coverage, page_size);
+        let origin_page = (
+            div_floor(origin.x, page_size),
+            div_floor(origin.y, page_size),
+            div_floor(origin.z, page_size),
+        );
+        let grid = self.visible_page_grid as i64;
+
+        {
+            let lod_state = &mut self.lods[lod];
+            lod_state.generation = lod_state.generation.wrapping_add(1);
+            lod_state.origin = Some(origin);
+            lod_state.pending_pages.clear();
+            lod_state.ready = false;
+        }
+
+        // Evict currently loaded pages that are now outside the visible range.
+        let mut stale_slots = Vec::new();
+        for (page_index, slot_coord) in self.lods[lod].page_coords.iter().enumerate() {
+            if *slot_coord == invalid_page_coord() {
+                continue;
+            }
+            let coord = (
+                i64::from(slot_coord[0]),
+                i64::from(slot_coord[1]),
+                i64::from(slot_coord[2]),
+            );
+            if !is_page_coord_in_range(coord, origin_page, grid) {
+                stale_slots.push(page_index);
+            }
+        }
+        for page_index in stale_slots {
+            self.clear_page_slot(lod, page_index);
+        }
+
+        // Enqueue only pages missing from the current visible range.
+        let visible_grid = self.visible_page_grid;
+        let mut missing_coords = Vec::new();
+        missing_coords.reserve(visible_grid * visible_grid * visible_grid);
+        for z in 0..visible_grid {
+            for y in 0..visible_grid {
+                for x in 0..visible_grid {
+                    let coord = (
+                        origin_page.0 + x as i64,
+                        origin_page.1 + y as i64,
+                        origin_page.2 + z as i64,
+                    );
+                    if !self.page_slot_matches_coord(lod, coord) {
+                        missing_coords.push(coord);
+                    }
+                }
+            }
+        }
+
+        let camera_voxel = self.camera_voxel;
+        missing_coords.sort_unstable_by_key(|&coord| {
+            page_distance_to_camera_sq(coord, camera_voxel, page_size)
+        });
+        self.lods[lod].pending_pages.extend(missing_coords);
+    }
+
+    fn deactivate_lod(&mut self, lod: usize) {
+        {
+            let lod_state = &mut self.lods[lod];
+            lod_state.generation = lod_state.generation.wrapping_add(1);
+            lod_state.pending_pages.clear();
+            lod_state.inflight_pages = 0;
+            lod_state.origin = None;
+            lod_state.ready = false;
+        }
+
+        // Evict all currently loaded pages for this LOD.
+        let mut loaded_slots = Vec::new();
+        for (page_index, loaded) in self.lods[lod].page_loaded.iter().enumerate() {
+            if *loaded {
+                loaded_slots.push(page_index);
+            }
+        }
+        for page_index in loaded_slots {
+            self.clear_page_slot(lod, page_index);
+        }
+    }
+
+    fn page_slot_matches_coord(&self, lod: usize, page_coord: (i64, i64, i64)) -> bool {
+        let page_index = Self::page_index_from_coord(page_coord);
+        if !self.lods[lod].page_loaded[page_index] {
+            return false;
+        }
+        let slot = self.lods[lod].page_coords[page_index];
+        slot != invalid_page_coord()
+            && i64::from(slot[0]) == page_coord.0
+            && i64::from(slot[1]) == page_coord.1
+            && i64::from(slot[2]) == page_coord.2
     }
 
     fn mark_brick_dirty(&mut self, brick_id: BrickId) {
@@ -689,7 +857,7 @@ impl ClipmapStreamingController {
     }
 
     fn apply_edit_immediate(&mut self, world: WorldCoord) {
-        let sync_lods = Self::SYNC_EDIT_LODS.min(CLIPMAP_LOD_COUNT);
+        let sync_lods = Self::SYNC_EDIT_LODS.min(self.active_lod_limit());
         let edits_snapshot = Arc::clone(&self.edit_snapshot);
 
         for lod in 0..sync_lods {
@@ -712,7 +880,7 @@ impl ClipmapStreamingController {
     }
 
     fn enqueue_pages_affected_by_edit(&mut self, world: WorldCoord) {
-        for lod in Self::SYNC_EDIT_LODS.min(CLIPMAP_LOD_COUNT)..CLIPMAP_LOD_COUNT {
+        for lod in Self::SYNC_EDIT_LODS.min(self.active_lod_limit())..self.active_lod_limit() {
             if self.lods[lod].origin.is_none() {
                 continue;
             }
@@ -784,6 +952,19 @@ fn aligned_origin(camera: WorldCoord, coverage: i64, page_size: i64) -> WorldCoo
         y: oy,
         z: oz,
     }
+}
+
+fn is_page_coord_in_range(
+    page_coord: (i64, i64, i64),
+    origin_page: (i64, i64, i64),
+    grid: i64,
+) -> bool {
+    page_coord.0 >= origin_page.0
+        && page_coord.0 < origin_page.0 + grid
+        && page_coord.1 >= origin_page.1
+        && page_coord.1 < origin_page.1 + grid
+        && page_coord.2 >= origin_page.2
+        && page_coord.2 < origin_page.2 + grid
 }
 
 fn page_distance_to_camera_sq(
@@ -1112,6 +1293,92 @@ mod tests {
             "Expected at least one LOD0 page update after small shift"
         );
         assert!(dirty_count <= CLIPMAP_PAGE_GRID * CLIPMAP_PAGE_GRID);
+    }
+
+    #[test]
+    fn visible_lod_area_scale_is_runtime_configurable() {
+        let gen = TerrainGenerator::new(TerrainConfig::default());
+        let mut controller = ClipmapStreamingController::new(gen);
+        let camera = Vec3::new(0.0, 0.0, 0.0);
+        controller.update(camera);
+        controller.take_dirty_state();
+
+        assert_eq!(controller.visible_page_grid(), CLIPMAP_PAGE_GRID);
+
+        let reduced_grid = CLIPMAP_PAGE_GRID / 2;
+        assert!(controller.set_visible_page_grid(reduced_grid));
+        assert_eq!(controller.visible_page_grid(), reduced_grid);
+        assert_eq!(
+            controller.lod_coverage(0),
+            (reduced_grid * PAGE_VOXELS_PER_AXIS) as i64
+        );
+
+        // Changing visible grid should not immediately mark the whole pool dirty.
+        let dirty_after_set = controller.take_dirty_state();
+        let pool_page_count = CLIPMAP_PAGE_GRID * CLIPMAP_PAGE_GRID * CLIPMAP_PAGE_GRID;
+        assert!(
+            dirty_after_set.dirty_pages[0].len() < pool_page_count,
+            "Visible range change should avoid full-pool dirtying"
+        );
+
+        // Reconfigured coverage should still produce updates over subsequent frames.
+        let mut saw_dirty_update = false;
+        for _ in 0..64 {
+            std::thread::sleep(Duration::from_millis(1));
+            controller.update(camera);
+            let dirty = controller.take_dirty_state();
+            if !dirty.dirty_pages[0].is_empty() {
+                saw_dirty_update = true;
+                break;
+            }
+        }
+        assert!(
+            saw_dirty_update,
+            "Expected LOD0 page updates after changing visible page grid"
+        );
+
+        // Setting the same value should be a no-op.
+        assert!(!controller.set_visible_page_grid(reduced_grid));
+    }
+
+    #[test]
+    fn loding_can_be_toggled_runtime() {
+        let gen = TerrainGenerator::new(TerrainConfig::default());
+        let mut controller = ClipmapStreamingController::new(gen);
+        let camera = Vec3::new(0.0, 0.0, 0.0);
+
+        controller.update(camera);
+        assert!(!controller.lod_enabled());
+        assert!(!controller.lod_renderable(1));
+
+        assert!(controller.set_lod_enabled(true));
+        assert!(controller.lod_enabled());
+        assert!(controller.lods[1].origin.is_some());
+
+        assert!(controller.set_lod_enabled(false));
+        assert!(!controller.lod_enabled());
+        assert!(!controller.lod_renderable(1));
+        assert!(controller.lods[1].pending_pages.is_empty());
+
+        // Setting the same state should be a no-op.
+        assert!(!controller.set_lod_enabled(false));
+    }
+
+    #[test]
+    fn runtime_reconfigure_does_not_reset_bootstrap() {
+        let gen = TerrainGenerator::new(TerrainConfig::default());
+        let mut controller = ClipmapStreamingController::new(gen);
+        let camera = Vec3::new(0.0, 0.0, 0.0);
+
+        controller.update(camera);
+        assert!(!controller.lod_enabled());
+
+        assert!(controller.set_lod_enabled(true));
+        assert_eq!(controller.bootstrap_lod, controller.active_lod_count());
+
+        let reduced_grid = (CLIPMAP_PAGE_GRID / 2).max(1);
+        assert!(controller.set_visible_page_grid(reduced_grid));
+        assert_eq!(controller.bootstrap_lod, controller.active_lod_count());
     }
 
     #[test]

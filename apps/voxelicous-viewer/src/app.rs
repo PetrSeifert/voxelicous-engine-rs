@@ -31,6 +31,8 @@ const CAMERA_SPRINT_MULT: f32 = 2.5;
 const MOUSE_SENSITIVITY: f32 = 0.002;
 /// Max distance for block editing raycasts.
 const BLOCK_EDIT_REACH: f32 = 10.0;
+/// Runtime LOD distance change step (pages per axis).
+const LOD_DISTANCE_PAGE_STEP: usize = 2;
 
 /// Configuration for clipmap rendering (from CLI or defaults).
 #[derive(Debug, Clone)]
@@ -124,6 +126,18 @@ impl VoxelApp for Viewer {
         let mut clipmap = ClipmapStreamingController::new(generator);
         let frames_in_flight = ctx.frames_in_flight();
         let mut clipmap_renderer = ClipmapRenderer::new(frames_in_flight);
+        info!(
+            "LOD distance pages per axis: {}",
+            clipmap.visible_page_grid()
+        );
+        info!(
+            "LOD mode: {}",
+            if clipmap.lod_enabled() {
+                "multi-LOD"
+            } else {
+                "LOD0 only"
+            }
+        );
 
         // Create rendering pipeline with frames_in_flight for per-frame buffers
         let pipeline = unsafe {
@@ -174,6 +188,9 @@ impl VoxelApp for Viewer {
             .bind("sprint", KeyCode::ShiftRight)
             .bind("toggle_cursor", KeyCode::Escape)
             .bind("debug_cycle", KeyCode::F3)
+            .bind("toggle_lod", KeyCode::F4)
+            .bind("lod_distance_increase", KeyCode::PageUp)
+            .bind("lod_distance_decrease", KeyCode::PageDown)
             .bind("destroy_block", MouseButton::Left)
             .build();
         let mut input = InputManager::with_actions(actions);
@@ -241,6 +258,46 @@ impl VoxelApp for Viewer {
         if self.input.is_action_just_pressed("debug_cycle") {
             self.debug_mode = self.debug_mode.next();
             info!("Debug mode: {:?}", self.debug_mode);
+        }
+
+        if self.input.is_action_just_pressed("toggle_lod") {
+            let target_enabled = !self.clipmap.lod_enabled();
+            if self.clipmap.set_lod_enabled(target_enabled) {
+                info!(
+                    "LOD mode: {}",
+                    if target_enabled {
+                        "multi-LOD"
+                    } else {
+                        "LOD0 only"
+                    }
+                );
+            }
+        }
+
+        if self.input.is_action_just_pressed("lod_distance_increase") {
+            let target = self
+                .clipmap
+                .visible_page_grid()
+                .saturating_add(LOD_DISTANCE_PAGE_STEP);
+            if self.clipmap.set_visible_page_grid(target) {
+                info!(
+                    "LOD distance pages per axis: {}",
+                    self.clipmap.visible_page_grid()
+                );
+            }
+        }
+
+        if self.input.is_action_just_pressed("lod_distance_decrease") {
+            let target = self
+                .clipmap
+                .visible_page_grid()
+                .saturating_sub(LOD_DISTANCE_PAGE_STEP);
+            if self.clipmap.set_visible_page_grid(target) {
+                info!(
+                    "LOD distance pages per axis: {}",
+                    self.clipmap.visible_page_grid()
+                );
+            }
         }
 
         // Camera rotation from mouse (only when cursor is locked)

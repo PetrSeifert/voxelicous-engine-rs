@@ -6,7 +6,7 @@
 
 // Constants
 const uint LOD_COUNT = 6u;
-const uint PAGE_GRID = 16u;
+const uint PAGE_GRID = 64u;
 const uint PAGE_BRICKS = 64u;
 const uint PAGE_BRICKS_AXIS = 4u;
 const uint BRICK_SIZE = 8u;
