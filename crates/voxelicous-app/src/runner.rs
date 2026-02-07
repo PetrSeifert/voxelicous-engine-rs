@@ -277,7 +277,10 @@ impl<A: VoxelApp + 'static> AppRunner<A> {
 }
 
 impl<A: VoxelApp> AppState<A> {
-    #[cfg_attr(feature = "profiling-tracy", tracing::instrument(level = "trace", skip_all))]
+    #[cfg_attr(
+        feature = "profiling-tracy",
+        tracing::instrument(level = "trace", skip_all)
+    )]
     fn render_frame(&mut self) -> anyhow::Result<()> {
         #[cfg(feature = "profiling")]
         profile_scope!(EventCategory::Frame);
@@ -470,7 +473,8 @@ impl<A: VoxelApp> AppState<A> {
         {
             #[cfg(feature = "profiling-tracy")]
             let _span = tracing::trace_span!("frame.advance").entered();
-            self.ctx.current_frame_index = (self.ctx.current_frame_index + 1) % self.ctx.frames.len();
+            self.ctx.current_frame_index =
+                (self.ctx.current_frame_index + 1) % self.ctx.frames.len();
             self.ctx.frame_count += 1;
         }
 

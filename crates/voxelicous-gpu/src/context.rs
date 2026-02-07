@@ -86,7 +86,10 @@ impl GpuContext {
     }
 
     /// Wait for device to be idle.
-    #[cfg_attr(feature = "profiling-tracy", tracing::instrument(level = "trace", skip_all))]
+    #[cfg_attr(
+        feature = "profiling-tracy",
+        tracing::instrument(level = "trace", skip_all)
+    )]
     pub fn wait_idle(&self) -> Result<()> {
         unsafe {
             self.device.device_wait_idle()?;

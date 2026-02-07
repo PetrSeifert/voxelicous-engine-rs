@@ -33,7 +33,10 @@ pub unsafe fn create_fence(device: &ash::Device, signaled: bool) -> Result<vk::F
 ///
 /// # Safety
 /// The device and fence must be valid.
-#[cfg_attr(feature = "profiling-tracy", tracing::instrument(level = "trace", skip_all))]
+#[cfg_attr(
+    feature = "profiling-tracy",
+    tracing::instrument(level = "trace", skip_all)
+)]
 pub unsafe fn wait_for_fence(
     device: &ash::Device,
     fence: vk::Fence,
@@ -47,7 +50,10 @@ pub unsafe fn wait_for_fence(
 ///
 /// # Safety
 /// The device and fence must be valid.
-#[cfg_attr(feature = "profiling-tracy", tracing::instrument(level = "trace", skip_all))]
+#[cfg_attr(
+    feature = "profiling-tracy",
+    tracing::instrument(level = "trace", skip_all)
+)]
 pub unsafe fn reset_fence(device: &ash::Device, fence: vk::Fence) -> Result<()> {
     device.reset_fences(&[fence])?;
     Ok(())
