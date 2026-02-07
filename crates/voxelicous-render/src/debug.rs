@@ -20,8 +20,10 @@ pub enum DebugMode {
     Distance = 3,
     /// Surface normals as RGB.
     Normals = 4,
+    /// Biome classification view.
+    Biomes = 5,
     /// Red overlay on clipmap LOD boundaries.
-    ChunkBoundaries = 5,
+    ChunkBoundaries = 6,
 }
 
 impl DebugMode {
@@ -33,7 +35,8 @@ impl DebugMode {
             Self::TraversalSteps => Self::NodeDepth,
             Self::NodeDepth => Self::Distance,
             Self::Distance => Self::Normals,
-            Self::Normals => Self::ChunkBoundaries,
+            Self::Normals => Self::Biomes,
+            Self::Biomes => Self::ChunkBoundaries,
             Self::ChunkBoundaries => Self::None,
         }
     }

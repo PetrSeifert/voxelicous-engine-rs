@@ -14,7 +14,7 @@ use voxelicous_voxel::{
     PAGE_VOXELS_PER_AXIS,
 };
 
-use crate::generation::TerrainGenerator;
+use crate::generation::{SurfaceSample, TerrainGenerator};
 
 /// Dirty ranges to upload to GPU after a clipmap update.
 #[derive(Debug, Default)]
@@ -1066,21 +1066,18 @@ fn build_page_voxels_unit_lod(
 ) -> BuiltPage {
     let mut occ: u64 = 0;
     let mut bricks = Vec::with_capacity(PAGE_BRICKS);
-    let mut surface_heights = vec![0i32; PAGE_VOXELS_PER_AXIS * PAGE_VOXELS_PER_AXIS];
-    let mut surface_blocks = vec![BlockId::AIR; PAGE_VOXELS_PER_AXIS * PAGE_VOXELS_PER_AXIS];
+    let mut surface_samples: Vec<SurfaceSample> =
+        Vec::with_capacity(PAGE_VOXELS_PER_AXIS * PAGE_VOXELS_PER_AXIS);
 
     for z in 0..PAGE_VOXELS_PER_AXIS {
         for x in 0..PAGE_VOXELS_PER_AXIS {
             let world_x = page_origin.x + x as i64;
             let world_z = page_origin.z + z as i64;
-            let sample = generator.surface_at(world_x, world_z);
-            let index = x + z * PAGE_VOXELS_PER_AXIS;
-            surface_heights[index] = sample.surface_height;
-            surface_blocks[index] = sample.top_block;
+            surface_samples.push(generator.surface_at(world_x, world_z));
         }
     }
+    let tree_overlay = build_tree_voxel_overlay(generator, page_origin);
 
-    let dirt_depth = i64::from(generator.config().dirt_depth);
     for bz in 0..PAGE_BRICKS_PER_AXIS {
         for by in 0..PAGE_BRICKS_PER_AXIS {
             for bx in 0..PAGE_BRICKS_PER_AXIS {
@@ -1099,17 +1096,25 @@ fn build_page_voxels_unit_lod(
                             let world_y = brick_origin.y + y as i64;
                             let world_z = brick_origin.z + z as i64;
                             let page_x = bx * BRICK_SIZE + x;
+                            let page_y = by * BRICK_SIZE + y;
                             let page_z = bz * BRICK_SIZE + z;
                             let index = page_x + page_z * PAGE_VOXELS_PER_AXIS;
-                            let surface_height = i64::from(surface_heights[index]);
-                            let surface_block = surface_blocks[index];
                             let idx = x + y * BRICK_SIZE + z * BRICK_SIZE * BRICK_SIZE;
-                            let generated = block_from_surface_height(
+                            let mut generated = generator.block_from_surface_sample(
+                                world_x,
                                 world_y,
-                                surface_height,
-                                dirt_depth,
-                                surface_block,
+                                world_z,
+                                surface_samples[index],
                             );
+                            if generated == BlockId::AIR || generated == BlockId::FLOWER {
+                                let tree_index = page_x
+                                    + page_y * PAGE_VOXELS_PER_AXIS
+                                    + page_z * PAGE_VOXELS_PER_AXIS * PAGE_VOXELS_PER_AXIS;
+                                let tree_block = tree_overlay[tree_index];
+                                if tree_block != BlockId::AIR {
+                                    generated = tree_block;
+                                }
+                            }
                             let block =
                                 overrides_or_generated(edits, world_x, world_y, world_z, generated);
                             voxels[idx] = block;
@@ -1134,6 +1139,57 @@ fn build_page_voxels_unit_lod(
         bricks,
         occ,
     }
+}
+
+fn build_tree_voxel_overlay(generator: &TerrainGenerator, page_origin: WorldCoord) -> Vec<BlockId> {
+    let mut overlay =
+        vec![BlockId::AIR; PAGE_VOXELS_PER_AXIS * PAGE_VOXELS_PER_AXIS * PAGE_VOXELS_PER_AXIS];
+    let min_x = page_origin.x;
+    let max_x = page_origin.x + PAGE_VOXELS_PER_AXIS as i64 - 1;
+    let min_y = page_origin.y;
+    let max_y = page_origin.y + PAGE_VOXELS_PER_AXIS as i64 - 1;
+    let min_z = page_origin.z;
+    let max_z = page_origin.z + PAGE_VOXELS_PER_AXIS as i64 - 1;
+
+    let trees = generator.trees_in_area(min_x, max_x, min_z, max_z);
+    for tree in trees {
+        let radius = i64::from(tree.canopy_radius);
+        for dz in -radius..=radius {
+            for dx in -radius..=radius {
+                let world_x = tree.root_x + dx;
+                let world_z = tree.root_z + dz;
+                if world_x < min_x || world_x > max_x || world_z < min_z || world_z > max_z {
+                    continue;
+                }
+
+                let trunk_top = i64::from(tree.trunk_base_y + tree.trunk_height - 1);
+                let y_start = i64::from(tree.trunk_base_y).min(trunk_top - 2);
+                let y_end = trunk_top + 2;
+                for world_y in y_start..=y_end {
+                    if world_y < min_y || world_y > max_y {
+                        continue;
+                    }
+
+                    let Some(block) =
+                        TerrainGenerator::tree_block_for_placement(tree, world_x, world_y, world_z)
+                    else {
+                        continue;
+                    };
+                    let lx = (world_x - min_x) as usize;
+                    let ly = (world_y - min_y) as usize;
+                    let lz = (world_z - min_z) as usize;
+                    let index = lx
+                        + ly * PAGE_VOXELS_PER_AXIS
+                        + lz * PAGE_VOXELS_PER_AXIS * PAGE_VOXELS_PER_AXIS;
+                    if block == BlockId::LOG || overlay[index] == BlockId::AIR {
+                        overlay[index] = block;
+                    }
+                }
+            }
+        }
+    }
+
+    overlay
 }
 
 fn sample_voxel_from_generator(
@@ -1198,23 +1254,6 @@ fn overrides_or_generated(
         })
         .copied()
         .unwrap_or(generated)
-}
-
-fn block_from_surface_height(
-    world_y: i64,
-    surface_height: i64,
-    dirt_depth: i64,
-    surface_block: BlockId,
-) -> BlockId {
-    if world_y > surface_height {
-        BlockId::AIR
-    } else if world_y == surface_height {
-        surface_block
-    } else if world_y > surface_height - dirt_depth {
-        BlockId::DIRT
-    } else {
-        BlockId::STONE
-    }
 }
 
 fn div_floor(value: i64, divisor: i64) -> i64 {
@@ -1460,5 +1499,65 @@ mod tests {
 
         assert!(controller.set_block_at_world(x, y, z, BlockId::STONE));
         assert_eq!(controller.block_at_world(x, y, z), BlockId::STONE);
+    }
+
+    #[test]
+    fn unit_lod_tree_overlay_overrides_flower_base_voxel() {
+        let mut overlap_case: Option<(u64, i64, i64, i64)> = None;
+        for seed in 0..128_u64 {
+            let generator = TerrainGenerator::with_seed(seed);
+            let trees = generator.trees_in_area(-4096, 4096, -4096, 4096);
+            for tree in trees {
+                let surface = generator.surface_at(tree.root_x, tree.root_z);
+                let trunk_y = i64::from(tree.trunk_base_y);
+                let base =
+                    generator.block_from_surface_sample(tree.root_x, trunk_y, tree.root_z, surface);
+                if base == BlockId::FLOWER {
+                    overlap_case = Some((seed, tree.root_x, trunk_y, tree.root_z));
+                    break;
+                }
+            }
+            if overlap_case.is_some() {
+                break;
+            }
+        }
+
+        let Some((seed, root_x, root_y, root_z)) = overlap_case else {
+            panic!("Expected at least one flower/tree-root overlap case in sampled seeds");
+        };
+
+        let generator = TerrainGenerator::with_seed(seed);
+        let edits = std::collections::HashMap::new();
+        let page_size = PAGE_VOXELS_PER_AXIS as i64;
+        let page_coord = (
+            div_floor(root_x, page_size),
+            div_floor(root_y, page_size),
+            div_floor(root_z, page_size),
+        );
+        let page_origin = WorldCoord {
+            x: page_coord.0 * page_size,
+            y: page_coord.1 * page_size,
+            z: page_coord.2 * page_size,
+        };
+        let page = build_page_voxels_unit_lod(&generator, &edits, page_coord, page_origin);
+
+        let lx = (root_x - page_origin.x) as usize;
+        let ly = (root_y - page_origin.y) as usize;
+        let lz = (root_z - page_origin.z) as usize;
+        let bx = lx / BRICK_SIZE;
+        let by = ly / BRICK_SIZE;
+        let bz = lz / BRICK_SIZE;
+        let vx = lx % BRICK_SIZE;
+        let vy = ly % BRICK_SIZE;
+        let vz = lz % BRICK_SIZE;
+        let brick_idx =
+            bx + by * PAGE_BRICKS_PER_AXIS + bz * PAGE_BRICKS_PER_AXIS * PAGE_BRICKS_PER_AXIS;
+        let voxel_idx = vx + vy * BRICK_SIZE + vz * BRICK_SIZE * BRICK_SIZE;
+
+        assert_eq!(
+            page.bricks[brick_idx][voxel_idx],
+            BlockId::LOG,
+            "Tree overlay should override flower base voxel in LOD0 page build"
+        );
     }
 }

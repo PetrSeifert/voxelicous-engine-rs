@@ -23,6 +23,16 @@ impl BlockId {
     pub const GRASS: Self = Self(3);
     /// Snow block
     pub const SNOW: Self = Self(4);
+    /// Sand block
+    pub const SAND: Self = Self(5);
+    /// Water block (opaque for current renderer path)
+    pub const WATER: Self = Self(6);
+    /// Tree log block
+    pub const LOG: Self = Self(7);
+    /// Tree leaves block
+    pub const LEAVES: Self = Self(8);
+    /// Flower block
+    pub const FLOWER: Self = Self(9);
 
     /// Returns true if this block is air (empty)
     #[inline]
@@ -79,6 +89,46 @@ impl Material {
     pub const SNOW: Self = Self {
         color: [236, 238, 245],
         roughness: 0.95,
+        metallic: 0.0,
+        emission: 0.0,
+    };
+
+    /// Default sand material
+    pub const SAND: Self = Self {
+        color: [215, 199, 133],
+        roughness: 0.92,
+        metallic: 0.0,
+        emission: 0.0,
+    };
+
+    /// Default water material
+    pub const WATER: Self = Self {
+        color: [58, 103, 178],
+        roughness: 0.4,
+        metallic: 0.0,
+        emission: 0.0,
+    };
+
+    /// Default log material
+    pub const LOG: Self = Self {
+        color: [94, 68, 42],
+        roughness: 0.88,
+        metallic: 0.0,
+        emission: 0.0,
+    };
+
+    /// Default leaves material
+    pub const LEAVES: Self = Self {
+        color: [62, 114, 52],
+        roughness: 0.95,
+        metallic: 0.0,
+        emission: 0.0,
+    };
+
+    /// Default flower material
+    pub const FLOWER: Self = Self {
+        color: [222, 72, 84],
+        roughness: 0.8,
         metallic: 0.0,
         emission: 0.0,
     };
@@ -143,6 +193,7 @@ mod tests {
     fn block_id_solid() {
         assert!(!BlockId::STONE.is_air());
         assert!(BlockId::STONE.is_solid());
+        assert!(BlockId::WATER.is_solid());
     }
 
     #[test]

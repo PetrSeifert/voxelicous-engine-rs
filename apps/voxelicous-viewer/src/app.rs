@@ -115,9 +115,12 @@ impl VoxelApp for Viewer {
         // Create terrain generator for clipmap sampling
         let terrain_config = TerrainConfig {
             seed: clipmap_params.seed,
-            sea_level: 64,
-            terrain_scale: 80.0,
-            terrain_height: 32.0,
+            sea_level: 60,
+            terrain_scale: 102.0,
+            terrain_height: 68.0,
+            biome_scale: 2200.0,
+            temperature_scale: 2400.0,
+            moisture_scale: 2300.0,
             ..Default::default()
         };
         let generator = TerrainGenerator::new(terrain_config);

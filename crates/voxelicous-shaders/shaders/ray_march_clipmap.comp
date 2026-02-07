@@ -55,7 +55,8 @@ const uint DEBUG_TRAVERSAL_STEPS = 1u;
 const uint DEBUG_NODE_DEPTH = 2u;
 const uint DEBUG_DISTANCE = 3u;
 const uint DEBUG_NORMALS = 4u;
-const uint DEBUG_CHUNK_BOUNDARIES = 5u;
+const uint DEBUG_BIOMES = 5u;
+const uint DEBUG_CHUNK_BOUNDARIES = 6u;
 
 // Push constants
 layout(push_constant) uniform PushConstants {
@@ -626,6 +627,120 @@ vec3 debug_normals(vec3 n) {
     return n * 0.5 + 0.5;
 }
 
+uint hash_u32(uint x) {
+    x ^= x >> 16u;
+    x *= 0x7FEB352Du;
+    x ^= x >> 15u;
+    x *= 0x846CA68Bu;
+    x ^= x >> 16u;
+    return x;
+}
+
+float hash2d(ivec2 p, uint seed) {
+    uint h = uint(p.x) * 0x9E3779B9u;
+    h ^= uint(p.y) * 0x85EBCA6Bu;
+    h ^= seed * 0xC2B2AE35u;
+    return float(hash_u32(h)) * (1.0 / 4294967295.0);
+}
+
+float value_noise(vec2 p, uint seed) {
+    ivec2 i = ivec2(floor(p));
+    vec2 f = fract(p);
+    vec2 u = f * f * (3.0 - 2.0 * f);
+
+    float n00 = hash2d(i, seed);
+    float n10 = hash2d(i + ivec2(1, 0), seed);
+    float n01 = hash2d(i + ivec2(0, 1), seed);
+    float n11 = hash2d(i + ivec2(1, 1), seed);
+
+    float nx0 = mix(n00, n10, u.x);
+    float nx1 = mix(n01, n11, u.x);
+    return mix(nx0, nx1, u.y) * 2.0 - 1.0;
+}
+
+float fbm_noise(vec2 p, uint seed) {
+    float sum = 0.0;
+    float amp = 0.5;
+    float freq = 1.0;
+    for (int i = 0; i < 4; i++) {
+        sum += value_noise(p * freq, seed + uint(i) * 131u) * amp;
+        freq *= 2.0;
+        amp *= 0.5;
+    }
+    return sum;
+}
+
+vec3 biome_debug_color(RayHit hit) {
+    if (!hit.hit) {
+        return vec3(0.42, 0.58, 0.84);
+    }
+
+    const float TERRAIN_SCALE = 102.0;
+    const float BIOME_SCALE = 2200.0;
+    const float TEMPERATURE_SCALE = 2400.0;
+    const float MOISTURE_SCALE = 2300.0;
+    const float MOUNTAIN_REGION_SCALE = 1900.0;
+    const float SEA_LEVEL = 60.0;
+    const float SNOW_HINT = SEA_LEVEL + 44.0;
+
+    vec2 world = hit.position.xz;
+    vec2 nxz = world / TERRAIN_SCALE;
+    vec2 bxz = world / BIOME_SCALE;
+
+    float ridge_base = fbm_noise(nxz * 0.55, 13u);
+    float ridge = pow(clamp(1.0 - abs(ridge_base), 0.0, 1.0), 0.85);
+    float macro_shape = fbm_noise(bxz * 0.9, 11u);
+    float macro01 = (macro_shape + 1.0) * 0.5;
+    float relief = clamp(ridge * 0.52 + macro01 * 0.48, 0.0, 1.0);
+
+    float mountain_region = (fbm_noise(world / MOUNTAIN_REGION_SCALE, 17u) + 1.0) * 0.5;
+    float mountain_gate = smoothstep(0.52, 0.78, mountain_region);
+    float ridge_break = smoothstep(
+        0.68,
+        0.90,
+        abs(fbm_noise(nxz * 0.34 + vec2(7.7, -15.3), 19u))
+    );
+    float mountain_core = smoothstep(0.70, 0.90, relief);
+    float mountain_weight = mountain_core * mountain_gate * clamp(1.0 - ridge_break * 0.30, 0.0, 1.0);
+    float hill_weight = smoothstep(0.48, 0.82, relief) * (1.0 - mountain_weight * 0.82);
+
+    float temperature = fbm_noise(world / TEMPERATURE_SCALE, 23u);
+    float moisture = fbm_noise(world / MOISTURE_SCALE, 29u);
+    float desert_region = fbm_noise(bxz * 0.65 + vec2(7.1, -9.3), 31u);
+    bool cold = temperature < -0.12;
+    bool wet = moisture > 0.22;
+    bool high_elevation = hit.position.y >= (SNOW_HINT - 10.0);
+    float heat = smoothstep(0.00, 0.45, temperature);
+    float aridity = smoothstep(-0.08, 0.45, temperature - moisture * 0.95);
+    float desert_zone = smoothstep(0.08, 0.55, desert_region);
+    float desert_strength = clamp(heat * 0.40 + aridity * 0.40 + desert_zone * 0.20, 0.0, 1.0);
+
+    vec3 biome_color;
+    if (mountain_weight > 0.54 && cold && high_elevation) {
+        biome_color = vec3(0.78, 0.88, 0.99); // SnowyMountains
+    } else if (desert_strength > 0.58 && mountain_weight < 0.58) {
+        biome_color = vec3(0.93, 0.82, 0.43); // Desert
+    } else if (mountain_weight > 0.52 || hill_weight > 0.62) {
+        biome_color = vec3(0.70, 0.48, 0.30); // Hills
+    } else if (wet) {
+        biome_color = vec3(0.14, 0.50, 0.20); // Forest
+    } else {
+        biome_color = vec3(0.44, 0.70, 0.28); // Plains
+    }
+
+    // Keep water/snow/sand visibly distinct in biome mode.
+    if (hit.block_id == 6u) {
+        biome_color = mix(biome_color, vec3(0.16, 0.40, 0.85), 0.78);
+    } else if (hit.block_id == 4u) {
+        biome_color = mix(biome_color, vec3(0.92, 0.95, 1.0), 0.72);
+    } else if (hit.block_id == 5u) {
+        biome_color = mix(biome_color, vec3(0.92, 0.82, 0.48), 0.70);
+    }
+
+    float lit = 0.65 + 0.35 * max(dot(hit.normal, normalize(vec3(0.4, 1.0, 0.2))), 0.0);
+    return biome_color * lit;
+}
+
 bool is_on_lod_boundary(vec3 world_pos, ClipmapInfoBuffer clipmap, float threshold) {
     for (uint i = 0u; i < LOD_COUNT; i++) {
         vec3 minb = clipmap.lod_aabb_min[i].xyz;
@@ -645,6 +760,11 @@ vec3 get_block_color(uint block_id) {
         case 2u: return vec3(0.54, 0.35, 0.17);
         case 3u: return vec3(0.34, 0.49, 0.27);
         case 4u: return vec3(0.94, 0.95, 0.98);
+        case 5u: return vec3(0.84, 0.78, 0.52);
+        case 6u: return vec3(0.22, 0.45, 0.77);
+        case 7u: return vec3(0.38, 0.27, 0.16);
+        case 8u: return vec3(0.24, 0.46, 0.20);
+        case 9u: return vec3(0.88, 0.28, 0.33);
         default: return vec3(0.8, 0.2, 0.8);
     }
 }
@@ -715,6 +835,10 @@ void main() {
             } else {
                 color = sky_color(ray_dir);
             }
+            break;
+        }
+        case DEBUG_BIOMES: {
+            color = biome_debug_color(hit);
             break;
         }
         case DEBUG_CHUNK_BOUNDARIES: {

@@ -613,7 +613,10 @@ pub fn downsample_voxel(children: &[BlockId; 8]) -> BlockId {
         if v.is_solid() {
             solid_count += 1;
             *counts.entry(*v).or_insert(0) += 1;
-            has_surface |= *v == BlockId::GRASS || *v == BlockId::SNOW;
+            has_surface |= matches!(
+                *v,
+                BlockId::GRASS | BlockId::SNOW | BlockId::SAND | BlockId::LEAVES | BlockId::WATER
+            );
         } else {
             has_air = true;
         }
@@ -625,12 +628,27 @@ pub fn downsample_voxel(children: &[BlockId; 8]) -> BlockId {
 
     // Preserve thin top surface shells on coarse LODs where air+surface blocks mix.
     if has_air && has_surface {
-        if counts.get(&BlockId::SNOW).copied().unwrap_or(0)
-            >= counts.get(&BlockId::GRASS).copied().unwrap_or(0)
-        {
+        let water_count = counts.get(&BlockId::WATER).copied().unwrap_or(0);
+        let snow_count = counts.get(&BlockId::SNOW).copied().unwrap_or(0);
+        let sand_count = counts.get(&BlockId::SAND).copied().unwrap_or(0);
+        let grass_count = counts.get(&BlockId::GRASS).copied().unwrap_or(0);
+        let leaves_count = counts.get(&BlockId::LEAVES).copied().unwrap_or(0);
+
+        if water_count >= 2 {
+            return BlockId::WATER;
+        }
+        if snow_count > 0 && snow_count >= grass_count.max(sand_count) {
             return BlockId::SNOW;
         }
-        return BlockId::GRASS;
+        if sand_count > 0 && sand_count >= grass_count {
+            return BlockId::SAND;
+        }
+        if grass_count > 0 {
+            return BlockId::GRASS;
+        }
+        if leaves_count > 0 {
+            return BlockId::LEAVES;
+        }
     }
 
     let mut best = BlockId::AIR;
@@ -784,5 +802,53 @@ mod tests {
         ];
         let out = downsample_voxel(&children);
         assert_eq!(out, BlockId::SNOW);
+    }
+
+    #[test]
+    fn downsample_preserves_surface_sand() {
+        let children = [
+            BlockId::AIR,
+            BlockId::AIR,
+            BlockId::SAND,
+            BlockId::DIRT,
+            BlockId::STONE,
+            BlockId::STONE,
+            BlockId::AIR,
+            BlockId::AIR,
+        ];
+        let out = downsample_voxel(&children);
+        assert_eq!(out, BlockId::SAND);
+    }
+
+    #[test]
+    fn downsample_preserves_shallow_water() {
+        let children = [
+            BlockId::AIR,
+            BlockId::WATER,
+            BlockId::WATER,
+            BlockId::AIR,
+            BlockId::AIR,
+            BlockId::AIR,
+            BlockId::AIR,
+            BlockId::AIR,
+        ];
+        let out = downsample_voxel(&children);
+        assert_eq!(out, BlockId::WATER);
+    }
+
+    #[test]
+    fn downsample_preserves_surface_leaves() {
+        let children = [
+            BlockId::AIR,
+            BlockId::AIR,
+            BlockId::LEAVES,
+            BlockId::AIR,
+            BlockId::STONE,
+            BlockId::STONE,
+            BlockId::AIR,
+            BlockId::AIR,
+        ];
+        let out = downsample_voxel(&children);
+        assert_eq!(out, BlockId::LEAVES);
     }
 }
