@@ -344,7 +344,8 @@ RayHit trace_interval(
     float t_end,
     uint lod,
     ClipmapInfoBuffer clipmap,
-    out bool had_missing_pages
+    out bool had_missing_pages,
+    out bool step_budget_exhausted
 ) {
     RayHit miss;
     miss.hit = false;
@@ -355,6 +356,7 @@ RayHit trace_interval(
     miss.traversal_steps = 0u;
     miss.lod = lod;
     had_missing_pages = false;
+    step_budget_exhausted = false;
 
     vec3 inv_dir = 1.0 / ray_dir;
     float voxel_size = float(clipmap.voxel_size[lod].x);
@@ -467,6 +469,9 @@ RayHit trace_interval(
         steps++;
     }
 
+    if (steps >= pc.max_steps && t < t_end) {
+        step_budget_exhausted = true;
+    }
     miss.traversal_steps = steps;
     return miss;
 }
@@ -554,36 +559,55 @@ RayHit trace_clipmap(vec3 ray_origin, vec3 ray_dir) {
         }
 
         bool missing_pages = false;
+        bool step_budget_exhausted = false;
         RayHit hit = trace_interval(
-            ray_origin, ray_dir, t_start, t_end, interval.lod, clipmap, missing_pages
+            ray_origin,
+            ray_dir,
+            t_start,
+            t_end,
+            interval.lod,
+            clipmap,
+            missing_pages,
+            step_budget_exhausted
         );
         total_steps += hit.traversal_steps;
 
-        if (!hit.hit && missing_pages) {
+        if (!hit.hit && (missing_pages || step_budget_exhausted)) {
+            bool allow_approx_fallback = step_budget_exhausted;
             for (uint fallback_lod = interval.lod + 1u; fallback_lod < LOD_COUNT; fallback_lod++) {
                 if (clipmap.voxel_size[fallback_lod].x == 0u) {
                     continue;
                 }
 
                 bool fallback_missing = false;
+                bool fallback_budget_exhausted = false;
                 RayHit fallback_hit = trace_interval(
-                    ray_origin, ray_dir, t_start, t_end, fallback_lod, clipmap, fallback_missing
+                    ray_origin,
+                    ray_dir,
+                    t_start,
+                    t_end,
+                    fallback_lod,
+                    clipmap,
+                    fallback_missing,
+                    fallback_budget_exhausted
                 );
                 total_steps += fallback_hit.traversal_steps;
 
                 if (fallback_hit.hit) {
-                    // Only allow fallback if the fine LOD page at the hit position is genuinely missing.
-                    // This prevents coarse voxels from leaking over valid fine data.
-                    float fine_voxel = max(float(clipmap.voxel_size[interval.lod].x), 1.0);
-                    vec3 probe_pos = fallback_hit.position - ray_dir * (fine_voxel * 0.25);
-                    if (!is_page_missing_at_position(clipmap, interval.lod, probe_pos)) {
-                        continue;
+                    if (!allow_approx_fallback) {
+                        // Only allow fallback if the fine LOD page at the hit position is genuinely missing.
+                        // This prevents coarse voxels from leaking over valid fine data.
+                        float fine_voxel = max(float(clipmap.voxel_size[interval.lod].x), 1.0);
+                        vec3 probe_pos = fallback_hit.position - ray_dir * (fine_voxel * 0.25);
+                        if (!is_page_missing_at_position(clipmap, interval.lod, probe_pos)) {
+                            continue;
+                        }
                     }
                     hit = fallback_hit;
                     break;
                 }
 
-                if (!fallback_missing) {
+                if (!fallback_missing && !fallback_budget_exhausted) {
                     break;
                 }
             }

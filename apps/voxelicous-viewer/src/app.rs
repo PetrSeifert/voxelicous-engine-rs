@@ -19,7 +19,7 @@ use voxelicous_world::{ClipmapStreamingController, TerrainConfig, TerrainGenerat
 use voxelicous_profiler::QueueSizes;
 
 /// Maximum ray marching steps per pixel.
-const MAX_STEPS: u32 = 512;
+const MAX_STEPS: u32 = 1024;
 
 /// Camera movement speed in units per second.
 const CAMERA_SPEED: f32 = 30.0;
