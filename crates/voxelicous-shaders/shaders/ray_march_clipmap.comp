@@ -16,6 +16,7 @@ const uint STRIDE_PALETTE16 = 288u;
 const uint STRIDE_PALETTE32 = 384u;
 const uint STRIDE_RAW16 = 1024u;
 const float DDA_EPS = 1e-4;
+const float TAU = 6.28318530718;
 
 // Buffer references
 layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer ClipmapInfoBuffer {
@@ -76,6 +77,7 @@ layout(set = 0, binding = 0) uniform CameraData {
     mat4 inverse_projection;
     vec4 position;
     vec4 direction;
+    vec4 day_night;
 } camera;
 
 // Output image
@@ -694,9 +696,85 @@ float fbm_noise(vec2 p, uint seed) {
     return sum;
 }
 
-vec3 biome_debug_color(RayHit hit) {
+struct CelestialLighting {
+    vec3 sun_dir;
+    vec3 moon_dir;
+    float sun_visibility;
+    float moon_visibility;
+    float daylight;
+};
+
+CelestialLighting compute_celestial_lighting() {
+    float day_phase = fract(camera.day_night.x);
+    float orbit = day_phase * TAU;
+
+    vec3 sun_dir = normalize(vec3(cos(orbit), sin(orbit), 0.35));
+    vec3 moon_dir = -sun_dir;
+
+    CelestialLighting lighting;
+    lighting.sun_dir = sun_dir;
+    lighting.moon_dir = moon_dir;
+    lighting.sun_visibility = smoothstep(-0.18, 0.08, sun_dir.y);
+    lighting.moon_visibility = smoothstep(-0.18, 0.08, moon_dir.y);
+    lighting.daylight = clamp(lighting.sun_visibility, 0.0, 1.0);
+    return lighting;
+}
+
+vec3 sky_color(vec3 ray_dir, CelestialLighting lighting) {
+    float sky_t = clamp(ray_dir.y * 0.5 + 0.5, 0.0, 1.0);
+
+    vec3 day_horizon = vec3(0.74, 0.84, 0.96);
+    vec3 day_zenith = vec3(0.20, 0.47, 0.85);
+    vec3 night_horizon = vec3(0.03, 0.06, 0.12);
+    vec3 night_zenith = vec3(0.005, 0.01, 0.03);
+
+    vec3 day_sky = mix(day_horizon, day_zenith, pow(sky_t, 0.7));
+    vec3 night_sky = mix(night_horizon, night_zenith, pow(sky_t, 0.8));
+    vec3 sky = mix(night_sky, day_sky, lighting.daylight);
+
+    float twilight = smoothstep(-0.25, 0.05, lighting.sun_dir.y) *
+                     (1.0 - smoothstep(0.05, 0.3, lighting.sun_dir.y));
+    float horizon = exp(-max(ray_dir.y, 0.0) * 14.0);
+    sky += vec3(0.58, 0.28, 0.12) * twilight * horizon * 0.6;
+
+    float sun_alignment = max(dot(ray_dir, lighting.sun_dir), 0.0);
+    float sun_glow = pow(sun_alignment, 18.0) * lighting.sun_visibility;
+    float sun_disk = pow(sun_alignment, 1100.0) * lighting.sun_visibility;
+    sky += vec3(1.0, 0.62, 0.30) * sun_glow * 0.65;
+    sky += vec3(1.0, 0.96, 0.88) * sun_disk * 5.0;
+
+    float moon_alignment = max(dot(ray_dir, lighting.moon_dir), 0.0);
+    float moon_glow = pow(moon_alignment, 12.0) * lighting.moon_visibility;
+    float moon_disk = pow(moon_alignment, 1400.0) * lighting.moon_visibility;
+    sky += vec3(0.35, 0.43, 0.58) * moon_glow * 0.45;
+    sky += vec3(0.83, 0.88, 1.0) * moon_disk * 1.4;
+
+    return sky;
+}
+
+vec3 apply_lighting(vec3 base_color, vec3 normal, CelestialLighting lighting) {
+    float sun_ndotl = max(dot(normal, lighting.sun_dir), 0.0);
+    float moon_ndotl = max(dot(normal, lighting.moon_dir), 0.0);
+
+    vec3 ambient_night = vec3(0.04, 0.05, 0.08);
+    vec3 ambient_day = vec3(0.23, 0.24, 0.26);
+    vec3 ambient = mix(ambient_night, ambient_day, lighting.daylight);
+
+    vec3 sun_color = mix(
+        vec3(1.0, 0.54, 0.34),
+        vec3(1.0, 0.97, 0.92),
+        smoothstep(0.0, 0.6, lighting.sun_dir.y)
+    );
+    vec3 moon_color = vec3(0.46, 0.55, 0.74);
+
+    vec3 direct = sun_color * (sun_ndotl * lighting.sun_visibility * 0.95) +
+                  moon_color * (moon_ndotl * lighting.moon_visibility * 0.30);
+    return base_color * (ambient + direct);
+}
+
+vec3 biome_debug_color(RayHit hit, vec3 ray_dir, CelestialLighting lighting) {
     if (!hit.hit) {
-        return vec3(0.42, 0.58, 0.84);
+        return sky_color(ray_dir, lighting);
     }
 
     const float TERRAIN_SCALE = 102.0;
@@ -761,8 +839,7 @@ vec3 biome_debug_color(RayHit hit) {
         biome_color = mix(biome_color, vec3(0.92, 0.82, 0.48), 0.70);
     }
 
-    float lit = 0.65 + 0.35 * max(dot(hit.normal, normalize(vec3(0.4, 1.0, 0.2))), 0.0);
-    return biome_color * lit;
+    return apply_lighting(biome_color, hit.normal, lighting);
 }
 
 bool is_on_lod_boundary(vec3 world_pos, ClipmapInfoBuffer clipmap, float threshold) {
@@ -793,22 +870,13 @@ vec3 get_block_color(uint block_id) {
     }
 }
 
-vec3 sky_color(vec3 ray_dir) {
-    float t = 0.5 * (ray_dir.y + 1.0);
-    return mix(vec3(0.8, 0.85, 0.9), vec3(0.4, 0.6, 0.9), t);
-}
-
-vec3 shade(RayHit hit, vec3 ray_dir) {
+vec3 shade(RayHit hit, vec3 ray_dir, CelestialLighting lighting) {
     if (!hit.hit) {
-        return sky_color(ray_dir);
+        return sky_color(ray_dir, lighting);
     }
 
     vec3 base_color = get_block_color(hit.block_id);
-    vec3 light_dir = normalize(vec3(0.5, 1.0, 0.3));
-    float ndotl = max(dot(hit.normal, light_dir), 0.0);
-    float ambient = 0.3;
-    float diffuse = 0.7 * ndotl;
-    return base_color * (ambient + diffuse);
+    return apply_lighting(base_color, hit.normal, lighting);
 }
 
 void main() {
@@ -828,6 +896,7 @@ void main() {
     vec3 ray_dir = normalize((camera.inverse_view * view_pos).xyz);
 
     RayHit hit = trace_clipmap(ray_origin, ray_dir);
+    CelestialLighting lighting = compute_celestial_lighting();
 
     vec3 color;
     switch (pc.debug_mode) {
@@ -857,17 +926,17 @@ void main() {
             if (hit.hit) {
                 color = debug_normals(hit.normal);
             } else {
-                color = sky_color(ray_dir);
+                color = sky_color(ray_dir, lighting);
             }
             break;
         }
         case DEBUG_BIOMES: {
-            color = biome_debug_color(hit);
+            color = biome_debug_color(hit, ray_dir, lighting);
             break;
         }
         case DEBUG_CHUNK_BOUNDARIES: {
             ClipmapInfoBuffer clipmap = ClipmapInfoBuffer(pc.clipmap_info_address);
-            color = shade(hit, ray_dir);
+            color = shade(hit, ray_dir, lighting);
             if (hit.hit && is_on_lod_boundary(hit.position, clipmap, 0.15)) {
                 color = mix(color, vec3(1.0, 0.2, 0.2), 0.7);
             }
@@ -875,7 +944,7 @@ void main() {
         }
         case DEBUG_NONE:
         default:
-            color = shade(hit, ray_dir);
+            color = shade(hit, ray_dir, lighting);
             break;
     }
 

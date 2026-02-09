@@ -69,7 +69,18 @@ impl Camera {
 
     /// Get camera uniforms for GPU.
     pub fn uniforms(&self) -> CameraUniforms {
-        CameraUniforms::from(self)
+        self.uniforms_with_day_phase(0.25)
+    }
+
+    /// Get camera uniforms for GPU with a normalized day phase.
+    ///
+    /// `day_phase` wraps to the range `[0.0, 1.0)`, where:
+    /// - `0.25` is noon
+    /// - `0.75` is midnight
+    pub fn uniforms_with_day_phase(&self, day_phase: f32) -> CameraUniforms {
+        let mut uniforms = CameraUniforms::from(self);
+        uniforms.day_night = [day_phase.rem_euclid(1.0), 0.0, 0.0, 0.0];
+        uniforms
     }
 
     pub fn view_matrix(&self) -> Mat4 {
@@ -109,6 +120,7 @@ pub struct CameraUniforms {
     pub inverse_projection: [[f32; 4]; 4],
     pub position: [f32; 4],
     pub direction: [f32; 4],
+    pub day_night: [f32; 4],
 }
 
 impl From<&Camera> for CameraUniforms {
@@ -125,6 +137,7 @@ impl From<&Camera> for CameraUniforms {
                 camera.direction.z,
                 0.0,
             ],
+            day_night: [0.25, 0.0, 0.0, 0.0],
         }
     }
 }

@@ -29,6 +29,8 @@ const CAMERA_SPRINT_MULT: f32 = 2.5;
 
 /// Mouse sensitivity for camera rotation (radians per pixel).
 const MOUSE_SENSITIVITY: f32 = 0.002;
+/// Full in-game day/night cycle duration in seconds.
+const DAY_NIGHT_CYCLE_SECONDS: f32 = 240.0;
 /// Max distance for block editing raycasts.
 const BLOCK_EDIT_REACH: f32 = 10.0;
 /// Runtime LOD distance change step (pages per axis).
@@ -97,6 +99,8 @@ pub struct Viewer {
     should_exit: bool,
     /// Current debug visualization mode.
     debug_mode: DebugMode,
+    /// Day/night phase in [0.0, 1.0).
+    day_phase: f32,
 }
 
 impl VoxelApp for Viewer {
@@ -236,6 +240,7 @@ impl VoxelApp for Viewer {
             clipmap_params,
             should_exit: false,
             debug_mode: DebugMode::default(),
+            day_phase: 0.25,
         })
     }
 
@@ -373,6 +378,9 @@ impl VoxelApp for Viewer {
         // End input frame (must be called at end of update)
         self.input.end_frame();
 
+        // Advance day/night cycle.
+        self.day_phase = (self.day_phase + dt / DAY_NIGHT_CYCLE_SECONDS).fract();
+
         // Update clipmap around the camera position
         self.clipmap.update(self.camera.position);
 
@@ -399,7 +407,7 @@ impl VoxelApp for Viewer {
         let frame_index = frame.frame_index;
         let frame_number = frame.frame_number;
         let capturing = self.screenshot_config.should_capture(frame_number);
-        let camera_uniforms = self.camera.uniforms();
+        let camera_uniforms = self.camera.uniforms_with_day_phase(self.day_phase);
 
         self.render_sync_clipmap_buffers(ctx, frame_index, frame_number);
         self.render_record_ray_march(ctx, frame, frame_index, &camera_uniforms)?;
