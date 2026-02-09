@@ -345,6 +345,7 @@ RayHit trace_interval(
     float t_start,
     float t_end,
     uint lod,
+    uint max_steps,
     ClipmapInfoBuffer clipmap,
     out bool had_missing_pages,
     out bool step_budget_exhausted
@@ -387,7 +388,7 @@ RayHit trace_interval(
     ByteAddressBuffer pal32_buf = ByteAddressBuffer(clipmap.palette32_addr);
     ByteAddressBuffer raw_buf = ByteAddressBuffer(clipmap.raw16_addr);
 
-    while (t <= t_end && steps < pc.max_steps) {
+    while (t <= t_end && steps < max_steps) {
         uint page_index = wrapped_page_index(page);
 
         float t_next = min3(t_max);
@@ -415,7 +416,7 @@ RayHit trace_interval(
                 vec3 brick_t_delta = abs(vec3(brick_size) * inv_dir);
 
                 float tb = t;
-                while (tb <= t_page_end && steps < pc.max_steps) {
+                while (tb <= t_page_end && steps < max_steps) {
                     uint brick_idx = uint(brick.x + brick.y * int(PAGE_BRICKS_AXIS) + brick.z * int(PAGE_BRICKS_AXIS * PAGE_BRICKS_AXIS));
                     uint brick_id = page_bricks.data[page_index * PAGE_BRICKS + brick_idx];
 
@@ -431,7 +432,7 @@ RayHit trace_interval(
                             page_origin + vec3(brick) * brick_size,
                             voxel_size,
                             brick_id,
-                            pc.max_steps,
+                            max_steps,
                             steps,
                             header_buf,
                             pal16_buf,
@@ -471,14 +472,14 @@ RayHit trace_interval(
         steps++;
     }
 
-    if (steps >= pc.max_steps && t < t_end) {
+    if (steps >= max_steps && t < t_end) {
         step_budget_exhausted = true;
     }
     miss.traversal_steps = steps;
     return miss;
 }
 
-RayHit trace_clipmap(vec3 ray_origin, vec3 ray_dir) {
+RayHit trace_clipmap(vec3 ray_origin, vec3 ray_dir, uint max_steps) {
     RayHit closest;
     closest.hit = false;
     closest.block_id = 0u;
@@ -568,6 +569,7 @@ RayHit trace_clipmap(vec3 ray_origin, vec3 ray_dir) {
             t_start,
             t_end,
             interval.lod,
+            max_steps,
             clipmap,
             missing_pages,
             step_budget_exhausted
@@ -589,6 +591,7 @@ RayHit trace_clipmap(vec3 ray_origin, vec3 ray_dir) {
                     t_start,
                     t_end,
                     fallback_lod,
+                    max_steps,
                     clipmap,
                     fallback_missing,
                     fallback_budget_exhausted
@@ -757,6 +760,10 @@ vec2 compute_shadow_visibility(RayHit hit, CelestialLighting lighting) {
     if (!hit.hit) {
         return visibility;
     }
+    // Debug hook: allow CPU to disable expensive shadow traces.
+    if (camera.day_night.y > 0.5) {
+        return visibility;
+    }
 
     ClipmapInfoBuffer clipmap = ClipmapInfoBuffer(pc.clipmap_info_address);
     uint lod = min(hit.lod, LOD_COUNT - 1u);
@@ -764,10 +771,16 @@ vec2 compute_shadow_visibility(RayHit hit, CelestialLighting lighting) {
     float normal_bias = max(voxel_size * 0.40, DDA_EPS * 32.0);
     float ray_bias = max(voxel_size * 0.15, DDA_EPS * 16.0);
     vec3 origin_base = hit.position + hit.normal * normal_bias;
+    // Keep secondary rays bounded; they are the biggest startup spike multipliers.
+    uint shadow_max_steps = min(pc.max_steps, 32u);
 
     float sun_facing = dot(hit.normal, lighting.sun_dir);
     if (lighting.sun_visibility > 0.01 && sun_facing > 0.0) {
-        RayHit blocker = trace_clipmap(origin_base + lighting.sun_dir * ray_bias, lighting.sun_dir);
+        RayHit blocker = trace_clipmap(
+            origin_base + lighting.sun_dir * ray_bias,
+            lighting.sun_dir,
+            shadow_max_steps
+        );
         if (blocker.hit) {
             visibility.x = 0.0;
         }
@@ -775,7 +788,11 @@ vec2 compute_shadow_visibility(RayHit hit, CelestialLighting lighting) {
 
     float moon_facing = dot(hit.normal, lighting.moon_dir);
     if (lighting.moon_visibility > 0.01 && moon_facing > 0.0) {
-        RayHit blocker = trace_clipmap(origin_base + lighting.moon_dir * ray_bias, lighting.moon_dir);
+        RayHit blocker = trace_clipmap(
+            origin_base + lighting.moon_dir * ray_bias,
+            lighting.moon_dir,
+            shadow_max_steps
+        );
         if (blocker.hit) {
             visibility.y = 0.0;
         }
@@ -929,7 +946,7 @@ void main() {
     vec3 ray_origin = camera.position.xyz;
     vec3 ray_dir = normalize((camera.inverse_view * view_pos).xyz);
 
-    RayHit hit = trace_clipmap(ray_origin, ray_dir);
+    RayHit hit = trace_clipmap(ray_origin, ray_dir, pc.max_steps);
     CelestialLighting lighting = compute_celestial_lighting();
 
     vec3 color;

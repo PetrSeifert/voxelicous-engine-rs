@@ -1,5 +1,6 @@
 //! Viewer application implementation with clipmap streaming.
 
+use anyhow::Context;
 use ash::vk;
 use glam::Vec3;
 use tracing::{error, info};
@@ -40,11 +41,19 @@ const LOD_DISTANCE_PAGE_STEP: usize = 2;
 #[derive(Debug, Clone)]
 pub struct ClipmapParams {
     pub seed: u64,
+    pub max_steps: u32,
+    pub debug_skip_ray_march: bool,
+    pub debug_disable_shadows: bool,
 }
 
 impl Default for ClipmapParams {
     fn default() -> Self {
-        Self { seed: 42 }
+        Self {
+            seed: 42,
+            max_steps: MAX_STEPS,
+            debug_skip_ray_march: false,
+            debug_disable_shadows: false,
+        }
     }
 }
 
@@ -64,6 +73,20 @@ impl ClipmapParams {
                             i += 1;
                         }
                     }
+                }
+                "--max-steps" => {
+                    if i + 1 < args.len() {
+                        if let Ok(v) = args[i + 1].parse::<u32>() {
+                            params.max_steps = v.max(1);
+                            i += 1;
+                        }
+                    }
+                }
+                "--debug-skip-raymarch" => {
+                    params.debug_skip_ray_march = true;
+                }
+                "--debug-disable-shadows" => {
+                    params.debug_disable_shadows = true;
                 }
                 _ => {}
             }
@@ -92,15 +115,18 @@ pub struct Viewer {
     input: InputManager,
     /// Screenshot configuration.
     screenshot_config: ScreenshotConfig,
-    /// Clipmap parameters (stored for potential runtime adjustment).
-    #[allow(dead_code)]
-    clipmap_params: ClipmapParams,
     /// Whether the app should exit.
     should_exit: bool,
     /// Current debug visualization mode.
     debug_mode: DebugMode,
     /// Day/night phase in [0.0, 1.0).
     day_phase: f32,
+    /// Runtime ray march step limit (debug-tunable).
+    max_steps: u32,
+    /// Debug toggle to skip compute ray marching entirely.
+    debug_skip_ray_march: bool,
+    /// Debug toggle to disable secondary shadow rays in the shader.
+    debug_disable_shadows: bool,
 }
 
 impl VoxelApp for Viewer {
@@ -114,7 +140,13 @@ impl VoxelApp for Viewer {
         }
 
         let clipmap_params = ClipmapParams::from_args();
-        info!("Clipmap config: seed={}", clipmap_params.seed);
+        info!(
+            "Clipmap config: seed={}, max_steps={}, skip_ray_march={}, disable_shadows={}",
+            clipmap_params.seed,
+            clipmap_params.max_steps,
+            clipmap_params.debug_skip_ray_march,
+            clipmap_params.debug_disable_shadows,
+        );
 
         // Create terrain generator for clipmap sampling
         let terrain_config = TerrainConfig {
@@ -212,21 +244,23 @@ impl VoxelApp for Viewer {
         {
             let mut allocator = ctx.gpu.allocator().lock();
             let initial_frame_number = 0u64;
-            if let Err(e) = clipmap_renderer.sync_from_controller(
+            clipmap_renderer.sync_from_controller(
                 &mut allocator,
                 ctx.gpu.device(),
                 &clipmap,
                 dirty,
                 0,
                 initial_frame_number,
-            ) {
-                error!("Failed to upload initial clipmap data: {e}");
-            }
+            )?;
         }
 
         info!("Clipmap initialized");
 
         info!("Viewer initialized successfully!");
+
+        let max_steps = clipmap_params.max_steps;
+        let debug_skip_ray_march = clipmap_params.debug_skip_ray_march;
+        let debug_disable_shadows = clipmap_params.debug_disable_shadows;
 
         Ok(Self {
             clipmap,
@@ -237,10 +271,12 @@ impl VoxelApp for Viewer {
             camera_pitch,
             input,
             screenshot_config,
-            clipmap_params,
             should_exit: false,
             debug_mode: DebugMode::default(),
             day_phase: 0.25,
+            max_steps,
+            debug_skip_ray_march,
+            debug_disable_shadows,
         })
     }
 
@@ -407,12 +443,24 @@ impl VoxelApp for Viewer {
         let frame_index = frame.frame_index;
         let frame_number = frame.frame_number;
         let capturing = self.screenshot_config.should_capture(frame_number);
-        let camera_uniforms = self.camera.uniforms_with_day_phase(self.day_phase);
+        let mut camera_uniforms = self.camera.uniforms_with_day_phase(self.day_phase);
+        if self.debug_disable_shadows {
+            camera_uniforms.day_night[1] = 1.0;
+        }
 
-        self.render_sync_clipmap_buffers(ctx, frame_index, frame_number);
-        self.render_record_ray_march(ctx, frame, frame_index, &camera_uniforms)?;
-        self.render_record_output_blit(ctx, frame);
-        self.render_record_readback(ctx, frame, capturing);
+        self.render_sync_clipmap_buffers(ctx, frame_index, frame_number)?;
+
+        if self.debug_skip_ray_march {
+            self.render_record_clear_swapchain(ctx, frame);
+            if capturing {
+                self.render_record_clear_pipeline_output_for_readback(ctx, frame);
+                self.render_record_readback(ctx, frame, true);
+            }
+        } else {
+            self.render_record_ray_march(ctx, frame, frame_index, &camera_uniforms)?;
+            self.render_record_output_blit(ctx, frame);
+            self.render_record_readback(ctx, frame, capturing);
+        }
         self.render_record_present_transition(ctx, frame);
 
         // Handle screenshot capture
@@ -515,7 +563,7 @@ impl Viewer {
         ctx: &AppContext,
         frame_index: usize,
         frame_number: u64,
-    ) {
+    ) -> anyhow::Result<()> {
         let device = ctx.gpu.device();
         let mut allocator = {
             #[cfg(feature = "profiling-tracy")]
@@ -523,14 +571,12 @@ impl Viewer {
             ctx.gpu.allocator().lock()
         };
 
-        let deferred_result = {
+        {
             #[cfg(feature = "profiling-tracy")]
             let _span = tracing::trace_span!("clipmap_sync.process_deferred_deletions").entered();
             self.clipmap_renderer
                 .process_deferred_deletions(&mut allocator, frame_number)
-        };
-        if let Err(e) = deferred_result {
-            error!("Failed to process deferred deletions: {}", e);
+                .context("failed to process deferred clipmap deletions")?;
         }
 
         let dirty = {
@@ -538,7 +584,7 @@ impl Viewer {
             let _span = tracing::trace_span!("clipmap_sync.take_dirty_state").entered();
             self.clipmap.take_dirty_state()
         };
-        let sync_result = {
+        {
             #[cfg(feature = "profiling-tracy")]
             let _span = tracing::trace_span!("clipmap_sync.sync_from_controller").entered();
             self.clipmap_renderer.sync_from_controller(
@@ -548,11 +594,10 @@ impl Viewer {
                 dirty,
                 frame_index,
                 frame_number,
-            )
-        };
-        if let Err(e) = sync_result {
-            error!("Failed to sync clipmap GPU buffers: {e}");
+            )?;
         }
+
+        Ok(())
     }
 
     #[cfg_attr(
@@ -576,13 +621,62 @@ impl Viewer {
                 cmd,
                 camera_uniforms,
                 &self.clipmap_renderer,
-                MAX_STEPS,
+                self.max_steps,
                 frame_index,
                 self.debug_mode,
             )?;
         }
 
         Ok(())
+    }
+
+    #[cfg_attr(
+        feature = "profiling-tracy",
+        tracing::instrument(level = "trace", skip_all)
+    )]
+    fn render_record_clear_swapchain(&self, ctx: &AppContext, frame: &FrameContext) {
+        let device = ctx.gpu.device();
+        let cmd = frame.command_buffer;
+
+        unsafe {
+            let swapchain_barrier = vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
+                .src_access_mask(vk::AccessFlags2::NONE)
+                .dst_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+                .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .image(frame.swapchain_image)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                });
+
+            let dependency_info = vk::DependencyInfo::default()
+                .image_memory_barriers(std::slice::from_ref(&swapchain_barrier));
+            device.cmd_pipeline_barrier2(cmd, &dependency_info);
+
+            let clear = vk::ClearColorValue {
+                float32: [0.0, 0.0, 0.0, 1.0],
+            };
+            let range = vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            };
+            device.cmd_clear_color_image(
+                cmd,
+                frame.swapchain_image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &clear,
+                std::slice::from_ref(&range),
+            );
+        }
     }
 
     #[cfg_attr(
@@ -674,6 +768,78 @@ impl Viewer {
                 &[blit],
                 vk::Filter::LINEAR,
             );
+        }
+    }
+
+    #[cfg_attr(
+        feature = "profiling-tracy",
+        tracing::instrument(level = "trace", skip_all)
+    )]
+    fn render_record_clear_pipeline_output_for_readback(
+        &self,
+        ctx: &AppContext,
+        frame: &FrameContext,
+    ) {
+        let device = ctx.gpu.device();
+        let cmd = frame.command_buffer;
+        let pipeline = self.pipeline.as_ref().expect("Pipeline should exist");
+
+        unsafe {
+            let to_transfer_dst = vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
+                .src_access_mask(vk::AccessFlags2::NONE)
+                .dst_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+                .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .image(pipeline.output_image().image)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                });
+            let dependency_info = vk::DependencyInfo::default()
+                .image_memory_barriers(std::slice::from_ref(&to_transfer_dst));
+            device.cmd_pipeline_barrier2(cmd, &dependency_info);
+
+            let clear = vk::ClearColorValue {
+                float32: [0.0, 0.0, 0.0, 1.0],
+            };
+            let range = vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            };
+            device.cmd_clear_color_image(
+                cmd,
+                pipeline.output_image().image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &clear,
+                std::slice::from_ref(&range),
+            );
+
+            let to_transfer_src = vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+                .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .image(pipeline.output_image().image)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                });
+            let dependency_info = vk::DependencyInfo::default()
+                .image_memory_barriers(std::slice::from_ref(&to_transfer_src));
+            device.cmd_pipeline_barrier2(cmd, &dependency_info);
         }
     }
 

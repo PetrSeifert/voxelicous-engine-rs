@@ -115,7 +115,10 @@ impl Swapchain {
 
         match result {
             Ok((index, suboptimal)) => Ok((index, suboptimal)),
-            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => Ok((0, true)),
+            // OUT_OF_DATE means no image was acquired; caller must recreate the swapchain.
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                Err(GpuError::Vulkan(vk::Result::ERROR_OUT_OF_DATE_KHR))
+            }
             Err(e) => Err(GpuError::from(e)),
         }
     }

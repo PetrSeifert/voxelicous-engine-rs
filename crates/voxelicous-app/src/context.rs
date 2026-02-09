@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use ash::vk;
 use voxelicous_gpu::swapchain::Swapchain;
-use voxelicous_gpu::sync::{create_fence, create_semaphore};
+use voxelicous_gpu::sync::{create_fence, create_semaphore, wait_for_fence};
 use voxelicous_gpu::{GpuContext, SurfaceContext};
 use winit::window::Window;
 
@@ -150,6 +150,17 @@ impl AppContext {
     /// Get the number of frames in flight.
     pub fn frames_in_flight(&self) -> usize {
         self.frames.len()
+    }
+
+    /// Wait for all frame fences (all in-flight submissions) to complete.
+    pub fn wait_for_all_in_flight_frames(&self, timeout_ns: u64) -> anyhow::Result<()> {
+        let device = self.gpu.device();
+        unsafe {
+            for frame in &self.frames {
+                wait_for_fence(device, frame.in_flight_fence, timeout_ns)?;
+            }
+        }
+        Ok(())
     }
 
     /// Recreate the swapchain (e.g., after resize).

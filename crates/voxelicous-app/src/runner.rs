@@ -10,6 +10,7 @@ use tracing_subscriber::EnvFilter;
 #[cfg(feature = "profiling-tracy")]
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use voxelicous_gpu::command::submit_command_buffers;
+use voxelicous_gpu::error::GpuError;
 use voxelicous_gpu::sync::{reset_fence, wait_for_fence};
 use voxelicous_gpu::GpuContextBuilder;
 use winit::application::ApplicationHandler;
@@ -201,10 +202,25 @@ impl<A: VoxelApp + 'static> ApplicationHandler for AppRunner<A> {
                 event_loop.exit();
             }
             WindowEvent::RedrawRequested => {
-                if let Some(state) = &mut self.state {
-                    if let Err(e) = state.render_frame() {
-                        error!("Render error: {e}");
+                let render_error = if let Some(state) = &mut self.state {
+                    state.render_frame().err()
+                } else {
+                    None
+                };
+
+                if let Some(e) = render_error {
+                    error!("Render error: {e}");
+                    if is_device_lost_error(&e) {
+                        error!("Device lost detected; shutting down");
+                        if let Some(mut state) = self.state.take() {
+                            state.cleanup();
+                        }
+                        event_loop.exit();
+                        return;
                     }
+                }
+
+                if let Some(state) = &self.state {
                     state.ctx.window.request_redraw();
                 }
             }
@@ -330,10 +346,13 @@ impl<A: VoxelApp> AppState<A> {
         }
 
         let device = self.ctx.gpu.device();
-        let frame_data = &self.ctx.frames[self.ctx.current_frame_index];
+        let frame_slot = self.ctx.current_frame_index;
+        let frame_fence = self.ctx.frames[frame_slot].in_flight_fence;
+        let frame_image_available = self.ctx.frames[frame_slot].image_available;
+        let frame_command_buffer = self.ctx.frames[frame_slot].command_buffer;
 
         // GPU synchronization: wait for previous frame and acquire next image
-        let image_index = {
+        let (image_index, acquire_suboptimal) = {
             #[cfg(feature = "profiling-tracy")]
             let _span = tracing::trace_span!("frame.gpu_sync").entered();
 
@@ -345,28 +364,31 @@ impl<A: VoxelApp> AppState<A> {
                 {
                     #[cfg(feature = "profiling-tracy")]
                     let _span = tracing::trace_span!("frame.gpu_sync.wait_fence").entered();
-                    wait_for_fence(device, frame_data.in_flight_fence, u64::MAX)?;
+                    wait_for_fence(device, frame_fence, u64::MAX)?;
                 }
 
                 // Acquire swapchain image
-                let (image_index, _suboptimal) = {
+                let (image_index, suboptimal) = {
                     #[cfg(feature = "profiling-tracy")]
                     let _span = tracing::trace_span!("frame.gpu_sync.acquire_image").entered();
-                    self.ctx.swapchain.acquire_next_image(
+                    match self.ctx.swapchain.acquire_next_image(
                         &self.ctx.surface.swapchain_loader,
-                        frame_data.image_available,
+                        frame_image_available,
                         u64::MAX,
-                    )?
+                    ) {
+                        Ok(v) => v,
+                        Err(GpuError::Vulkan(vk::Result::ERROR_OUT_OF_DATE_KHR)) => {
+                            let size = self.ctx.window.inner_size();
+                            self.handle_resize(size.width.max(1), size.height.max(1))?;
+                            return Ok(());
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
                 };
 
-                // Reset fence after successful acquire
-                {
-                    #[cfg(feature = "profiling-tracy")]
-                    let _span = tracing::trace_span!("frame.gpu_sync.reset_fence").entered();
-                    reset_fence(device, frame_data.in_flight_fence)?;
-                }
-
-                image_index
+                // Do not return early on suboptimal here; we must consume the
+                // acquire semaphore via a queue submit first.
+                (image_index, suboptimal)
             }
         };
 
@@ -384,13 +406,13 @@ impl<A: VoxelApp> AppState<A> {
                     #[cfg(feature = "profiling-tracy")]
                     let _span = tracing::trace_span!("frame.record.begin_cmd").entered();
                     device.reset_command_buffer(
-                        frame_data.command_buffer,
+                        frame_command_buffer,
                         vk::CommandBufferResetFlags::empty(),
                     )?;
 
                     let begin_info = vk::CommandBufferBeginInfo::default()
                         .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-                    device.begin_command_buffer(frame_data.command_buffer, &begin_info)?;
+                    device.begin_command_buffer(frame_command_buffer, &begin_info)?;
                 }
 
                 // Create frame context
@@ -398,12 +420,12 @@ impl<A: VoxelApp> AppState<A> {
                     #[cfg(feature = "profiling-tracy")]
                     let _span = tracing::trace_span!("frame.record.build_context").entered();
                     FrameContext::new(
-                        frame_data.command_buffer,
+                        frame_command_buffer,
                         image_index,
                         self.ctx.swapchain.images[image_index as usize],
                         dt,
                         self.ctx.frame_count,
-                        self.ctx.current_frame_index,
+                        frame_slot,
                     )
                 };
 
@@ -418,7 +440,7 @@ impl<A: VoxelApp> AppState<A> {
                 {
                     #[cfg(feature = "profiling-tracy")]
                     let _span = tracing::trace_span!("frame.record.end_cmd").entered();
-                    device.end_command_buffer(frame_data.command_buffer)?;
+                    device.end_command_buffer(frame_command_buffer)?;
                 }
             }
         }
@@ -434,12 +456,21 @@ impl<A: VoxelApp> AppState<A> {
             #[cfg(feature = "profiling")]
             profile_scope!(EventCategory::GpuSubmit);
 
-            let wait_semaphores = [frame_data.image_available];
+            let wait_semaphores = [frame_image_available];
             let wait_stages = [vk::PipelineStageFlags::TRANSFER];
             let signal_semaphores = [render_finished];
-            let command_buffers = [frame_data.command_buffer];
+            let command_buffers = [frame_command_buffer];
 
             unsafe {
+                // Reset fence only when we are about to submit.
+                // If recording/app render fails earlier, the fence stays signaled and
+                // the next frame won't block forever on wait_for_fence.
+                {
+                    #[cfg(feature = "profiling-tracy")]
+                    let _span = tracing::trace_span!("frame.submit.reset_fence").entered();
+                    reset_fence(device, frame_fence)?;
+                }
+
                 submit_command_buffers(
                     device,
                     self.ctx.gpu.graphics_queue(),
@@ -447,7 +478,7 @@ impl<A: VoxelApp> AppState<A> {
                     &wait_semaphores,
                     &wait_stages,
                     &signal_semaphores,
-                    frame_data.in_flight_fence,
+                    frame_fence,
                 )?;
             }
         }
@@ -461,12 +492,17 @@ impl<A: VoxelApp> AppState<A> {
             profile_scope!(EventCategory::FramePresent);
 
             unsafe {
-                self.ctx.swapchain.present(
+                let suboptimal = self.ctx.swapchain.present(
                     &self.ctx.surface.swapchain_loader,
                     self.ctx.gpu.graphics_queue(),
                     image_index,
                     &[render_finished],
                 )?;
+                if suboptimal || acquire_suboptimal {
+                    let size = self.ctx.window.inner_size();
+                    self.handle_resize(size.width.max(1), size.height.max(1))?;
+                    return Ok(());
+                }
             }
         }
 
@@ -546,4 +582,9 @@ impl<A: VoxelApp> AppState<A> {
             info!("Cleanup complete");
         }
     }
+}
+
+fn is_device_lost_error(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<GpuError>()
+        .is_some_and(|gpu_err| matches!(gpu_err, GpuError::Vulkan(vk::Result::ERROR_DEVICE_LOST)))
 }

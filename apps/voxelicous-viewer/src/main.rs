@@ -18,6 +18,11 @@
 //!
 //! ### World options
 //! - `--seed <N>`: World generation seed (default: 42)
+//! - `--max-steps <N>`: Ray march step limit (default: 1024)
+//!
+//! ### Debug options
+//! - `--debug-skip-raymarch`: Skip compute ray march pass and clear/present only
+//! - `--debug-disable-shadows`: Disable secondary shadow rays in shader
 //!
 //! ### Other
 //! - `-h, --help`: Print help message
@@ -87,6 +92,11 @@ SCREENSHOT OPTIONS:
 
 WORLD OPTIONS:
     --seed <N>              World generation seed (default: 42)
+    --max-steps <N>         Ray march step limit (default: 1024)
+
+DEBUG OPTIONS:
+    --debug-skip-raymarch      Skip compute ray march; clear+present only
+    --debug-disable-shadows    Disable secondary shadow rays in shader
 
 OTHER:
     -h, --help              Print this help message

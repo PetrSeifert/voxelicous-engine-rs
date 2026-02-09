@@ -3,7 +3,6 @@
 use ash::vk;
 use bytemuck::{Pod, Zeroable};
 use gpu_allocator::MemoryLocation;
-use voxelicous_gpu::deferred::DeferredDeletionQueue;
 use voxelicous_gpu::error::Result;
 use voxelicous_gpu::memory::{GpuAllocator, GpuBuffer};
 use voxelicous_voxel::{
@@ -13,6 +12,10 @@ use voxelicous_voxel::{
 use voxelicous_world::{ClipmapDirtyState, ClipmapStreamingController};
 
 use crate::debug::DebugMode;
+
+const INVALID_PAGE_COORD: [i32; 4] = [i32::MIN, i32::MIN, i32::MIN, 0];
+const INIT_CHUNK_U32: usize = 16 * 1024;
+const INIT_CHUNK_COORD: usize = 4 * 1024;
 
 /// GPU-side clipmap info shared with the shader (buffer reference).
 #[repr(C)]
@@ -52,8 +55,7 @@ impl ClipmapRenderPushConstants {
     pub const SIZE: u32 = std::mem::size_of::<Self>() as u32;
 }
 
-/// GPU resources for clipmap rendering.
-pub struct ClipmapRenderer {
+struct FrameBuffers {
     page_brick_buffers: Vec<Option<GpuBuffer>>,
     page_occ_buffers: Vec<Option<GpuBuffer>>,
     page_coord_buffers: Vec<Option<GpuBuffer>>,
@@ -61,23 +63,17 @@ pub struct ClipmapRenderer {
     palette16_buffer: Option<GpuBuffer>,
     palette32_buffer: Option<GpuBuffer>,
     raw16_buffer: Option<GpuBuffer>,
-    clipmap_info_buffers: Vec<Option<GpuBuffer>>,
-    clipmap_info_addresses: Vec<vk::DeviceAddress>,
-    deferred_deletions: DeferredDeletionQueue,
-    frames_in_flight: usize,
+    clipmap_info_buffer: Option<GpuBuffer>,
 }
 
-impl ClipmapRenderer {
-    /// Create a new clipmap renderer.
-    pub fn new(frames_in_flight: usize) -> Self {
+impl FrameBuffers {
+    fn new() -> Self {
         let mut page_brick_buffers = Vec::with_capacity(CLIPMAP_LOD_COUNT);
         page_brick_buffers.resize_with(CLIPMAP_LOD_COUNT, || None);
         let mut page_occ_buffers = Vec::with_capacity(CLIPMAP_LOD_COUNT);
         page_occ_buffers.resize_with(CLIPMAP_LOD_COUNT, || None);
         let mut page_coord_buffers = Vec::with_capacity(CLIPMAP_LOD_COUNT);
         page_coord_buffers.resize_with(CLIPMAP_LOD_COUNT, || None);
-        let mut clipmap_info_buffers = Vec::with_capacity(frames_in_flight);
-        clipmap_info_buffers.resize_with(frames_in_flight, || None);
 
         Self {
             page_brick_buffers,
@@ -87,10 +83,62 @@ impl ClipmapRenderer {
             palette16_buffer: None,
             palette32_buffer: None,
             raw16_buffer: None,
-            clipmap_info_buffers,
+            clipmap_info_buffer: None,
+        }
+    }
+}
+
+struct PendingDirtyState {
+    dirty_pages: Vec<Vec<usize>>,
+    dirty_headers: Vec<BrickId>,
+    dirty_palette16_entries: Vec<u32>,
+    dirty_palette32_entries: Vec<u32>,
+    dirty_raw16_entries: Vec<u32>,
+}
+
+impl PendingDirtyState {
+    fn new() -> Self {
+        Self {
+            dirty_pages: vec![Vec::new(); CLIPMAP_LOD_COUNT],
+            dirty_headers: Vec::new(),
+            dirty_palette16_entries: Vec::new(),
+            dirty_palette32_entries: Vec::new(),
+            dirty_raw16_entries: Vec::new(),
+        }
+    }
+
+    fn append_from(&mut self, dirty: &ClipmapDirtyState) {
+        for lod in 0..CLIPMAP_LOD_COUNT {
+            if let Some(src) = dirty.dirty_pages.get(lod) {
+                self.dirty_pages[lod].extend_from_slice(src);
+            }
+        }
+        self.dirty_headers.extend_from_slice(&dirty.dirty_headers);
+        self.dirty_palette16_entries
+            .extend_from_slice(&dirty.dirty_palette16_entries);
+        self.dirty_palette32_entries
+            .extend_from_slice(&dirty.dirty_palette32_entries);
+        self.dirty_raw16_entries
+            .extend_from_slice(&dirty.dirty_raw16_entries);
+    }
+}
+
+/// GPU resources for clipmap rendering.
+pub struct ClipmapRenderer {
+    frame_buffers: Vec<FrameBuffers>,
+    pending_dirty_per_frame: Vec<PendingDirtyState>,
+    clipmap_info_addresses: Vec<vk::DeviceAddress>,
+}
+
+impl ClipmapRenderer {
+    /// Create a new clipmap renderer.
+    pub fn new(frames_in_flight: usize) -> Self {
+        Self {
+            frame_buffers: (0..frames_in_flight).map(|_| FrameBuffers::new()).collect(),
+            pending_dirty_per_frame: (0..frames_in_flight)
+                .map(|_| PendingDirtyState::new())
+                .collect(),
             clipmap_info_addresses: vec![0; frames_in_flight],
-            deferred_deletions: DeferredDeletionQueue::new(frames_in_flight),
-            frames_in_flight,
         }
     }
 
@@ -106,34 +154,35 @@ impl ClipmapRenderer {
         controller: &ClipmapStreamingController,
         dirty: ClipmapDirtyState,
         frame_index: usize,
-        frame_number: u64,
+        _frame_number: u64,
     ) -> Result<()> {
+        self.broadcast_dirty(&dirty);
+
         {
             #[cfg(feature = "profiling-tracy")]
             let _span = tracing::trace_span!("clipmap_sync.ensure_page_buffers").entered();
-            self.ensure_page_buffers(allocator, controller.active_lod_count(), frame_number)?;
+            self.ensure_page_buffers(allocator, frame_index, controller.active_lod_count())?;
         }
         {
             #[cfg(feature = "profiling-tracy")]
             let _span = tracing::trace_span!("clipmap_sync.ensure_info_buffers").entered();
-            self.ensure_info_buffers(allocator, device)?;
+            self.ensure_info_buffer(allocator, device, frame_index)?;
         }
 
         let store = controller.store();
+        let pending = self.take_pending_dirty(frame_index);
 
         let header_realloc = {
             #[cfg(feature = "profiling-tracy")]
             let _span = tracing::trace_span!("clipmap_sync.ensure_brick_header_buffer").entered();
-            self.ensure_brick_header_buffer(allocator, frame_number, store.headers())?
+            self.ensure_brick_header_buffer(allocator, frame_index, store.headers())?
         };
         let pal16_realloc = {
             #[cfg(feature = "profiling-tracy")]
             let _span = tracing::trace_span!("clipmap_sync.ensure_palette16_buffer").entered();
             Self::ensure_pool_buffer(
                 allocator,
-                &mut self.deferred_deletions,
-                frame_number,
-                &mut self.palette16_buffer,
+                &mut self.frame_buffers[frame_index].palette16_buffer,
                 store.palette16_pool().len() as u64,
                 PALETTE16_STRIDE as u64,
                 "clipmap_palette16",
@@ -144,9 +193,7 @@ impl ClipmapRenderer {
             let _span = tracing::trace_span!("clipmap_sync.ensure_palette32_buffer").entered();
             Self::ensure_pool_buffer(
                 allocator,
-                &mut self.deferred_deletions,
-                frame_number,
-                &mut self.palette32_buffer,
+                &mut self.frame_buffers[frame_index].palette32_buffer,
                 store.palette32_pool().len() as u64,
                 PALETTE32_STRIDE as u64,
                 "clipmap_palette32",
@@ -157,9 +204,7 @@ impl ClipmapRenderer {
             let _span = tracing::trace_span!("clipmap_sync.ensure_raw16_buffer").entered();
             Self::ensure_pool_buffer(
                 allocator,
-                &mut self.deferred_deletions,
-                frame_number,
-                &mut self.raw16_buffer,
+                &mut self.frame_buffers[frame_index].raw16_buffer,
                 store.raw16_pool().len() as u64,
                 RAW16_STRIDE as u64,
                 "clipmap_raw16",
@@ -169,12 +214,12 @@ impl ClipmapRenderer {
         {
             #[cfg(feature = "profiling-tracy")]
             let _span = tracing::trace_span!("clipmap_sync.upload_page_tables").entered();
-            self.upload_page_tables(controller, dirty.dirty_pages)?;
+            self.upload_page_tables(controller, frame_index, pending.dirty_pages)?;
         }
         {
             #[cfg(feature = "profiling-tracy")]
             let _span = tracing::trace_span!("clipmap_sync.upload_brick_headers").entered();
-            self.upload_brick_headers(store, dirty.dirty_headers, header_realloc)?;
+            self.upload_brick_headers(store, frame_index, pending.dirty_headers, header_realloc)?;
         }
         {
             #[cfg(feature = "profiling-tracy")]
@@ -182,8 +227,11 @@ impl ClipmapRenderer {
             self.upload_pool_entries(
                 store.palette16_pool(),
                 PALETTE16_STRIDE,
-                self.palette16_buffer.as_ref().unwrap(),
-                dirty.dirty_palette16_entries,
+                self.frame_buffers[frame_index]
+                    .palette16_buffer
+                    .as_ref()
+                    .unwrap(),
+                pending.dirty_palette16_entries,
                 pal16_realloc,
             )?;
         }
@@ -193,8 +241,11 @@ impl ClipmapRenderer {
             self.upload_pool_entries(
                 store.palette32_pool(),
                 PALETTE32_STRIDE,
-                self.palette32_buffer.as_ref().unwrap(),
-                dirty.dirty_palette32_entries,
+                self.frame_buffers[frame_index]
+                    .palette32_buffer
+                    .as_ref()
+                    .unwrap(),
+                pending.dirty_palette32_entries,
                 pal32_realloc,
             )?;
         }
@@ -204,8 +255,11 @@ impl ClipmapRenderer {
             self.upload_pool_entries(
                 store.raw16_pool(),
                 RAW16_STRIDE,
-                self.raw16_buffer.as_ref().unwrap(),
-                dirty.dirty_raw16_entries,
+                self.frame_buffers[frame_index]
+                    .raw16_buffer
+                    .as_ref()
+                    .unwrap(),
+                pending.dirty_raw16_entries,
                 raw_realloc,
             )?;
         }
@@ -213,9 +267,9 @@ impl ClipmapRenderer {
         let info = {
             #[cfg(feature = "profiling-tracy")]
             let _span = tracing::trace_span!("clipmap_sync.build_gpu_info").entered();
-            self.build_gpu_info(device, controller)
+            self.build_gpu_info(device, controller, frame_index)
         };
-        if let Some(info_buffer) = &self.clipmap_info_buffers[frame_index] {
+        if let Some(info_buffer) = &self.frame_buffers[frame_index].clipmap_info_buffer {
             #[cfg(feature = "profiling-tracy")]
             let _span = tracing::trace_span!("clipmap_sync.write_gpu_info").entered();
             info_buffer.write(std::slice::from_ref(&info))?;
@@ -247,133 +301,144 @@ impl ClipmapRenderer {
     /// Process deferred deletions.
     pub fn process_deferred_deletions(
         &mut self,
-        allocator: &mut GpuAllocator,
-        frame_number: u64,
+        _allocator: &mut GpuAllocator,
+        _frame_number: u64,
     ) -> Result<()> {
-        self.deferred_deletions.process(allocator, frame_number)
+        Ok(())
     }
 
     /// Destroy all GPU resources.
     pub fn destroy(mut self, allocator: &mut GpuAllocator) -> Result<()> {
-        self.deferred_deletions.flush(allocator)?;
-
-        for buffer in &mut self.page_brick_buffers {
-            if let Some(mut buf) = buffer.take() {
+        for frame in &mut self.frame_buffers {
+            for buffer in &mut frame.page_brick_buffers {
+                if let Some(mut buf) = buffer.take() {
+                    allocator.free_buffer(&mut buf)?;
+                }
+            }
+            for buffer in &mut frame.page_occ_buffers {
+                if let Some(mut buf) = buffer.take() {
+                    allocator.free_buffer(&mut buf)?;
+                }
+            }
+            for buffer in &mut frame.page_coord_buffers {
+                if let Some(mut buf) = buffer.take() {
+                    allocator.free_buffer(&mut buf)?;
+                }
+            }
+            if let Some(mut buf) = frame.clipmap_info_buffer.take() {
                 allocator.free_buffer(&mut buf)?;
             }
-        }
-        for buffer in &mut self.page_occ_buffers {
-            if let Some(mut buf) = buffer.take() {
+            if let Some(mut buf) = frame.brick_header_buffer.take() {
                 allocator.free_buffer(&mut buf)?;
             }
-        }
-        for buffer in &mut self.page_coord_buffers {
-            if let Some(mut buf) = buffer.take() {
+            if let Some(mut buf) = frame.palette16_buffer.take() {
                 allocator.free_buffer(&mut buf)?;
             }
-        }
-        for buffer in &mut self.clipmap_info_buffers {
-            if let Some(mut buf) = buffer.take() {
+            if let Some(mut buf) = frame.palette32_buffer.take() {
                 allocator.free_buffer(&mut buf)?;
             }
-        }
-        if let Some(mut buf) = self.brick_header_buffer.take() {
-            allocator.free_buffer(&mut buf)?;
-        }
-        if let Some(mut buf) = self.palette16_buffer.take() {
-            allocator.free_buffer(&mut buf)?;
-        }
-        if let Some(mut buf) = self.palette32_buffer.take() {
-            allocator.free_buffer(&mut buf)?;
-        }
-        if let Some(mut buf) = self.raw16_buffer.take() {
-            allocator.free_buffer(&mut buf)?;
+            if let Some(mut buf) = frame.raw16_buffer.take() {
+                allocator.free_buffer(&mut buf)?;
+            }
         }
 
         Ok(())
+    }
+
+    fn broadcast_dirty(&mut self, dirty: &ClipmapDirtyState) {
+        for pending in &mut self.pending_dirty_per_frame {
+            pending.append_from(dirty);
+        }
+    }
+
+    fn take_pending_dirty(&mut self, frame_index: usize) -> PendingDirtyState {
+        std::mem::replace(
+            &mut self.pending_dirty_per_frame[frame_index],
+            PendingDirtyState::new(),
+        )
     }
 
     fn ensure_page_buffers(
         &mut self,
         allocator: &mut GpuAllocator,
+        frame_index: usize,
         active_lod_count: usize,
-        frame_number: u64,
     ) -> Result<()> {
         let page_count = CLIPMAP_PAGE_GRID * CLIPMAP_PAGE_GRID * CLIPMAP_PAGE_GRID;
-        let brick_bytes = (page_count * PAGE_BRICKS * std::mem::size_of::<u32>()) as u64;
-        let occ_bytes = (page_count * 2 * std::mem::size_of::<u32>()) as u64;
-        let coord_bytes = (page_count * std::mem::size_of::<[i32; 4]>()) as u64;
+        let brick_u32_count = page_count * PAGE_BRICKS;
+        let occ_u32_count = page_count * 2;
+        let coord_count = page_count;
         let usage =
             vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS;
 
+        let frame = &mut self.frame_buffers[frame_index];
+
         for lod in 0..active_lod_count {
-            if self.page_brick_buffers[lod].is_none() {
-                let buffer = allocator.create_buffer(
-                    brick_bytes,
+            if frame.page_brick_buffers[lod].is_none() {
+                let mut buffer = allocator.create_buffer(
+                    (brick_u32_count * std::mem::size_of::<u32>()) as u64,
                     usage,
                     MemoryLocation::CpuToGpu,
-                    &format!("clipmap_page_bricks_lod{lod}"),
+                    &format!("clipmap_page_bricks_f{frame_index}_lod{lod}"),
                 )?;
-                self.page_brick_buffers[lod] = Some(buffer);
+                Self::initialize_u32_buffer(&mut buffer, 0, brick_u32_count)?;
+                frame.page_brick_buffers[lod] = Some(buffer);
             }
-            if self.page_occ_buffers[lod].is_none() {
-                let buffer = allocator.create_buffer(
-                    occ_bytes,
+            if frame.page_occ_buffers[lod].is_none() {
+                let mut buffer = allocator.create_buffer(
+                    (occ_u32_count * std::mem::size_of::<u32>()) as u64,
                     usage,
                     MemoryLocation::CpuToGpu,
-                    &format!("clipmap_page_occ_lod{lod}"),
+                    &format!("clipmap_page_occ_f{frame_index}_lod{lod}"),
                 )?;
-                self.page_occ_buffers[lod] = Some(buffer);
+                Self::initialize_u32_buffer(&mut buffer, 0, occ_u32_count)?;
+                frame.page_occ_buffers[lod] = Some(buffer);
             }
-            if self.page_coord_buffers[lod].is_none() {
-                let buffer = allocator.create_buffer(
-                    coord_bytes,
+            if frame.page_coord_buffers[lod].is_none() {
+                let mut buffer = allocator.create_buffer(
+                    (coord_count * std::mem::size_of::<[i32; 4]>()) as u64,
                     usage,
                     MemoryLocation::CpuToGpu,
-                    &format!("clipmap_page_coord_lod{lod}"),
+                    &format!("clipmap_page_coord_f{frame_index}_lod{lod}"),
                 )?;
-                self.page_coord_buffers[lod] = Some(buffer);
+                Self::initialize_page_coord_buffer(&mut buffer, coord_count)?;
+                frame.page_coord_buffers[lod] = Some(buffer);
             }
         }
 
         for lod in active_lod_count..CLIPMAP_LOD_COUNT {
-            if let Some(buffer) = self.page_brick_buffers[lod].take() {
-                self.deferred_deletions.queue(buffer, frame_number);
+            if let Some(mut buffer) = frame.page_brick_buffers[lod].take() {
+                allocator.free_buffer(&mut buffer)?;
             }
-            if let Some(buffer) = self.page_occ_buffers[lod].take() {
-                self.deferred_deletions.queue(buffer, frame_number);
+            if let Some(mut buffer) = frame.page_occ_buffers[lod].take() {
+                allocator.free_buffer(&mut buffer)?;
             }
-            if let Some(buffer) = self.page_coord_buffers[lod].take() {
-                self.deferred_deletions.queue(buffer, frame_number);
+            if let Some(mut buffer) = frame.page_coord_buffers[lod].take() {
+                allocator.free_buffer(&mut buffer)?;
             }
         }
 
         Ok(())
     }
 
-    fn ensure_info_buffers(
+    fn ensure_info_buffer(
         &mut self,
         allocator: &mut GpuAllocator,
         device: &ash::Device,
+        frame_index: usize,
     ) -> Result<()> {
-        if self.clipmap_info_buffers.iter().all(|b| b.is_some()) {
-            return Ok(());
-        }
-
-        let usage =
-            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS;
-
-        for i in 0..self.frames_in_flight {
-            if self.clipmap_info_buffers[i].is_none() {
-                let buffer = allocator.create_buffer(
-                    GpuClipmapInfo::SIZE as u64,
-                    usage,
-                    MemoryLocation::CpuToGpu,
-                    &format!("clipmap_info_{i}"),
-                )?;
-                self.clipmap_info_addresses[i] = buffer.device_address(device);
-                self.clipmap_info_buffers[i] = Some(buffer);
-            }
+        if self.frame_buffers[frame_index]
+            .clipmap_info_buffer
+            .is_none()
+        {
+            let buffer = allocator.create_buffer(
+                GpuClipmapInfo::SIZE as u64,
+                vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+                MemoryLocation::CpuToGpu,
+                &format!("clipmap_info_{frame_index}"),
+            )?;
+            self.clipmap_info_addresses[frame_index] = buffer.device_address(device);
+            self.frame_buffers[frame_index].clipmap_info_buffer = Some(buffer);
         }
 
         Ok(())
@@ -382,18 +447,18 @@ impl ClipmapRenderer {
     fn ensure_brick_header_buffer(
         &mut self,
         allocator: &mut GpuAllocator,
-        frame_number: u64,
+        frame_index: usize,
         headers: &[BrickHeader],
     ) -> Result<bool> {
         let required = (headers.len() * std::mem::size_of::<BrickHeader>()) as u64;
         let usage =
             vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS;
-        let buffer = &mut self.brick_header_buffer;
+        let buffer = &mut self.frame_buffers[frame_index].brick_header_buffer;
 
-        if buffer.as_ref().map_or(true, |b| b.size < required) {
+        if buffer.as_ref().is_none_or(|b| b.size < required) {
             let current_size = buffer.as_ref().map_or(0, |b| b.size);
-            if let Some(old) = buffer.take() {
-                self.deferred_deletions.queue(old, frame_number);
+            if let Some(mut old) = buffer.take() {
+                allocator.free_buffer(&mut old)?;
             }
             let min_size = std::mem::size_of::<BrickHeader>() as u64;
             let required_size = required.max(min_size);
@@ -406,7 +471,7 @@ impl ClipmapRenderer {
                 size,
                 usage,
                 MemoryLocation::CpuToGpu,
-                "clipmap_brick_headers",
+                &format!("clipmap_brick_headers_f{frame_index}"),
             )?;
             *buffer = Some(new_buffer);
             return Ok(true);
@@ -417,8 +482,6 @@ impl ClipmapRenderer {
 
     fn ensure_pool_buffer(
         allocator: &mut GpuAllocator,
-        deferred: &mut DeferredDeletionQueue,
-        frame_number: u64,
         buffer: &mut Option<GpuBuffer>,
         pool_size: u64,
         stride: u64,
@@ -428,10 +491,10 @@ impl ClipmapRenderer {
         let usage =
             vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS;
 
-        if buffer.as_ref().map_or(true, |b| b.size < required) {
+        if buffer.as_ref().is_none_or(|b| b.size < required) {
             let current_size = buffer.as_ref().map_or(0, |b| b.size);
-            if let Some(old) = buffer.take() {
-                deferred.queue(old, frame_number);
+            if let Some(mut old) = buffer.take() {
+                allocator.free_buffer(&mut old)?;
             }
             let grow_size = if current_size == 0 {
                 required
@@ -454,18 +517,20 @@ impl ClipmapRenderer {
     fn upload_page_tables(
         &self,
         controller: &ClipmapStreamingController,
+        frame_index: usize,
         dirty_pages: Vec<Vec<usize>>,
     ) -> Result<()> {
         let page_count = CLIPMAP_PAGE_GRID * CLIPMAP_PAGE_GRID * CLIPMAP_PAGE_GRID;
+        let frame = &self.frame_buffers[frame_index];
 
         for lod in 0..CLIPMAP_LOD_COUNT {
-            let Some(brick_buffer) = &self.page_brick_buffers[lod] else {
+            let Some(brick_buffer) = &frame.page_brick_buffers[lod] else {
                 continue;
             };
-            let Some(occ_buffer) = &self.page_occ_buffers[lod] else {
+            let Some(occ_buffer) = &frame.page_occ_buffers[lod] else {
                 continue;
             };
-            let Some(coord_buffer) = &self.page_coord_buffers[lod] else {
+            let Some(coord_buffer) = &frame.page_coord_buffers[lod] else {
                 continue;
             };
 
@@ -477,7 +542,6 @@ impl ClipmapRenderer {
                 continue;
             };
             if lod_dirty_pages.is_empty() {
-                // No dirty pages; skip.
                 continue;
             }
 
@@ -515,10 +579,11 @@ impl ClipmapRenderer {
     fn upload_brick_headers(
         &self,
         store: &ClipmapVoxelStore,
+        frame_index: usize,
         dirty_headers: Vec<BrickId>,
         full_upload: bool,
     ) -> Result<()> {
-        let Some(header_buffer) = &self.brick_header_buffer else {
+        let Some(header_buffer) = &self.frame_buffers[frame_index].brick_header_buffer else {
             return Ok(());
         };
         let headers = store.headers();
@@ -600,17 +665,19 @@ impl ClipmapRenderer {
         &self,
         device: &ash::Device,
         controller: &ClipmapStreamingController,
+        frame_index: usize,
     ) -> GpuClipmapInfo {
         let mut info = GpuClipmapInfo::zeroed();
+        let frame = &self.frame_buffers[frame_index];
 
         for lod in 0..CLIPMAP_LOD_COUNT {
-            if let Some(buffer) = &self.page_brick_buffers[lod] {
+            if let Some(buffer) = &frame.page_brick_buffers[lod] {
                 info.page_brick_indices_addr[lod] = buffer.device_address(device);
             }
-            if let Some(buffer) = &self.page_occ_buffers[lod] {
+            if let Some(buffer) = &frame.page_occ_buffers[lod] {
                 info.page_occ_addr[lod] = buffer.device_address(device);
             }
-            if let Some(buffer) = &self.page_coord_buffers[lod] {
+            if let Some(buffer) = &frame.page_coord_buffers[lod] {
                 info.page_coord_addr[lod] = buffer.device_address(device);
             }
 
@@ -638,20 +705,54 @@ impl ClipmapRenderer {
             ];
         }
 
-        if let Some(buffer) = &self.brick_header_buffer {
+        if let Some(buffer) = &frame.brick_header_buffer {
             info.brick_header_addr = buffer.device_address(device);
         }
-        if let Some(buffer) = &self.palette16_buffer {
+        if let Some(buffer) = &frame.palette16_buffer {
             info.palette16_addr = buffer.device_address(device);
         }
-        if let Some(buffer) = &self.palette32_buffer {
+        if let Some(buffer) = &frame.palette32_buffer {
             info.palette32_addr = buffer.device_address(device);
         }
-        if let Some(buffer) = &self.raw16_buffer {
+        if let Some(buffer) = &frame.raw16_buffer {
             info.raw16_addr = buffer.device_address(device);
         }
 
         info
+    }
+
+    fn initialize_u32_buffer(buffer: &mut GpuBuffer, value: u32, count: usize) -> Result<()> {
+        if count == 0 {
+            return Ok(());
+        }
+
+        let chunk = vec![value; INIT_CHUNK_U32];
+        let mut offset_elems = 0usize;
+        while offset_elems < count {
+            let len = (count - offset_elems).min(chunk.len());
+            let offset_bytes = (offset_elems * std::mem::size_of::<u32>()) as u64;
+            buffer.write_range(offset_bytes, &chunk[..len])?;
+            offset_elems += len;
+        }
+
+        Ok(())
+    }
+
+    fn initialize_page_coord_buffer(buffer: &mut GpuBuffer, count: usize) -> Result<()> {
+        if count == 0 {
+            return Ok(());
+        }
+
+        let chunk = vec![INVALID_PAGE_COORD; INIT_CHUNK_COORD];
+        let mut offset_elems = 0usize;
+        while offset_elems < count {
+            let len = (count - offset_elems).min(chunk.len());
+            let offset_bytes = (offset_elems * std::mem::size_of::<[i32; 4]>()) as u64;
+            buffer.write_range(offset_bytes, &chunk[..len])?;
+            offset_elems += len;
+        }
+
+        Ok(())
     }
 }
 
