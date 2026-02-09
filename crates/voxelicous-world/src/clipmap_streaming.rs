@@ -1,7 +1,7 @@
 //! Clipmap streaming controller for brick/page management.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BinaryHeap, HashMap, HashSet, VecDeque},
     sync::mpsc::{self, Receiver, Sender, TryRecvError},
     sync::Arc,
 };
@@ -101,6 +101,7 @@ impl ClipmapStreamingController {
     const PAGE_APPLY_BUDGET_STEADY: usize = 2;
     const PAGE_APPLY_BUDGET_BOOTSTRAP: usize = 12;
     const MAX_INFLIGHT_PAGE_JOBS: usize = 16;
+    const PENDING_PAGE_BACKLOG_FRAMES: usize = 2;
     const BRICK_FREE_DELAY_FRAMES: u64 = 3;
     const SYNC_EDIT_LODS: usize = 2;
 
@@ -218,7 +219,10 @@ impl ClipmapStreamingController {
                 self.update_lod(lod, camera_voxel, false);
             }
 
-            if self.lods[self.bootstrap_lod].pending_pages.is_empty() {
+            if self.lods[self.bootstrap_lod].ready
+                && self.lods[self.bootstrap_lod].pending_pages.is_empty()
+                && self.lods[self.bootstrap_lod].inflight_pages == 0
+            {
                 self.bootstrap_lod += 1;
                 if self.bootstrap_lod < active_lod_count {
                     let voxel_size = self.lod_voxel_size(self.bootstrap_lod);
@@ -247,11 +251,7 @@ impl ClipmapStreamingController {
             }
         }
 
-        let apply_budget = if self.bootstrap_lod < active_lod_count {
-            Self::PAGE_APPLY_BUDGET_BOOTSTRAP
-        } else {
-            Self::PAGE_APPLY_BUDGET_STEADY
-        };
+        let apply_budget = self.current_apply_budget();
         self.process_pending_pages(apply_budget);
         self.frame_counter = self.frame_counter.wrapping_add(1);
     }
@@ -483,11 +483,13 @@ impl ClipmapStreamingController {
             }
         }
 
+        let pending_budget = self.pending_page_budget(self.current_apply_budget());
+        self.reduce_coords_to_pending_budget(page_size, &mut coords, pending_budget);
         let camera_voxel = self.camera_voxel;
         coords.sort_unstable_by_key(|&coord| {
             page_distance_to_camera_sq(coord, camera_voxel, page_size)
         });
-        self.lods[lod].pending_pages.extend(coords);
+        self.enqueue_pending_pages(lod, coords, false, pending_budget);
     }
 
     fn enqueue_slice(&mut self, lod: usize, page_origin: (i64, i64, i64), axis: Axis, shift: i64) {
@@ -521,11 +523,13 @@ impl ClipmapStreamingController {
         }
 
         let page_size = PAGE_VOXELS_PER_AXIS as i64 * self.lod_voxel_size(lod);
+        let pending_budget = self.pending_page_budget(self.current_apply_budget());
+        self.reduce_coords_to_pending_budget(page_size, &mut coords, pending_budget);
         let camera_voxel = self.camera_voxel;
         coords.sort_unstable_by_key(|&coord| {
             page_distance_to_camera_sq(coord, camera_voxel, page_size)
         });
-        self.lods[lod].pending_pages.extend(coords);
+        self.enqueue_pending_pages(lod, coords, false, pending_budget);
     }
 
     #[cfg_attr(
@@ -552,6 +556,12 @@ impl ClipmapStreamingController {
             self.apply_built_page(result.lod, result.page);
             apply_budget -= 1;
         }
+
+        let pending_budget = self.pending_page_budget(self.current_apply_budget());
+        for lod in 0..self.active_lod_limit() {
+            self.refill_pending_pages_if_starved(lod, pending_budget);
+        }
+        self.spawn_pending_jobs();
 
         for lod in 0..self.active_lod_limit() {
             let state = &mut self.lods[lod];
@@ -725,6 +735,159 @@ impl ClipmapStreamingController {
         self.active_lod_count.clamp(1, CLIPMAP_LOD_COUNT)
     }
 
+    fn current_apply_budget(&self) -> usize {
+        if self.bootstrap_lod < self.active_lod_limit() {
+            Self::PAGE_APPLY_BUDGET_BOOTSTRAP
+        } else {
+            Self::PAGE_APPLY_BUDGET_STEADY
+        }
+    }
+
+    fn pending_page_budget(&self, apply_budget: usize) -> usize {
+        (Self::MAX_INFLIGHT_PAGE_JOBS + apply_budget) * Self::PENDING_PAGE_BACKLOG_FRAMES
+    }
+
+    fn reduce_coords_to_pending_budget(
+        &self,
+        page_size: i64,
+        coords: &mut Vec<(i64, i64, i64)>,
+        pending_budget: usize,
+    ) {
+        if pending_budget == 0 || coords.len() <= pending_budget {
+            return;
+        }
+
+        let camera_voxel = self.camera_voxel;
+        coords.select_nth_unstable_by_key(pending_budget, |&coord| {
+            page_distance_to_camera_sq(coord, camera_voxel, page_size)
+        });
+        coords.truncate(pending_budget);
+    }
+
+    fn enqueue_pending_pages(
+        &mut self,
+        lod: usize,
+        new_coords: Vec<(i64, i64, i64)>,
+        prioritize_new: bool,
+        pending_budget: usize,
+    ) {
+        if pending_budget == 0 {
+            self.lods[lod].pending_pages.clear();
+            return;
+        }
+        if new_coords.is_empty() && self.lods[lod].pending_pages.len() <= pending_budget {
+            return;
+        }
+
+        let page_size = PAGE_VOXELS_PER_AXIS as i64 * self.lod_voxel_size(lod);
+        let mut seen_new = HashSet::with_capacity(new_coords.len());
+        let mut prioritized = Vec::with_capacity(new_coords.len());
+        for coord in new_coords {
+            if !self.is_page_in_coverage(lod, coord) || self.page_slot_matches_coord(lod, coord) {
+                continue;
+            }
+            if seen_new.insert(coord) {
+                prioritized.push(coord);
+            }
+        }
+
+        let existing: Vec<_> = self.lods[lod].pending_pages.drain(..).collect();
+        let mut merged = Vec::with_capacity(existing.len() + prioritized.len());
+        if prioritize_new {
+            let protected_count = prioritized.len().min(pending_budget);
+            let mut tail = existing
+                .into_iter()
+                .filter(|&coord| {
+                    self.is_page_in_coverage(lod, coord)
+                        && !self.page_slot_matches_coord(lod, coord)
+                        && !seen_new.contains(&coord)
+                })
+                .collect::<Vec<_>>();
+            self.reduce_coords_to_pending_budget(
+                page_size,
+                &mut tail,
+                pending_budget.saturating_sub(protected_count),
+            );
+            merged.extend(prioritized.into_iter().take(protected_count));
+            merged.extend(tail);
+        } else {
+            merged.extend(existing);
+            merged.extend(prioritized);
+            merged.retain(|&coord| {
+                self.is_page_in_coverage(lod, coord) && !self.page_slot_matches_coord(lod, coord)
+            });
+            let mut seen = HashSet::with_capacity(merged.len());
+            merged.retain(|coord| seen.insert(*coord));
+            self.reduce_coords_to_pending_budget(page_size, &mut merged, pending_budget);
+        }
+
+        let camera_voxel = self.camera_voxel;
+        merged.sort_unstable_by_key(|&coord| {
+            page_distance_to_camera_sq(coord, camera_voxel, page_size)
+        });
+        self.lods[lod].pending_pages = merged.into();
+        if !self.lods[lod].pending_pages.is_empty() || self.lods[lod].inflight_pages > 0 {
+            self.lods[lod].ready = false;
+        }
+    }
+
+    fn refill_pending_pages_if_starved(&mut self, lod: usize, pending_budget: usize) {
+        if pending_budget == 0 {
+            return;
+        }
+        if self.lods[lod].origin.is_none()
+            || !self.lods[lod].pending_pages.is_empty()
+            || self.lods[lod].inflight_pages != 0
+        {
+            return;
+        }
+
+        let Some(origin) = self.lods[lod].origin else {
+            return;
+        };
+        let page_size = PAGE_VOXELS_PER_AXIS as i64 * self.lod_voxel_size(lod);
+        let origin_page = (
+            div_floor(origin.x, page_size),
+            div_floor(origin.y, page_size),
+            div_floor(origin.z, page_size),
+        );
+
+        let mut nearest: BinaryHeap<(i128, (i64, i64, i64))> = BinaryHeap::new();
+        let grid = self.visible_page_grid as i64;
+        let camera_voxel = self.camera_voxel;
+        for z in 0..grid {
+            for y in 0..grid {
+                for x in 0..grid {
+                    let coord = (origin_page.0 + x, origin_page.1 + y, origin_page.2 + z);
+                    if self.page_slot_matches_coord(lod, coord) {
+                        continue;
+                    }
+
+                    let distance = page_distance_to_camera_sq(coord, camera_voxel, page_size);
+                    if nearest.len() < pending_budget {
+                        nearest.push((distance, coord));
+                        continue;
+                    }
+
+                    if matches!(nearest.peek(), Some((farthest, _)) if distance < *farthest) {
+                        nearest.pop();
+                        nearest.push((distance, coord));
+                    }
+                }
+            }
+        }
+
+        if nearest.is_empty() {
+            return;
+        }
+
+        let mut coords: Vec<_> = nearest.into_iter().map(|(_, coord)| coord).collect();
+        coords.sort_unstable_by_key(|&coord| {
+            page_distance_to_camera_sq(coord, camera_voxel, page_size)
+        });
+        self.enqueue_pending_pages(lod, coords, false, pending_budget);
+    }
+
     fn reconfigure_visible_coverage_all_lods(&mut self) {
         let active_lod_count = self.active_lod_limit();
         for lod in 0..active_lod_count {
@@ -797,11 +960,13 @@ impl ClipmapStreamingController {
             }
         }
 
+        let pending_budget = self.pending_page_budget(self.current_apply_budget());
+        self.reduce_coords_to_pending_budget(page_size, &mut missing_coords, pending_budget);
         let camera_voxel = self.camera_voxel;
         missing_coords.sort_unstable_by_key(|&coord| {
             page_distance_to_camera_sq(coord, camera_voxel, page_size)
         });
-        self.lods[lod].pending_pages.extend(missing_coords);
+        self.enqueue_pending_pages(lod, missing_coords, false, pending_budget);
     }
 
     fn deactivate_lod(&mut self, lod: usize) {
@@ -880,18 +1045,22 @@ impl ClipmapStreamingController {
     }
 
     fn enqueue_pages_affected_by_edit(&mut self, world: WorldCoord) {
+        let pending_budget = self.pending_page_budget(self.current_apply_budget());
         for lod in Self::SYNC_EDIT_LODS.min(self.active_lod_limit())..self.active_lod_limit() {
             if self.lods[lod].origin.is_none() {
                 continue;
             }
 
+            let mut pending_edit_coords = Vec::new();
             for page_coord in self.affected_pages_for_edit(lod, world) {
                 if !self.is_page_in_coverage(lod, page_coord) {
                     continue;
                 }
-                if !self.lods[lod].pending_pages.contains(&page_coord) {
-                    self.lods[lod].pending_pages.push_front(page_coord);
-                }
+                pending_edit_coords.push(page_coord);
+            }
+
+            if !pending_edit_coords.is_empty() {
+                self.enqueue_pending_pages(lod, pending_edit_coords, true, pending_budget);
                 self.lods[lod].ready = false;
             }
         }
@@ -1481,6 +1650,119 @@ mod tests {
             );
             previous_distance = distance;
         }
+    }
+
+    #[test]
+    fn pending_queue_is_capped_to_processing_budget() {
+        let gen = TerrainGenerator::new(TerrainConfig::default());
+        let mut controller = ClipmapStreamingController::new(gen);
+        let camera = WorldCoord { x: 0, y: 0, z: 0 };
+        controller.camera_voxel = camera;
+
+        let lod = 0;
+        let voxel_size = controller.lod_voxel_size(lod);
+        let page_size = PAGE_VOXELS_PER_AXIS as i64 * voxel_size;
+        let coverage = controller.lod_coverage(lod);
+        let origin = aligned_origin(camera, coverage, page_size);
+        controller.enqueue_full_rebuild(lod, origin, voxel_size, page_size);
+
+        let pending_budget = controller.pending_page_budget(controller.current_apply_budget());
+        let full_visible_page_count = controller.visible_page_grid()
+            * controller.visible_page_grid()
+            * controller.visible_page_grid();
+
+        assert!(full_visible_page_count > pending_budget);
+        assert_eq!(controller.lods[lod].pending_pages.len(), pending_budget);
+    }
+
+    #[test]
+    fn starved_lod_refills_with_nearest_missing_pages() {
+        let gen = TerrainGenerator::new(TerrainConfig::default());
+        let mut controller = ClipmapStreamingController::new(gen);
+        let camera = Vec3::new(0.0, 0.0, 0.0);
+
+        controller.update(camera);
+        let lod = 0;
+        controller.lods[lod].pending_pages.clear();
+        controller.lods[lod].inflight_pages = 0;
+
+        let pending_budget = controller.pending_page_budget(controller.current_apply_budget());
+        controller.refill_pending_pages_if_starved(lod, pending_budget);
+
+        assert!(!controller.lods[lod].pending_pages.is_empty());
+        assert!(controller.lods[lod].pending_pages.len() <= pending_budget);
+
+        let page_size = PAGE_VOXELS_PER_AXIS as i64 * controller.lod_voxel_size(lod);
+        let mut previous_distance = i128::MIN;
+        for &coord in &controller.lods[lod].pending_pages {
+            let distance = page_distance_to_camera_sq(coord, controller.camera_voxel, page_size);
+            assert!(
+                distance >= previous_distance,
+                "Refilled pending pages should be nearest-to-farthest"
+            );
+            previous_distance = distance;
+        }
+    }
+
+    #[test]
+    fn bootstrap_does_not_advance_from_stale_ready_flag() {
+        let gen = TerrainGenerator::new(TerrainConfig::default());
+        let mut controller = ClipmapStreamingController::new(gen);
+        controller.active_lod_count = 2;
+
+        let camera = Vec3::new(0.0, 0.0, 0.0);
+        controller.update(camera);
+        controller.bootstrap_lod = 0;
+        controller.lods[0].ready = true;
+        controller.lods[0].pending_pages.push_back((0, 0, 0));
+
+        controller.update(camera);
+
+        assert_eq!(controller.bootstrap_lod, 0);
+    }
+
+    #[test]
+    fn prioritize_new_keeps_far_edit_page_when_queue_is_full() {
+        let gen = TerrainGenerator::new(TerrainConfig::default());
+        let mut controller = ClipmapStreamingController::new(gen);
+        controller.update(Vec3::new(0.0, 0.0, 0.0));
+
+        let lod = 0;
+        let pending_budget = controller.pending_page_budget(controller.current_apply_budget());
+        let page_size = PAGE_VOXELS_PER_AXIS as i64 * controller.lod_voxel_size(lod);
+        let origin = controller.lod_origin(lod);
+        let origin_page = (
+            div_floor(origin.x, page_size),
+            div_floor(origin.y, page_size),
+            div_floor(origin.z, page_size),
+        );
+        let grid = controller.visible_page_grid() as i64;
+
+        let mut coords = Vec::with_capacity((grid * grid * grid) as usize);
+        for z in 0..grid {
+            for y in 0..grid {
+                for x in 0..grid {
+                    coords.push((origin_page.0 + x, origin_page.1 + y, origin_page.2 + z));
+                }
+            }
+        }
+        let camera_voxel = controller.camera_voxel;
+        coords.sort_unstable_by_key(|&coord| {
+            page_distance_to_camera_sq(coord, camera_voxel, page_size)
+        });
+        controller.lods[lod].pending_pages = coords.into_iter().take(pending_budget).collect();
+
+        let far_coord = (
+            origin_page.0 + grid - 1,
+            origin_page.1 + grid - 1,
+            origin_page.2 + grid - 1,
+        );
+        assert!(!controller.lods[lod].pending_pages.contains(&far_coord));
+
+        controller.enqueue_pending_pages(lod, vec![far_coord], true, pending_budget);
+
+        assert_eq!(controller.lods[lod].pending_pages.len(), pending_budget);
+        assert!(controller.lods[lod].pending_pages.contains(&far_coord));
     }
 
     #[test]
