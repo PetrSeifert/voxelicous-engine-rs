@@ -752,7 +752,39 @@ vec3 sky_color(vec3 ray_dir, CelestialLighting lighting) {
     return sky;
 }
 
-vec3 apply_lighting(vec3 base_color, vec3 normal, CelestialLighting lighting) {
+vec2 compute_shadow_visibility(RayHit hit, CelestialLighting lighting) {
+    vec2 visibility = vec2(1.0);
+    if (!hit.hit) {
+        return visibility;
+    }
+
+    ClipmapInfoBuffer clipmap = ClipmapInfoBuffer(pc.clipmap_info_address);
+    uint lod = min(hit.lod, LOD_COUNT - 1u);
+    float voxel_size = max(float(clipmap.voxel_size[lod].x), 1.0);
+    float normal_bias = max(voxel_size * 0.40, DDA_EPS * 32.0);
+    float ray_bias = max(voxel_size * 0.15, DDA_EPS * 16.0);
+    vec3 origin_base = hit.position + hit.normal * normal_bias;
+
+    float sun_facing = dot(hit.normal, lighting.sun_dir);
+    if (lighting.sun_visibility > 0.01 && sun_facing > 0.0) {
+        RayHit blocker = trace_clipmap(origin_base + lighting.sun_dir * ray_bias, lighting.sun_dir);
+        if (blocker.hit) {
+            visibility.x = 0.0;
+        }
+    }
+
+    float moon_facing = dot(hit.normal, lighting.moon_dir);
+    if (lighting.moon_visibility > 0.01 && moon_facing > 0.0) {
+        RayHit blocker = trace_clipmap(origin_base + lighting.moon_dir * ray_bias, lighting.moon_dir);
+        if (blocker.hit) {
+            visibility.y = 0.0;
+        }
+    }
+
+    return visibility;
+}
+
+vec3 apply_lighting(vec3 base_color, vec3 normal, CelestialLighting lighting, vec2 shadow_visibility) {
     float sun_ndotl = max(dot(normal, lighting.sun_dir), 0.0);
     float moon_ndotl = max(dot(normal, lighting.moon_dir), 0.0);
 
@@ -767,8 +799,8 @@ vec3 apply_lighting(vec3 base_color, vec3 normal, CelestialLighting lighting) {
     );
     vec3 moon_color = vec3(0.46, 0.55, 0.74);
 
-    vec3 direct = sun_color * (sun_ndotl * lighting.sun_visibility * 0.95) +
-                  moon_color * (moon_ndotl * lighting.moon_visibility * 0.30);
+    vec3 direct = sun_color * (sun_ndotl * lighting.sun_visibility * shadow_visibility.x * 0.95) +
+                  moon_color * (moon_ndotl * lighting.moon_visibility * shadow_visibility.y * 0.30);
     return base_color * (ambient + direct);
 }
 
@@ -839,7 +871,8 @@ vec3 biome_debug_color(RayHit hit, vec3 ray_dir, CelestialLighting lighting) {
         biome_color = mix(biome_color, vec3(0.92, 0.82, 0.48), 0.70);
     }
 
-    return apply_lighting(biome_color, hit.normal, lighting);
+    vec2 shadows = compute_shadow_visibility(hit, lighting);
+    return apply_lighting(biome_color, hit.normal, lighting, shadows);
 }
 
 bool is_on_lod_boundary(vec3 world_pos, ClipmapInfoBuffer clipmap, float threshold) {
@@ -876,7 +909,8 @@ vec3 shade(RayHit hit, vec3 ray_dir, CelestialLighting lighting) {
     }
 
     vec3 base_color = get_block_color(hit.block_id);
-    return apply_lighting(base_color, hit.normal, lighting);
+    vec2 shadows = compute_shadow_visibility(hit, lighting);
+    return apply_lighting(base_color, hit.normal, lighting, shadows);
 }
 
 void main() {
