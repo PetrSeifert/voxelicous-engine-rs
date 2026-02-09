@@ -5,6 +5,7 @@ use bytemuck::{Pod, Zeroable};
 use gpu_allocator::MemoryLocation;
 use voxelicous_gpu::error::Result;
 use voxelicous_gpu::memory::{GpuAllocator, GpuBuffer};
+use voxelicous_gpu::DeferredDeletionQueue;
 use voxelicous_voxel::{
     BrickHeader, BrickId, ClipmapVoxelStore, CLIPMAP_LOD_COUNT, CLIPMAP_PAGE_GRID, PAGE_BRICKS,
     PALETTE16_STRIDE, PALETTE32_STRIDE, RAW16_STRIDE,
@@ -128,6 +129,7 @@ pub struct ClipmapRenderer {
     frame_buffers: Vec<FrameBuffers>,
     pending_dirty_per_frame: Vec<PendingDirtyState>,
     clipmap_info_addresses: Vec<vk::DeviceAddress>,
+    deferred_deletions: DeferredDeletionQueue,
 }
 
 impl ClipmapRenderer {
@@ -139,6 +141,7 @@ impl ClipmapRenderer {
                 .map(|_| PendingDirtyState::new())
                 .collect(),
             clipmap_info_addresses: vec![0; frames_in_flight],
+            deferred_deletions: DeferredDeletionQueue::new(frames_in_flight),
         }
     }
 
@@ -154,7 +157,7 @@ impl ClipmapRenderer {
         controller: &ClipmapStreamingController,
         dirty: ClipmapDirtyState,
         frame_index: usize,
-        _frame_number: u64,
+        frame_number: u64,
     ) -> Result<()> {
         self.broadcast_dirty(&dirty);
 
@@ -180,35 +183,50 @@ impl ClipmapRenderer {
         let pal16_realloc = {
             #[cfg(feature = "profiling-tracy")]
             let _span = tracing::trace_span!("clipmap_sync.ensure_palette16_buffer").entered();
-            Self::ensure_pool_buffer(
+            let (full_upload, old_buffer) = Self::ensure_pool_buffer(
                 allocator,
                 &mut self.frame_buffers[frame_index].palette16_buffer,
+                store.palette16_pool(),
                 store.palette16_pool().len() as u64,
                 PALETTE16_STRIDE as u64,
                 "clipmap_palette16",
-            )?
+            )?;
+            if let Some(buffer) = old_buffer {
+                self.deferred_deletions.queue(buffer, frame_number);
+            }
+            full_upload
         };
         let pal32_realloc = {
             #[cfg(feature = "profiling-tracy")]
             let _span = tracing::trace_span!("clipmap_sync.ensure_palette32_buffer").entered();
-            Self::ensure_pool_buffer(
+            let (full_upload, old_buffer) = Self::ensure_pool_buffer(
                 allocator,
                 &mut self.frame_buffers[frame_index].palette32_buffer,
+                store.palette32_pool(),
                 store.palette32_pool().len() as u64,
                 PALETTE32_STRIDE as u64,
                 "clipmap_palette32",
-            )?
+            )?;
+            if let Some(buffer) = old_buffer {
+                self.deferred_deletions.queue(buffer, frame_number);
+            }
+            full_upload
         };
         let raw_realloc = {
             #[cfg(feature = "profiling-tracy")]
             let _span = tracing::trace_span!("clipmap_sync.ensure_raw16_buffer").entered();
-            Self::ensure_pool_buffer(
+            let (full_upload, old_buffer) = Self::ensure_pool_buffer(
                 allocator,
                 &mut self.frame_buffers[frame_index].raw16_buffer,
+                store.raw16_pool(),
                 store.raw16_pool().len() as u64,
                 RAW16_STRIDE as u64,
                 "clipmap_raw16",
-            )?
+            )?;
+            if let Some(buffer) = old_buffer {
+                self.deferred_deletions.queue(buffer, frame_number);
+            }
+            full_upload
         };
 
         {
@@ -301,14 +319,17 @@ impl ClipmapRenderer {
     /// Process deferred deletions.
     pub fn process_deferred_deletions(
         &mut self,
-        _allocator: &mut GpuAllocator,
-        _frame_number: u64,
+        allocator: &mut GpuAllocator,
+        frame_number: u64,
     ) -> Result<()> {
+        self.deferred_deletions.process(allocator, frame_number)?;
         Ok(())
     }
 
     /// Destroy all GPU resources.
     pub fn destroy(mut self, allocator: &mut GpuAllocator) -> Result<()> {
+        self.deferred_deletions.flush(allocator)?;
+
         for frame in &mut self.frame_buffers {
             for buffer in &mut frame.page_brick_buffers {
                 if let Some(mut buf) = buffer.take() {
@@ -483,19 +504,17 @@ impl ClipmapRenderer {
     fn ensure_pool_buffer(
         allocator: &mut GpuAllocator,
         buffer: &mut Option<GpuBuffer>,
+        pool: &[u8],
         pool_size: u64,
         stride: u64,
         name: &str,
-    ) -> Result<bool> {
+    ) -> Result<(bool, Option<GpuBuffer>)> {
         let required = pool_size.max(stride);
         let usage =
             vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS;
 
         if buffer.as_ref().is_none_or(|b| b.size < required) {
             let current_size = buffer.as_ref().map_or(0, |b| b.size);
-            if let Some(mut old) = buffer.take() {
-                allocator.free_buffer(&mut old)?;
-            }
             let grow_size = if current_size == 0 {
                 required
             } else {
@@ -503,11 +522,24 @@ impl ClipmapRenderer {
             };
             let new_buffer =
                 allocator.create_buffer(grow_size, usage, MemoryLocation::CpuToGpu, name)?;
+            let mut full_upload = current_size == 0;
+
+            if current_size > 0 {
+                // Preserve existing uploaded prefix from CPU pool data to avoid expensive
+                // readback from CPU->GPU mapped memory during growth.
+                let preserve_len = current_size.min(pool.len() as u64) as usize;
+                if preserve_len > 0 {
+                    new_buffer.write_bytes(0, &pool[..preserve_len])?;
+                    full_upload = false;
+                }
+            }
+
+            let old_buffer = buffer.take();
             *buffer = Some(new_buffer);
-            return Ok(true);
+            return Ok((full_upload, old_buffer));
         }
 
-        Ok(false)
+        Ok((false, None))
     }
 
     #[cfg_attr(

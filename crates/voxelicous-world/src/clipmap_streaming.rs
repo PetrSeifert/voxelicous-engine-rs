@@ -98,6 +98,7 @@ pub struct ClipmapStreamingController {
 }
 
 impl ClipmapStreamingController {
+    const DEFAULT_VISIBLE_PAGE_GRID: usize = CLIPMAP_PAGE_GRID;
     const PAGE_APPLY_BUDGET_STEADY: usize = 2;
     const PAGE_APPLY_BUDGET_BOOTSTRAP: usize = 12;
     const MAX_INFLIGHT_PAGE_JOBS: usize = 16;
@@ -117,7 +118,7 @@ impl ClipmapStreamingController {
             edit_snapshot: Arc::new(HashMap::new()),
             store: ClipmapVoxelStore::new(),
             lods,
-            visible_page_grid: CLIPMAP_PAGE_GRID,
+            visible_page_grid: Self::DEFAULT_VISIBLE_PAGE_GRID,
             active_lod_count: 1,
             camera_voxel: WorldCoord { x: 0, y: 0, z: 0 },
             frame_counter: 0,
@@ -1511,7 +1512,10 @@ mod tests {
         controller.update(camera);
         controller.take_dirty_state();
 
-        assert_eq!(controller.visible_page_grid(), CLIPMAP_PAGE_GRID);
+        assert_eq!(
+            controller.visible_page_grid(),
+            ClipmapStreamingController::DEFAULT_VISIBLE_PAGE_GRID
+        );
 
         let reduced_grid = CLIPMAP_PAGE_GRID / 2;
         assert!(controller.set_visible_page_grid(reduced_grid));
