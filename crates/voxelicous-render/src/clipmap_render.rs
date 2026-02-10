@@ -157,7 +157,7 @@ impl ClipmapRenderer {
         controller: &ClipmapStreamingController,
         dirty: ClipmapDirtyState,
         frame_index: usize,
-        frame_number: u64,
+        _frame_number: u64,
     ) -> Result<()> {
         self.broadcast_dirty(&dirty);
 
@@ -191,8 +191,8 @@ impl ClipmapRenderer {
                 PALETTE16_STRIDE as u64,
                 "clipmap_palette16",
             )?;
-            if let Some(buffer) = old_buffer {
-                self.deferred_deletions.queue(buffer, frame_number);
+            if let Some(mut buffer) = old_buffer {
+                allocator.free_buffer(&mut buffer)?;
             }
             full_upload
         };
@@ -207,8 +207,8 @@ impl ClipmapRenderer {
                 PALETTE32_STRIDE as u64,
                 "clipmap_palette32",
             )?;
-            if let Some(buffer) = old_buffer {
-                self.deferred_deletions.queue(buffer, frame_number);
+            if let Some(mut buffer) = old_buffer {
+                allocator.free_buffer(&mut buffer)?;
             }
             full_upload
         };
@@ -223,8 +223,8 @@ impl ClipmapRenderer {
                 RAW16_STRIDE as u64,
                 "clipmap_raw16",
             )?;
-            if let Some(buffer) = old_buffer {
-                self.deferred_deletions.queue(buffer, frame_number);
+            if let Some(mut buffer) = old_buffer {
+                allocator.free_buffer(&mut buffer)?;
             }
             full_upload
         };
@@ -612,7 +612,7 @@ impl ClipmapRenderer {
         &self,
         store: &ClipmapVoxelStore,
         frame_index: usize,
-        dirty_headers: Vec<BrickId>,
+        mut dirty_headers: Vec<BrickId>,
         full_upload: bool,
     ) -> Result<()> {
         let Some(header_buffer) = &self.frame_buffers[frame_index].brick_header_buffer else {
@@ -630,6 +630,8 @@ impl ClipmapRenderer {
         }
 
         let header_size = std::mem::size_of::<BrickHeader>();
+        dirty_headers.sort_unstable_by_key(|id| id.0);
+        dirty_headers.dedup_by_key(|id| id.0);
         #[cfg(feature = "profiling-tracy")]
         let _span = tracing::trace_span!(
             "upload_brick_headers_incremental",
@@ -657,7 +659,7 @@ impl ClipmapRenderer {
         pool: &[u8],
         stride: usize,
         buffer: &GpuBuffer,
-        entries: Vec<u32>,
+        mut entries: Vec<u32>,
         full_upload: bool,
     ) -> Result<()> {
         if pool.is_empty() {
@@ -679,6 +681,8 @@ impl ClipmapRenderer {
             stride = stride as u32
         )
         .entered();
+        entries.sort_unstable();
+        entries.dedup();
         for entry in entries {
             let offset = entry as usize * stride;
             if offset + stride <= pool.len() {
