@@ -18,6 +18,11 @@ const INVALID_PAGE_COORD: [i32; 4] = [i32::MIN, i32::MIN, i32::MIN, 0];
 const INIT_CHUNK_U32: usize = 16 * 1024;
 const INIT_CHUNK_COORD: usize = 4 * 1024;
 
+/// Growth factor for pool buffers
+const POOL_GROWTH_FACTOR: u64 = 2;
+/// Fixed minimum entries for initial pool buffer allocation.
+const MIN_POOL_ENTRIES: u64 = 16 * 1024;
+
 /// GPU-side clipmap info shared with the shader (buffer reference).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
@@ -130,6 +135,19 @@ pub struct ClipmapRenderer {
     pending_dirty_per_frame: Vec<PendingDirtyState>,
     clipmap_info_addresses: Vec<vk::DeviceAddress>,
     deferred_deletions: DeferredDeletionQueue,
+    /// Track target buffer sizes to sync across all frame buffers.
+    /// When one frame grows a buffer, other frames will match that size.
+    pool_buffer_sizes: PoolBufferSizes,
+}
+
+/// Tracks the target buffer sizes for pool buffers across all frames.
+/// When one frame grows a buffer, we record the new size so other frames
+/// can allocate to match without triggering repeated reallocations.
+#[derive(Default)]
+struct PoolBufferSizes {
+    palette16: u64,
+    palette32: u64,
+    raw16: u64,
 }
 
 impl ClipmapRenderer {
@@ -142,6 +160,7 @@ impl ClipmapRenderer {
                 .collect(),
             clipmap_info_addresses: vec![0; frames_in_flight],
             deferred_deletions: DeferredDeletionQueue::new(frames_in_flight),
+            pool_buffer_sizes: PoolBufferSizes::default(),
         }
     }
 
@@ -175,6 +194,9 @@ impl ClipmapRenderer {
         let store = controller.store();
         let pending = self.take_pending_dirty(frame_index);
 
+        // Use a fixed bootstrap pool size to avoid large startup allocations.
+        let min_pool_entries = MIN_POOL_ENTRIES;
+
         let header_realloc = {
             #[cfg(feature = "profiling-tracy")]
             let _span = tracing::trace_span!("clipmap_sync.ensure_brick_header_buffer").entered();
@@ -183,14 +205,17 @@ impl ClipmapRenderer {
         let pal16_realloc = {
             #[cfg(feature = "profiling-tracy")]
             let _span = tracing::trace_span!("clipmap_sync.ensure_palette16_buffer").entered();
-            let (full_upload, old_buffer) = Self::ensure_pool_buffer(
+            let (full_upload, old_buffer, new_size) = Self::ensure_pool_buffer(
                 allocator,
                 &mut self.frame_buffers[frame_index].palette16_buffer,
-                store.palette16_pool(),
                 store.palette16_pool().len() as u64,
                 PALETTE16_STRIDE as u64,
+                min_pool_entries,
+                self.pool_buffer_sizes.palette16,
                 "clipmap_palette16",
             )?;
+            // Track buffer size so other frames allocate to match.
+            self.pool_buffer_sizes.palette16 = self.pool_buffer_sizes.palette16.max(new_size);
             if let Some(mut buffer) = old_buffer {
                 allocator.free_buffer(&mut buffer)?;
             }
@@ -199,14 +224,16 @@ impl ClipmapRenderer {
         let pal32_realloc = {
             #[cfg(feature = "profiling-tracy")]
             let _span = tracing::trace_span!("clipmap_sync.ensure_palette32_buffer").entered();
-            let (full_upload, old_buffer) = Self::ensure_pool_buffer(
+            let (full_upload, old_buffer, new_size) = Self::ensure_pool_buffer(
                 allocator,
                 &mut self.frame_buffers[frame_index].palette32_buffer,
-                store.palette32_pool(),
                 store.palette32_pool().len() as u64,
                 PALETTE32_STRIDE as u64,
+                min_pool_entries,
+                self.pool_buffer_sizes.palette32,
                 "clipmap_palette32",
             )?;
+            self.pool_buffer_sizes.palette32 = self.pool_buffer_sizes.palette32.max(new_size);
             if let Some(mut buffer) = old_buffer {
                 allocator.free_buffer(&mut buffer)?;
             }
@@ -215,14 +242,16 @@ impl ClipmapRenderer {
         let raw_realloc = {
             #[cfg(feature = "profiling-tracy")]
             let _span = tracing::trace_span!("clipmap_sync.ensure_raw16_buffer").entered();
-            let (full_upload, old_buffer) = Self::ensure_pool_buffer(
+            let (full_upload, old_buffer, new_size) = Self::ensure_pool_buffer(
                 allocator,
                 &mut self.frame_buffers[frame_index].raw16_buffer,
-                store.raw16_pool(),
                 store.raw16_pool().len() as u64,
                 RAW16_STRIDE as u64,
+                min_pool_entries,
+                self.pool_buffer_sizes.raw16,
                 "clipmap_raw16",
             )?;
+            self.pool_buffer_sizes.raw16 = self.pool_buffer_sizes.raw16.max(new_size);
             if let Some(mut buffer) = old_buffer {
                 allocator.free_buffer(&mut buffer)?;
             }
@@ -501,45 +530,65 @@ impl ClipmapRenderer {
         Ok(false)
     }
 
+    /// Ensures pool buffer exists and is large enough.
+    /// Returns (full_upload_needed, old_buffer_to_free, new_buffer_size).
     fn ensure_pool_buffer(
         allocator: &mut GpuAllocator,
         buffer: &mut Option<GpuBuffer>,
-        pool: &[u8],
         pool_size: u64,
         stride: u64,
+        min_entries: u64,
+        target_size: u64,
         name: &str,
-    ) -> Result<(bool, Option<GpuBuffer>)> {
-        let required = pool_size.max(stride);
+    ) -> Result<(bool, Option<GpuBuffer>, u64)> {
+        // Use minimum size based on render distance to avoid reallocations during world load.
+        // Also respect target_size which may be larger due to another frame's growth.
+        let min_size = min_entries * stride;
+        let required = pool_size.max(stride).max(min_size).max(target_size);
         let usage =
             vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS;
 
         if buffer.as_ref().is_none_or(|b| b.size < required) {
             let current_size = buffer.as_ref().map_or(0, |b| b.size);
+            // Use larger growth factor to reduce future reallocations.
             let grow_size = if current_size == 0 {
                 required
             } else {
-                current_size.saturating_mul(2).max(required)
+                current_size.saturating_mul(POOL_GROWTH_FACTOR).max(required)
             };
-            let new_buffer =
-                allocator.create_buffer(grow_size, usage, MemoryLocation::CpuToGpu, name)?;
-            let mut full_upload = current_size == 0;
 
-            if current_size > 0 {
-                // Preserve existing uploaded prefix from CPU pool data to avoid expensive
-                // readback from CPU->GPU mapped memory during growth.
-                let preserve_len = current_size.min(pool.len() as u64) as usize;
-                if preserve_len > 0 {
-                    new_buffer.write_bytes(0, &pool[..preserve_len])?;
-                    full_upload = false;
-                }
+            if current_size == 0 {
+                tracing::debug!(
+                    buffer = name,
+                    size_bytes = grow_size,
+                    size_mb = grow_size as f64 / (1024.0 * 1024.0),
+                    entries = grow_size / stride,
+                    "pool buffer initial allocation"
+                );
+            } else {
+                tracing::warn!(
+                    buffer = name,
+                    old_bytes = current_size,
+                    new_bytes = grow_size,
+                    old_mb = current_size as f64 / (1024.0 * 1024.0),
+                    new_mb = grow_size as f64 / (1024.0 * 1024.0),
+                    growth_factor = grow_size as f64 / current_size as f64,
+                    "pool buffer reallocation (potential frame spike)"
+                );
             }
 
+            let new_buffer =
+                allocator.create_buffer(grow_size, usage, MemoryLocation::CpuToGpu, name)?;
+
+            // Always request full upload on reallocation - upload_pool_entries will handle
+            // the contiguous write efficiently. This avoids a separate preservation copy.
             let old_buffer = buffer.take();
             *buffer = Some(new_buffer);
-            return Ok((full_upload, old_buffer));
+            return Ok((true, old_buffer, grow_size));
         }
 
-        Ok((false, None))
+        let current_size = buffer.as_ref().map_or(0, |b| b.size);
+        Ok((false, None, current_size))
     }
 
     #[cfg_attr(
@@ -674,6 +723,13 @@ impl ClipmapRenderer {
             return Ok(());
         }
 
+        entries.sort_unstable();
+        entries.dedup();
+
+        if entries.is_empty() {
+            return Ok(());
+        }
+
         #[cfg(feature = "profiling-tracy")]
         let _span = tracing::trace_span!(
             "upload_pool_entries_incremental",
@@ -681,13 +737,33 @@ impl ClipmapRenderer {
             stride = stride as u32
         )
         .entered();
-        entries.sort_unstable();
-        entries.dedup();
-        for entry in entries {
-            let offset = entry as usize * stride;
-            if offset + stride <= pool.len() {
-                buffer.write_bytes(offset as u64, &pool[offset..offset + stride])?;
+
+        // Coalesce contiguous entries into single writes to reduce GPU memory operation overhead.
+        // For example, entries [5, 6, 7, 10, 11] become two writes: [5..8] and [10..12].
+        let mut run_start = entries[0];
+        let mut run_len = 1u32;
+
+        for &entry in &entries[1..] {
+            if entry == run_start + run_len {
+                // Consecutive entry - extend the current run
+                run_len += 1;
+            } else {
+                // Gap found - write the current run and start a new one
+                let offset = run_start as usize * stride;
+                let end = (run_start + run_len) as usize * stride;
+                if end <= pool.len() {
+                    buffer.write_bytes(offset as u64, &pool[offset..end])?;
+                }
+                run_start = entry;
+                run_len = 1;
             }
+        }
+
+        // Write the final run
+        let offset = run_start as usize * stride;
+        let end = (run_start + run_len) as usize * stride;
+        if end <= pool.len() {
+            buffer.write_bytes(offset as u64, &pool[offset..end])?;
         }
 
         Ok(())

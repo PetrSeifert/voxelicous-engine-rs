@@ -218,6 +218,14 @@ impl<A: VoxelApp + 'static> ApplicationHandler for AppRunner<A> {
                         event_loop.exit();
                         return;
                     }
+                    if is_out_of_memory_error(&e) {
+                        error!("Out-of-memory detected; shutting down");
+                        if let Some(mut state) = self.state.take() {
+                            state.cleanup();
+                        }
+                        event_loop.exit();
+                        return;
+                    }
                 }
 
                 if let Some(state) = &self.state {
@@ -587,4 +595,20 @@ impl<A: VoxelApp> AppState<A> {
 fn is_device_lost_error(err: &anyhow::Error) -> bool {
     err.downcast_ref::<GpuError>()
         .is_some_and(|gpu_err| matches!(gpu_err, GpuError::Vulkan(vk::Result::ERROR_DEVICE_LOST)))
+}
+
+fn is_out_of_memory_error(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<GpuError>().is_some_and(|gpu_err| match gpu_err {
+        GpuError::Vulkan(vk::Result::ERROR_OUT_OF_HOST_MEMORY)
+        | GpuError::Vulkan(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY) => true,
+        GpuError::AllocationFailed(message) => {
+            let normalized = message.to_ascii_lowercase();
+            normalized.contains("out of memory")
+                || normalized.contains("out_of_memory")
+                || normalized.contains("outofmemory")
+                || normalized.contains("error_out_of_host_memory")
+                || normalized.contains("error_out_of_device_memory")
+        }
+        _ => false,
+    })
 }

@@ -85,8 +85,10 @@ impl AppContext {
         // SAFETY: Device is valid
         let command_pool = unsafe { gpu.device().create_command_pool(&pool_info, None)? };
 
-        // Create per-frame sync data (match swapchain image count)
-        let frames_in_flight = swapchain.images.len();
+        // Use 1 frame in flight to simplify sync and avoid repeated buffer reallocations.
+        // The swapchain still has multiple images for presentation, but we only need
+        // one set of per-frame rendering resources (command buffer, fence, semaphore).
+        let frames_in_flight = 1;
         let mut frames = Vec::with_capacity(frames_in_flight);
         for _ in 0..frames_in_flight {
             let alloc_info = vk::CommandBufferAllocateInfo::default()

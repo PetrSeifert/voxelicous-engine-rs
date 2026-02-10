@@ -20,7 +20,9 @@
       "Bash(set VOXELICOUS_FORCE_COMPUTE=1:*)",
       "Bash(cmd /c \"set VOXELICOUS_FORCE_COMPUTE=1 && cargo run -p voxelicous-viewer --features nvidia -- -S -f 0 -o compute_frame_{}.png --exit-after\")",
       "Bash(wc:*)",
-      "Bash(tree:*)"
+      "Bash(tree:*)",
+      "Bash(findstr:*)",
+      "Bash(Select-String \"clipmap_render\")"
     ]
   }
 }
