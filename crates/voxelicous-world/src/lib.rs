@@ -3,7 +3,7 @@
 pub mod clipmap_streaming;
 pub mod generation;
 
-pub use clipmap_streaming::{ClipmapDirtyState, ClipmapStreamingController};
+pub use clipmap_streaming::{ClipmapDirtyState, ClipmapPoolReserve, ClipmapStreamingController};
 pub use generation::{TerrainConfig, TerrainGenerator};
 
 /// World seed for procedural generation.

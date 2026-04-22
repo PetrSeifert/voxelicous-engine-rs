@@ -169,6 +169,33 @@ impl ClipmapVoxelStore {
         self.headers.len()
     }
 
+    /// Reserve CPU-side brick header and payload pool capacity.
+    ///
+    /// This keeps streaming from paying large `Vec` reallocations while pages are being
+    /// applied during gameplay. Payload pools are reserved independently because each
+    /// brick can use a different encoding.
+    pub fn reserve_pool_capacity(
+        &mut self,
+        header_entries: usize,
+        palette16_entries: usize,
+        palette32_entries: usize,
+        raw16_entries: usize,
+    ) {
+        reserve_vec_capacity(&mut self.headers, header_entries);
+        reserve_vec_capacity(
+            &mut self.palette16_pool,
+            palette16_entries.saturating_mul(PALETTE16_STRIDE),
+        );
+        reserve_vec_capacity(
+            &mut self.palette32_pool,
+            palette32_entries.saturating_mul(PALETTE32_STRIDE),
+        );
+        reserve_vec_capacity(
+            &mut self.raw16_pool,
+            raw16_entries.saturating_mul(RAW16_STRIDE),
+        );
+    }
+
     /// Get a brick header by id.
     pub fn header(&self, id: BrickId) -> Option<&BrickHeader> {
         self.headers.get(id.0 as usize)
@@ -325,6 +352,12 @@ impl ClipmapVoxelStore {
             return None;
         }
         Some(&pool[offset..offset + stride])
+    }
+}
+
+fn reserve_vec_capacity<T>(vec: &mut Vec<T>, capacity: usize) {
+    if capacity > vec.capacity() {
+        vec.reserve(capacity - vec.capacity());
     }
 }
 

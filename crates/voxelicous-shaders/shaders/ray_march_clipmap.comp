@@ -15,6 +15,7 @@ const uint PAGE_VOXELS_AXIS = 32u;
 const uint STRIDE_PALETTE16 = 288u;
 const uint STRIDE_PALETTE32 = 384u;
 const uint STRIDE_RAW16 = 1024u;
+const uint PALETTE16_CHUNK_ENTRIES = 262144u;
 const float DDA_EPS = 1e-4;
 const float TAU = 6.28318530718;
 
@@ -48,6 +49,10 @@ layout(buffer_reference, scalar, buffer_reference_align = 16) readonly buffer Pa
 
 layout(buffer_reference, scalar, buffer_reference_align = 4) readonly buffer ByteAddressBuffer {
     uint data[];
+};
+
+layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer AddressBuffer {
+    uint64_t data[];
 };
 
 // Debug mode constants
@@ -126,6 +131,14 @@ uint palette16_lookup(ByteAddressBuffer buf, uint base, uint voxel_idx) {
     uint packed = read_u8(buf, base + 32u + palette_idx);
     uint nibble = (voxel_idx & 1u) == 0u ? (packed & 0xFu) : ((packed >> 4u) & 0xFu);
     return read_u16(buf, base + nibble * 2u);
+}
+
+uint palette16_lookup_chunked(uint64_t table_addr, uint data_index, uint voxel_idx) {
+    AddressBuffer chunks = AddressBuffer(table_addr);
+    uint chunk_idx = data_index / PALETTE16_CHUNK_ENTRIES;
+    uint local_idx = data_index - chunk_idx * PALETTE16_CHUNK_ENTRIES;
+    ByteAddressBuffer buf = ByteAddressBuffer(chunks.data[chunk_idx]);
+    return palette16_lookup(buf, local_idx * STRIDE_PALETTE16, voxel_idx);
 }
 
 uint palette32_lookup(ByteAddressBuffer buf, uint base, uint voxel_idx, uint palette_len) {
@@ -250,7 +263,7 @@ RayHit trace_brick(
     uint max_steps,
     inout uint steps,
     ByteAddressBuffer header_buf,
-    ByteAddressBuffer pal16_buf,
+    uint64_t palette16_table_addr,
     ByteAddressBuffer pal32_buf,
     ByteAddressBuffer raw_buf
 ) {
@@ -299,7 +312,7 @@ RayHit trace_brick(
         uint voxel_idx = uint(voxel.x + voxel.y * int(BRICK_SIZE) + voxel.z * int(BRICK_SIZE * BRICK_SIZE));
         uint block_id = 0u;
         if (encoding == 0u) {
-            block_id = palette16_lookup(pal16_buf, data_index * STRIDE_PALETTE16, voxel_idx);
+            block_id = palette16_lookup_chunked(palette16_table_addr, data_index, voxel_idx);
         } else if (encoding == 1u) {
             block_id = palette32_lookup(pal32_buf, data_index * STRIDE_PALETTE32, voxel_idx, palette_len);
         } else {
@@ -384,7 +397,6 @@ RayHit trace_interval(
     PageOccBuffer page_occ = PageOccBuffer(clipmap.page_occ_addr[lod]);
     PageCoordBuffer page_coords = PageCoordBuffer(clipmap.page_coord_addr[lod]);
     ByteAddressBuffer header_buf = ByteAddressBuffer(clipmap.brick_header_addr);
-    ByteAddressBuffer pal16_buf = ByteAddressBuffer(clipmap.palette16_addr);
     ByteAddressBuffer pal32_buf = ByteAddressBuffer(clipmap.palette32_addr);
     ByteAddressBuffer raw_buf = ByteAddressBuffer(clipmap.raw16_addr);
 
@@ -435,7 +447,7 @@ RayHit trace_interval(
                             max_steps,
                             steps,
                             header_buf,
-                            pal16_buf,
+                            clipmap.palette16_addr,
                             pal32_buf,
                             raw_buf
                         );

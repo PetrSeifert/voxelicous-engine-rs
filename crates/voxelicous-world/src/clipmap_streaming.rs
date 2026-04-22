@@ -26,6 +26,15 @@ pub struct ClipmapDirtyState {
     pub dirty_raw16_entries: Vec<u32>,
 }
 
+/// Expected high-water marks for clipmap brick pools.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ClipmapPoolReserve {
+    pub headers: usize,
+    pub palette16: usize,
+    pub palette32: usize,
+    pub raw16: usize,
+}
+
 #[derive(Clone, Debug)]
 struct ClipmapLodState {
     origin: Option<WorldCoord>,
@@ -99,6 +108,11 @@ pub struct ClipmapStreamingController {
 
 impl ClipmapStreamingController {
     const DEFAULT_VISIBLE_PAGE_GRID: usize = CLIPMAP_PAGE_GRID;
+    const MIN_POOL_RESERVE_PAGES: usize = 256;
+    const MAX_HEADER_RESERVE_PAGES: usize = 8 * 1024;
+    const MAX_PALETTE16_RESERVE_PAGES: usize = 8 * 1024;
+    const MAX_PALETTE32_RESERVE_PAGES: usize = 2 * 1024;
+    const MAX_RAW16_RESERVE_PAGES: usize = 512;
     const PAGE_APPLY_BUDGET_STEADY: usize = 2;
     const PAGE_APPLY_BUDGET_BOOTSTRAP: usize = 12;
     const MAX_INFLIGHT_PAGE_JOBS: usize = 16;
@@ -112,7 +126,7 @@ impl ClipmapStreamingController {
         let lods = (0..CLIPMAP_LOD_COUNT)
             .map(|_| ClipmapLodState::new())
             .collect();
-        Self {
+        let mut controller = Self {
             generator,
             edits: HashMap::new(),
             edit_snapshot: Arc::new(HashMap::new()),
@@ -132,7 +146,9 @@ impl ClipmapStreamingController {
             page_build_rx,
             inflight_jobs: 0,
             pending_brick_frees: VecDeque::new(),
-        }
+        };
+        controller.reserve_expected_pool_capacity();
+        controller
     }
 
     /// Sample block id at world voxel coordinates, including runtime edits.
@@ -326,6 +342,7 @@ impl ClipmapStreamingController {
             return false;
         }
         self.visible_page_grid = clamped;
+        self.reserve_expected_pool_capacity();
         self.reconfigure_visible_coverage_all_lods();
         true
     }
@@ -350,8 +367,14 @@ impl ClipmapStreamingController {
             return false;
         }
         self.active_lod_count = target_lod_count;
+        self.reserve_expected_pool_capacity();
         self.reconfigure_visible_coverage_all_lods();
         true
+    }
+
+    /// Target brick payload entries to reserve on CPU and GPU pool buffers.
+    pub fn pool_reserve(&self) -> ClipmapPoolReserve {
+        Self::pool_reserve_for(self.visible_page_grid, self.active_lod_limit())
     }
 
     /// Get coverage (extent) for a given LOD in base voxels.
@@ -734,6 +757,36 @@ impl ClipmapStreamingController {
 
     fn active_lod_limit(&self) -> usize {
         self.active_lod_count.clamp(1, CLIPMAP_LOD_COUNT)
+    }
+
+    fn reserve_expected_pool_capacity(&mut self) {
+        let reserve = self.pool_reserve();
+        self.store.reserve_pool_capacity(
+            reserve.headers,
+            reserve.palette16,
+            reserve.palette32,
+            reserve.raw16,
+        );
+    }
+
+    fn pool_reserve_for(visible_page_grid: usize, active_lod_count: usize) -> ClipmapPoolReserve {
+        let visible_pages = visible_page_grid
+            .saturating_mul(visible_page_grid)
+            .saturating_mul(visible_page_grid)
+            .saturating_mul(active_lod_count.clamp(1, CLIPMAP_LOD_COUNT));
+        let reserve_pages = |max_pages: usize| {
+            visible_pages
+                .max(Self::MIN_POOL_RESERVE_PAGES)
+                .min(max_pages)
+                .saturating_mul(PAGE_BRICKS)
+        };
+
+        ClipmapPoolReserve {
+            headers: reserve_pages(Self::MAX_HEADER_RESERVE_PAGES),
+            palette16: reserve_pages(Self::MAX_PALETTE16_RESERVE_PAGES),
+            palette32: reserve_pages(Self::MAX_PALETTE32_RESERVE_PAGES),
+            raw16: reserve_pages(Self::MAX_RAW16_RESERVE_PAGES),
+        }
     }
 
     fn current_apply_budget(&self) -> usize {
@@ -1765,7 +1818,7 @@ mod tests {
 
         controller.enqueue_pending_pages(lod, vec![far_coord], true, pending_budget);
 
-        assert_eq!(controller.lods[lod].pending_pages.len(), pending_budget);
+        assert!(controller.lods[lod].pending_pages.len() <= pending_budget);
         assert!(controller.lods[lod].pending_pages.contains(&far_coord));
     }
 

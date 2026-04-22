@@ -20,8 +20,8 @@ const INIT_CHUNK_COORD: usize = 4 * 1024;
 
 /// Growth factor for pool buffers
 const POOL_GROWTH_FACTOR: u64 = 2;
-/// Fixed minimum entries for initial pool buffer allocation.
-const MIN_POOL_ENTRIES: u64 = 16 * 1024;
+const PALETTE16_CHUNK_ENTRIES: usize = 256 * 1024;
+const PALETTE16_CHUNK_BYTES: u64 = (PALETTE16_CHUNK_ENTRIES * PALETTE16_STRIDE) as u64;
 
 /// GPU-side clipmap info shared with the shader (buffer reference).
 #[repr(C)]
@@ -31,6 +31,7 @@ pub struct GpuClipmapInfo {
     pub page_occ_addr: [u64; CLIPMAP_LOD_COUNT],
     pub page_coord_addr: [u64; CLIPMAP_LOD_COUNT],
     pub brick_header_addr: u64,
+    /// Address of a `uint64_t[]` table containing palette16 chunk buffer addresses.
     pub palette16_addr: u64,
     pub palette32_addr: u64,
     pub raw16_addr: u64,
@@ -61,12 +62,20 @@ impl ClipmapRenderPushConstants {
     pub const SIZE: u32 = std::mem::size_of::<Self>() as u32;
 }
 
+fn entries_for_pool_size(pool_size: u64, stride: u64) -> usize {
+    if pool_size == 0 {
+        0
+    } else {
+        pool_size.div_ceil(stride) as usize
+    }
+}
+
 struct FrameBuffers {
     page_brick_buffers: Vec<Option<GpuBuffer>>,
     page_occ_buffers: Vec<Option<GpuBuffer>>,
     page_coord_buffers: Vec<Option<GpuBuffer>>,
     brick_header_buffer: Option<GpuBuffer>,
-    palette16_buffer: Option<GpuBuffer>,
+    palette16_pool: Palette16GpuPool,
     palette32_buffer: Option<GpuBuffer>,
     raw16_buffer: Option<GpuBuffer>,
     clipmap_info_buffer: Option<GpuBuffer>,
@@ -86,10 +95,26 @@ impl FrameBuffers {
             page_occ_buffers,
             page_coord_buffers,
             brick_header_buffer: None,
-            palette16_buffer: None,
+            palette16_pool: Palette16GpuPool::new(),
             palette32_buffer: None,
             raw16_buffer: None,
             clipmap_info_buffer: None,
+        }
+    }
+}
+
+struct Palette16GpuPool {
+    chunks: Vec<GpuBuffer>,
+    address_table: Option<GpuBuffer>,
+    table_capacity: usize,
+}
+
+impl Palette16GpuPool {
+    fn new() -> Self {
+        Self {
+            chunks: Vec::new(),
+            address_table: None,
+            table_capacity: 0,
         }
     }
 }
@@ -145,7 +170,6 @@ pub struct ClipmapRenderer {
 /// can allocate to match without triggering repeated reallocations.
 #[derive(Default)]
 struct PoolBufferSizes {
-    palette16: u64,
     palette32: u64,
     raw16: u64,
 }
@@ -194,32 +218,29 @@ impl ClipmapRenderer {
         let store = controller.store();
         let pending = self.take_pending_dirty(frame_index);
 
-        // Use a fixed bootstrap pool size to avoid large startup allocations.
-        let min_pool_entries = MIN_POOL_ENTRIES;
+        let reserve = controller.pool_reserve();
 
         let header_realloc = {
             #[cfg(feature = "profiling-tracy")]
             let _span = tracing::trace_span!("clipmap_sync.ensure_brick_header_buffer").entered();
-            self.ensure_brick_header_buffer(allocator, frame_index, store.headers())?
+            self.ensure_brick_header_buffer(
+                allocator,
+                frame_index,
+                store.headers(),
+                reserve.headers as u64,
+            )?
         };
-        let pal16_realloc = {
+        let pal16_full_upload_chunks = {
             #[cfg(feature = "profiling-tracy")]
             let _span = tracing::trace_span!("clipmap_sync.ensure_palette16_buffer").entered();
-            let (full_upload, old_buffer, new_size) = Self::ensure_pool_buffer(
+            Self::ensure_palette16_pool(
                 allocator,
-                &mut self.frame_buffers[frame_index].palette16_buffer,
+                device,
+                &mut self.frame_buffers[frame_index].palette16_pool,
                 store.palette16_pool().len() as u64,
-                PALETTE16_STRIDE as u64,
-                min_pool_entries,
-                self.pool_buffer_sizes.palette16,
-                "clipmap_palette16",
-            )?;
-            // Track buffer size so other frames allocate to match.
-            self.pool_buffer_sizes.palette16 = self.pool_buffer_sizes.palette16.max(new_size);
-            if let Some(mut buffer) = old_buffer {
-                allocator.free_buffer(&mut buffer)?;
-            }
-            full_upload
+                reserve.palette16 as u64,
+                &format!("clipmap_palette16_f{frame_index}"),
+            )?
         };
         let pal32_realloc = {
             #[cfg(feature = "profiling-tracy")]
@@ -229,7 +250,7 @@ impl ClipmapRenderer {
                 &mut self.frame_buffers[frame_index].palette32_buffer,
                 store.palette32_pool().len() as u64,
                 PALETTE32_STRIDE as u64,
-                min_pool_entries,
+                reserve.palette32 as u64,
                 self.pool_buffer_sizes.palette32,
                 "clipmap_palette32",
             )?;
@@ -247,7 +268,7 @@ impl ClipmapRenderer {
                 &mut self.frame_buffers[frame_index].raw16_buffer,
                 store.raw16_pool().len() as u64,
                 RAW16_STRIDE as u64,
-                min_pool_entries,
+                reserve.raw16 as u64,
                 self.pool_buffer_sizes.raw16,
                 "clipmap_raw16",
             )?;
@@ -271,15 +292,11 @@ impl ClipmapRenderer {
         {
             #[cfg(feature = "profiling-tracy")]
             let _span = tracing::trace_span!("clipmap_sync.upload_palette16_entries").entered();
-            self.upload_pool_entries(
+            self.upload_palette16_entries(
                 store.palette16_pool(),
-                PALETTE16_STRIDE,
-                self.frame_buffers[frame_index]
-                    .palette16_buffer
-                    .as_ref()
-                    .unwrap(),
+                &self.frame_buffers[frame_index].palette16_pool,
                 pending.dirty_palette16_entries,
-                pal16_realloc,
+                pal16_full_upload_chunks,
             )?;
         }
         {
@@ -381,9 +398,7 @@ impl ClipmapRenderer {
             if let Some(mut buf) = frame.brick_header_buffer.take() {
                 allocator.free_buffer(&mut buf)?;
             }
-            if let Some(mut buf) = frame.palette16_buffer.take() {
-                allocator.free_buffer(&mut buf)?;
-            }
+            Self::destroy_palette16_pool(allocator, &mut frame.palette16_pool)?;
             if let Some(mut buf) = frame.palette32_buffer.take() {
                 allocator.free_buffer(&mut buf)?;
             }
@@ -499,8 +514,12 @@ impl ClipmapRenderer {
         allocator: &mut GpuAllocator,
         frame_index: usize,
         headers: &[BrickHeader],
+        min_entries: u64,
     ) -> Result<bool> {
-        let required = (headers.len() * std::mem::size_of::<BrickHeader>()) as u64;
+        let header_size = std::mem::size_of::<BrickHeader>() as u64;
+        let required = (headers.len() as u64)
+            .saturating_mul(header_size)
+            .max(min_entries.saturating_mul(header_size));
         let usage =
             vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS;
         let buffer = &mut self.frame_buffers[frame_index].brick_header_buffer;
@@ -510,7 +529,7 @@ impl ClipmapRenderer {
             if let Some(mut old) = buffer.take() {
                 allocator.free_buffer(&mut old)?;
             }
-            let min_size = std::mem::size_of::<BrickHeader>() as u64;
+            let min_size = header_size;
             let required_size = required.max(min_size);
             let size = if current_size == 0 {
                 required_size
@@ -591,6 +610,86 @@ impl ClipmapRenderer {
 
         let current_size = buffer.as_ref().map_or(0, |b| b.size);
         Ok((false, None, current_size))
+    }
+
+    fn ensure_palette16_pool(
+        allocator: &mut GpuAllocator,
+        device: &ash::Device,
+        pool: &mut Palette16GpuPool,
+        pool_size: u64,
+        min_entries: u64,
+        name: &str,
+    ) -> Result<Vec<usize>> {
+        let required_entries = entries_for_pool_size(pool_size, PALETTE16_STRIDE as u64)
+            .max(min_entries as usize)
+            .max(1);
+        let required_chunks = required_entries.div_ceil(PALETTE16_CHUNK_ENTRIES);
+        let usage =
+            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS;
+
+        let old_chunk_count = pool.chunks.len();
+        while pool.chunks.len() < required_chunks {
+            let chunk_index = pool.chunks.len();
+            let chunk = allocator.create_buffer(
+                PALETTE16_CHUNK_BYTES,
+                usage,
+                MemoryLocation::CpuToGpu,
+                &format!("{name}_chunk{chunk_index}"),
+            )?;
+            pool.chunks.push(chunk);
+        }
+
+        let mut table_recreated = false;
+        if pool.chunks.len() > pool.table_capacity {
+            let new_capacity = pool
+                .table_capacity
+                .max(1)
+                .saturating_mul(2)
+                .max(pool.chunks.len());
+            if let Some(mut table) = pool.address_table.take() {
+                allocator.free_buffer(&mut table)?;
+            }
+            pool.address_table = Some(allocator.create_buffer(
+                (new_capacity * std::mem::size_of::<u64>()) as u64,
+                usage,
+                MemoryLocation::CpuToGpu,
+                &format!("{name}_table"),
+            )?);
+            pool.table_capacity = new_capacity;
+            table_recreated = true;
+        }
+
+        if table_recreated || pool.chunks.len() != old_chunk_count {
+            Self::write_palette16_address_table(device, pool)?;
+        }
+
+        Ok((old_chunk_count..pool.chunks.len()).collect())
+    }
+
+    fn write_palette16_address_table(device: &ash::Device, pool: &Palette16GpuPool) -> Result<()> {
+        let Some(table) = &pool.address_table else {
+            return Ok(());
+        };
+        let addresses: Vec<u64> = pool
+            .chunks
+            .iter()
+            .map(|chunk| chunk.device_address(device))
+            .collect();
+        table.write(&addresses)
+    }
+
+    fn destroy_palette16_pool(
+        allocator: &mut GpuAllocator,
+        pool: &mut Palette16GpuPool,
+    ) -> Result<()> {
+        if let Some(mut table) = pool.address_table.take() {
+            allocator.free_buffer(&mut table)?;
+        }
+        for mut chunk in pool.chunks.drain(..) {
+            allocator.free_buffer(&mut chunk)?;
+        }
+        pool.table_capacity = 0;
+        Ok(())
     }
 
     #[cfg_attr(
@@ -775,6 +874,86 @@ impl ClipmapRenderer {
         feature = "profiling-tracy",
         tracing::instrument(level = "trace", skip_all)
     )]
+    fn upload_palette16_entries(
+        &self,
+        pool: &[u8],
+        gpu_pool: &Palette16GpuPool,
+        mut entries: Vec<u32>,
+        full_upload_chunks: Vec<usize>,
+    ) -> Result<()> {
+        if pool.is_empty() {
+            return Ok(());
+        }
+
+        for chunk_index in full_upload_chunks {
+            let Some(chunk) = gpu_pool.chunks.get(chunk_index) else {
+                continue;
+            };
+            let start = chunk_index * PALETTE16_CHUNK_ENTRIES * PALETTE16_STRIDE;
+            if start >= pool.len() {
+                continue;
+            }
+            let end = (start + PALETTE16_CHUNK_ENTRIES * PALETTE16_STRIDE).min(pool.len());
+            chunk.write_bytes(0, &pool[start..end])?;
+        }
+
+        entries.sort_unstable();
+        entries.dedup();
+
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        #[cfg(feature = "profiling-tracy")]
+        let _span = tracing::trace_span!(
+            "upload_palette16_entries_incremental",
+            entries = entries.len() as u32
+        )
+        .entered();
+
+        let mut run_start = entries[0];
+        let mut run_len = 1u32;
+
+        for &entry in &entries[1..] {
+            let current_chunk = entry as usize / PALETTE16_CHUNK_ENTRIES;
+            let run_chunk = run_start as usize / PALETTE16_CHUNK_ENTRIES;
+            if entry == run_start + run_len && current_chunk == run_chunk {
+                run_len += 1;
+            } else {
+                Self::write_palette16_run(pool, gpu_pool, run_start, run_len)?;
+                run_start = entry;
+                run_len = 1;
+            }
+        }
+
+        Self::write_palette16_run(pool, gpu_pool, run_start, run_len)
+    }
+
+    fn write_palette16_run(
+        pool: &[u8],
+        gpu_pool: &Palette16GpuPool,
+        run_start: u32,
+        run_len: u32,
+    ) -> Result<()> {
+        let chunk_index = run_start as usize / PALETTE16_CHUNK_ENTRIES;
+        let local_start = run_start as usize % PALETTE16_CHUNK_ENTRIES;
+        let Some(chunk) = gpu_pool.chunks.get(chunk_index) else {
+            return Ok(());
+        };
+
+        let src_offset = run_start as usize * PALETTE16_STRIDE;
+        let src_end = (run_start + run_len) as usize * PALETTE16_STRIDE;
+        if src_end > pool.len() {
+            return Ok(());
+        }
+        let dst_offset = (local_start * PALETTE16_STRIDE) as u64;
+        chunk.write_bytes(dst_offset, &pool[src_offset..src_end])
+    }
+
+    #[cfg_attr(
+        feature = "profiling-tracy",
+        tracing::instrument(level = "trace", skip_all)
+    )]
     fn build_gpu_info(
         &self,
         device: &ash::Device,
@@ -822,7 +1001,7 @@ impl ClipmapRenderer {
         if let Some(buffer) = &frame.brick_header_buffer {
             info.brick_header_addr = buffer.device_address(device);
         }
-        if let Some(buffer) = &frame.palette16_buffer {
+        if let Some(buffer) = &frame.palette16_pool.address_table {
             info.palette16_addr = buffer.device_address(device);
         }
         if let Some(buffer) = &frame.palette32_buffer {
