@@ -115,6 +115,8 @@ pub struct Viewer {
     input: InputManager,
     /// Screenshot configuration.
     screenshot_config: ScreenshotConfig,
+    /// Frame whose readback commands were recorded and are ready to save.
+    pending_screenshot_frame: Option<u64>,
     /// Whether the app should exit.
     should_exit: bool,
     /// Current debug visualization mode.
@@ -271,6 +273,7 @@ impl VoxelApp for Viewer {
             camera_pitch,
             input,
             screenshot_config,
+            pending_screenshot_frame: None,
             should_exit: false,
             debug_mode: DebugMode::default(),
             day_phase: 0.25,
@@ -440,6 +443,10 @@ impl VoxelApp for Viewer {
         tracing::instrument(level = "trace", skip_all)
     )]
     fn render(&mut self, ctx: &AppContext, frame: &mut FrameContext) -> anyhow::Result<()> {
+        // The runner waits this frame slot's fence before calling render, so
+        // a readback recorded on the previous use of the slot is complete.
+        self.capture_pending_screenshot();
+
         let frame_index = frame.frame_index;
         let frame_number = frame.frame_number;
         let capturing = self.screenshot_config.should_capture(frame_number);
@@ -463,9 +470,8 @@ impl VoxelApp for Viewer {
         }
         self.render_record_present_transition(ctx, frame);
 
-        // Handle screenshot capture
         if capturing {
-            self.capture_screenshot(ctx, frame_number)?;
+            self.pending_screenshot_frame = Some(frame_number);
         }
 
         // Check if we should exit after capturing
@@ -893,9 +899,15 @@ impl Viewer {
         }
     }
 
-    fn capture_screenshot(&self, ctx: &AppContext, frame_number: u64) -> anyhow::Result<()> {
-        ctx.gpu.wait_idle()?;
+    fn capture_pending_screenshot(&mut self) {
+        let Some(frame_number) = self.pending_screenshot_frame.take() else {
+            return;
+        };
 
+        self.save_screenshot(frame_number);
+    }
+
+    fn save_screenshot(&self, frame_number: u64) {
         let pipeline = self.pipeline.as_ref().expect("Pipeline should exist");
         let (width, height) = pipeline.dimensions();
 
@@ -910,8 +922,6 @@ impl Viewer {
                 error!("Failed to read output for screenshot: {e}");
             }
         }
-
-        Ok(())
     }
 }
 
