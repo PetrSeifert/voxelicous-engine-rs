@@ -554,7 +554,9 @@ impl ClipmapRenderer {
             let grow_size = if current_size == 0 {
                 required
             } else {
-                current_size.saturating_mul(POOL_GROWTH_FACTOR).max(required)
+                current_size
+                    .saturating_mul(POOL_GROWTH_FACTOR)
+                    .max(required)
             };
 
             if current_size == 0 {

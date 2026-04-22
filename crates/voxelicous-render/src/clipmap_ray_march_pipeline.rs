@@ -343,19 +343,8 @@ impl ClipmapRayMarchPipeline {
 
     /// Read the rendered image from the readback buffer.
     pub fn read_output(&self) -> Result<Vec<u8>> {
-        let ptr = self
-            .readback_buffer
-            .mapped_ptr()
-            .ok_or_else(|| GpuError::InvalidState("Readback buffer not mapped".to_string()))?;
-
         let size = (self.width * self.height * 4) as usize;
-        let mut data = vec![0u8; size];
-
-        unsafe {
-            std::ptr::copy_nonoverlapping(ptr, data.as_mut_ptr(), size);
-        }
-
-        Ok(data)
+        self.readback_buffer.read_bytes(0, size)
     }
 
     /// Get output image dimensions.

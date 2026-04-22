@@ -208,6 +208,31 @@ impl GpuBuffer {
         unsafe { device.get_buffer_device_address(&info) }
     }
 
+    /// Returns `true` if the mapped allocation is host coherent.
+    pub fn is_host_coherent(&self) -> bool {
+        self.allocation.as_ref().is_some_and(|allocation| {
+            allocation
+                .memory_properties()
+                .contains(vk::MemoryPropertyFlags::HOST_COHERENT)
+        })
+    }
+
+    fn require_host_coherent(&self) -> Result<()> {
+        if let Some(allocation) = self.allocation.as_ref() {
+            if !allocation
+                .memory_properties()
+                .contains(vk::MemoryPropertyFlags::HOST_COHERENT)
+            {
+                return Err(GpuError::InvalidState(
+                    "Buffer memory is not HOST_COHERENT; host access requires coherent allocations"
+                        .to_string(),
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
     /// Map the buffer memory for CPU access.
     pub fn mapped_ptr(&self) -> Option<*mut u8> {
         self.allocation
@@ -216,8 +241,9 @@ impl GpuBuffer {
             .map(|p| p.as_ptr() as *mut u8)
     }
 
-    /// Write data to the buffer (must be host-visible).
+    /// Write data to the buffer (must be host-visible and host-coherent).
     pub fn write<T: Copy>(&self, data: &[T]) -> Result<()> {
+        self.require_host_coherent()?;
         let ptr = self
             .mapped_ptr()
             .ok_or_else(|| GpuError::InvalidState("Buffer not mapped".to_string()))?;
@@ -236,8 +262,9 @@ impl GpuBuffer {
         Ok(())
     }
 
-    /// Write raw bytes to the buffer at the given offset (must be host-visible).
+    /// Write raw bytes to the buffer at the given offset (must be host-visible and host-coherent).
     pub fn write_bytes(&self, offset: u64, data: &[u8]) -> Result<()> {
+        self.require_host_coherent()?;
         let ptr = self
             .mapped_ptr()
             .ok_or_else(|| GpuError::InvalidState("Buffer not mapped".to_string()))?;
@@ -251,19 +278,51 @@ impl GpuBuffer {
             ));
         }
 
+        let offset = usize::try_from(offset).map_err(|_| {
+            GpuError::InvalidState("Offset too large for this platform".to_string())
+        })?;
+
         unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(offset as usize), data.len());
+            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(offset), data.len());
         }
 
         Ok(())
     }
 
-    /// Write typed data to the buffer at the given offset (must be host-visible).
+    /// Write typed data to the buffer at the given offset (must be host-visible and host-coherent).
     pub fn write_range<T: Copy>(&self, offset: u64, data: &[T]) -> Result<()> {
         let bytes = std::mem::size_of_val(data);
         self.write_bytes(offset, unsafe {
             std::slice::from_raw_parts(data.as_ptr() as *const u8, bytes)
         })
+    }
+
+    /// Read raw bytes from the buffer at the given offset (must be host-visible and host-coherent).
+    pub fn read_bytes(&self, offset: u64, size: usize) -> Result<Vec<u8>> {
+        self.require_host_coherent()?;
+        let ptr = self
+            .mapped_ptr()
+            .ok_or_else(|| GpuError::InvalidState("Buffer not mapped".to_string()))?;
+
+        let end = offset
+            .checked_add(size as u64)
+            .ok_or_else(|| GpuError::InvalidState("Offset overflow".to_string()))?;
+        if end > self.size {
+            return Err(GpuError::InvalidState(
+                "Data range too large for buffer".to_string(),
+            ));
+        }
+
+        let offset = usize::try_from(offset).map_err(|_| {
+            GpuError::InvalidState("Offset too large for this platform".to_string())
+        })?;
+
+        let mut data = vec![0u8; size];
+        unsafe {
+            std::ptr::copy_nonoverlapping(ptr.add(offset), data.as_mut_ptr(), size);
+        }
+
+        Ok(data)
     }
 }
 
