@@ -17,6 +17,8 @@ const uint STRIDE_PALETTE32 = 384u;
 const uint STRIDE_RAW16 = 1024u;
 const uint PALETTE16_CHUNK_ENTRIES = 262144u;
 const float DDA_EPS = 1e-4;
+const float RAY_DIR_EPS = 1e-8;
+const float DDA_INF = 1e30;
 const float TAU = 6.28318530718;
 
 // Buffer references
@@ -91,19 +93,30 @@ layout(set = 0, binding = 1, rgba8) writeonly uniform image2D output_image;
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 // Helper functions
-bool ray_aabb_intersect(vec3 ray_origin, vec3 ray_dir_inv,
+bool axis_slab_intersect(float origin, float dir, float box_min, float box_max,
+                         inout float t_near, inout float t_far) {
+    if (abs(dir) < RAY_DIR_EPS) {
+        return origin >= box_min && origin <= box_max;
+    }
+
+    float inv_dir = 1.0 / dir;
+    float t1 = (box_min - origin) * inv_dir;
+    float t2 = (box_max - origin) * inv_dir;
+    t_near = max(t_near, min(t1, t2));
+    t_far = min(t_far, max(t1, t2));
+    return t_near <= t_far;
+}
+
+bool ray_aabb_intersect(vec3 ray_origin, vec3 ray_dir,
                         vec3 box_min, vec3 box_max,
                         out float t_near, out float t_far) {
-    vec3 t1 = (box_min - ray_origin) * ray_dir_inv;
-    vec3 t2 = (box_max - ray_origin) * ray_dir_inv;
+    t_near = -DDA_INF;
+    t_far = DDA_INF;
 
-    vec3 t_min_v = min(t1, t2);
-    vec3 t_max_v = max(t1, t2);
-
-    t_near = max(max(t_min_v.x, t_min_v.y), t_min_v.z);
-    t_far = min(min(t_max_v.x, t_max_v.y), t_max_v.z);
-
-    return t_near <= t_far && t_far >= 0.0;
+    return axis_slab_intersect(ray_origin.x, ray_dir.x, box_min.x, box_max.x, t_near, t_far) &&
+           axis_slab_intersect(ray_origin.y, ray_dir.y, box_min.y, box_max.y, t_near, t_far) &&
+           axis_slab_intersect(ray_origin.z, ray_dir.z, box_min.z, box_max.z, t_near, t_far) &&
+           t_far >= 0.0;
 }
 
 uint read_u8(ByteAddressBuffer buf, uint byte_idx) {
@@ -214,6 +227,36 @@ bvec3 dda_step_axes(vec3 t_max) {
     );
 }
 
+float safe_axis_t_max(float t, float boundary, float position, float dir) {
+    if (abs(dir) < RAY_DIR_EPS) {
+        return DDA_INF;
+    }
+    return t + (boundary - position) / dir;
+}
+
+vec3 safe_dda_t_max(float t, vec3 boundary, vec3 position, vec3 ray_dir) {
+    return vec3(
+        safe_axis_t_max(t, boundary.x, position.x, ray_dir.x),
+        safe_axis_t_max(t, boundary.y, position.y, ray_dir.y),
+        safe_axis_t_max(t, boundary.z, position.z, ray_dir.z)
+    );
+}
+
+float safe_axis_t_delta(float cell_size, float dir) {
+    if (abs(dir) < RAY_DIR_EPS) {
+        return DDA_INF;
+    }
+    return abs(cell_size / dir);
+}
+
+vec3 safe_dda_t_delta(float cell_size, vec3 ray_dir) {
+    return vec3(
+        safe_axis_t_delta(cell_size, ray_dir.x),
+        safe_axis_t_delta(cell_size, ray_dir.y),
+        safe_axis_t_delta(cell_size, ray_dir.z)
+    );
+}
+
 void advance_dda(
     inout float t,
     float t_next,
@@ -292,7 +335,6 @@ RayHit trace_brick(
     // thin edge voxels at brick boundaries.
     float start_nudge = min(local_eps, interval_len * 0.25);
     float t = t_start + start_nudge;
-    vec3 inv_dir = 1.0 / ray_dir;
     vec3 pos = ray_origin + ray_dir * t;
 
     vec3 local = (pos - brick_min) / voxel_size;
@@ -303,8 +345,8 @@ RayHit trace_brick(
     vec3 voxel_min = brick_min + vec3(voxel) * voxel_size;
     vec3 next_boundary = mix(voxel_min, voxel_min + vec3(voxel_size), greaterThan(step, ivec3(0)));
 
-    vec3 t_max = vec3(t) + (next_boundary - pos) * inv_dir;
-    vec3 t_delta = abs(vec3(voxel_size) * inv_dir);
+    vec3 t_max = safe_dda_t_max(t, next_boundary, pos, ray_dir);
+    vec3 t_delta = safe_dda_t_delta(voxel_size, ray_dir);
 
     while (t <= t_end && steps < max_steps) {
         steps++;
@@ -374,7 +416,6 @@ RayHit trace_interval(
     had_missing_pages = false;
     step_budget_exhausted = false;
 
-    vec3 inv_dir = 1.0 / ray_dir;
     float voxel_size = float(clipmap.voxel_size[lod].x);
     float page_size = voxel_size * float(PAGE_VOXELS_AXIS);
     float brick_size = voxel_size * float(BRICK_SIZE);
@@ -389,8 +430,8 @@ RayHit trace_interval(
 
     vec3 page_min = vec3(page) * page_size;
     vec3 next_boundary = mix(page_min, page_min + vec3(page_size), greaterThan(step, ivec3(0)));
-    vec3 t_max = vec3(t) + (next_boundary - start_pos) * inv_dir;
-    vec3 t_delta = abs(vec3(page_size) * inv_dir);
+    vec3 t_max = safe_dda_t_max(t, next_boundary, start_pos, ray_dir);
+    vec3 t_delta = safe_dda_t_delta(page_size, ray_dir);
     uint steps = 0u;
 
     PageBrickBuffer page_bricks = PageBrickBuffer(clipmap.page_brick_indices_addr[lod]);
@@ -424,8 +465,8 @@ RayHit trace_interval(
                 ivec3 brick_step = ivec3(sign(ray_dir));
                 vec3 brick_min = page_origin + vec3(brick) * brick_size;
                 vec3 brick_boundary = mix(brick_min, brick_min + vec3(brick_size), greaterThan(brick_step, ivec3(0)));
-                vec3 brick_t_max = vec3(t) + (brick_boundary - page_start) * inv_dir;
-                vec3 brick_t_delta = abs(vec3(brick_size) * inv_dir);
+                vec3 brick_t_max = safe_dda_t_max(t, brick_boundary, page_start, ray_dir);
+                vec3 brick_t_delta = safe_dda_t_delta(brick_size, ray_dir);
 
                 float tb = t;
                 while (tb <= t_page_end && steps < max_steps) {
@@ -502,8 +543,6 @@ RayHit trace_clipmap(vec3 ray_origin, vec3 ray_dir, uint max_steps) {
     closest.lod = 0u;
 
     ClipmapInfoBuffer clipmap = ClipmapInfoBuffer(pc.clipmap_info_address);
-    vec3 inv_dir = 1.0 / ray_dir;
-
     Interval intervals[12];
     int interval_count = 0;
 
@@ -516,7 +555,7 @@ RayHit trace_clipmap(vec3 ray_origin, vec3 ray_dir, uint max_steps) {
 
         float t_near;
         float t_far;
-        if (!ray_aabb_intersect(ray_origin, inv_dir, box_min, box_max, t_near, t_far)) {
+        if (!ray_aabb_intersect(ray_origin, ray_dir, box_min, box_max, t_near, t_far)) {
             continue;
         }
 
@@ -535,7 +574,7 @@ RayHit trace_clipmap(vec3 ray_origin, vec3 ray_dir, uint max_steps) {
 
             float t_in_near;
             float t_in_far;
-            bool inner_hit = ray_aabb_intersect(ray_origin, inv_dir, inner_min, inner_max, t_in_near, t_in_far);
+            bool inner_hit = ray_aabb_intersect(ray_origin, ray_dir, inner_min, inner_max, t_in_near, t_in_far);
             // Keep shell trimming small enough to avoid visible seam gaps at LOD boundaries.
             float shell_eps = max(DDA_EPS, float(clipmap.voxel_size[lod].x) * 0.002);
 
