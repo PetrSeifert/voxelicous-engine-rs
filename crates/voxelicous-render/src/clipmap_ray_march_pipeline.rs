@@ -2,6 +2,8 @@
 //!
 //! Uses the `ray_march_clipmap.comp` shader to render clipmap voxel data.
 
+use std::cell::Cell;
+
 use ash::vk;
 use gpu_allocator::MemoryLocation;
 use voxelicous_gpu::descriptors::{DescriptorPool, DescriptorSetLayoutBuilder};
@@ -26,6 +28,9 @@ pub struct ClipmapRayMarchPipeline {
     camera_buffers: Vec<GpuBuffer>,
     output_image: GpuImage,
     output_image_view: vk::ImageView,
+    output_image_layout: Cell<vk::ImageLayout>,
+    output_image_stage: Cell<vk::PipelineStageFlags2>,
+    output_image_access: Cell<vk::AccessFlags2>,
     readback_buffer: GpuBuffer,
     width: u32,
     height: u32,
@@ -198,6 +203,9 @@ impl ClipmapRayMarchPipeline {
             camera_buffers,
             output_image,
             output_image_view,
+            output_image_layout: Cell::new(vk::ImageLayout::UNDEFINED),
+            output_image_stage: Cell::new(vk::PipelineStageFlags2::TOP_OF_PIPE),
+            output_image_access: Cell::new(vk::AccessFlags2::NONE),
             readback_buffer,
             width,
             height,
@@ -220,26 +228,13 @@ impl ClipmapRayMarchPipeline {
     ) -> Result<()> {
         self.camera_buffers[frame_index].write(std::slice::from_ref(camera))?;
 
-        let barrier = vk::ImageMemoryBarrier2::default()
-            .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
-            .src_access_mask(vk::AccessFlags2::NONE)
-            .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-            .dst_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
-            .old_layout(vk::ImageLayout::UNDEFINED)
-            .new_layout(vk::ImageLayout::GENERAL)
-            .image(self.output_image.image)
-            .subresource_range(vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            });
-
-        let dependency_info =
-            vk::DependencyInfo::default().image_memory_barriers(std::slice::from_ref(&barrier));
-
-        device.cmd_pipeline_barrier2(cmd, &dependency_info);
+        self.record_output_image_transition(
+            device,
+            cmd,
+            vk::ImageLayout::GENERAL,
+            vk::PipelineStageFlags2::COMPUTE_SHADER,
+            vk::AccessFlags2::SHADER_STORAGE_WRITE,
+        );
 
         device.cmd_bind_pipeline(
             cmd,
@@ -270,26 +265,13 @@ impl ClipmapRayMarchPipeline {
         let workgroup_y = (self.height + 7) / 8;
         device.cmd_dispatch(cmd, workgroup_x, workgroup_y, 1);
 
-        let overlay_barrier = vk::ImageMemoryBarrier2::default()
-            .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-            .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
-            .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-            .dst_access_mask(
-                vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_STORAGE_WRITE,
-            )
-            .old_layout(vk::ImageLayout::GENERAL)
-            .new_layout(vk::ImageLayout::GENERAL)
-            .image(self.output_image.image)
-            .subresource_range(vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            });
-        let overlay_dependency = vk::DependencyInfo::default()
-            .image_memory_barriers(std::slice::from_ref(&overlay_barrier));
-        device.cmd_pipeline_barrier2(cmd, &overlay_dependency);
+        self.record_output_image_transition(
+            device,
+            cmd,
+            vk::ImageLayout::GENERAL,
+            vk::PipelineStageFlags2::COMPUTE_SHADER,
+            vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_STORAGE_WRITE,
+        );
 
         device.cmd_bind_pipeline(
             cmd,
@@ -309,7 +291,52 @@ impl ClipmapRayMarchPipeline {
         Ok(())
     }
 
+    /// Record an output image layout and memory transition.
+    ///
+    /// # Safety
+    /// Command buffer must be in recording state, and callers must request transitions in the
+    /// same order commands using the output image are recorded.
+    pub unsafe fn record_output_image_transition(
+        &self,
+        device: &ash::Device,
+        cmd: vk::CommandBuffer,
+        new_layout: vk::ImageLayout,
+        dst_stage: vk::PipelineStageFlags2,
+        dst_access: vk::AccessFlags2,
+    ) {
+        let old_layout = self.output_image_layout.get();
+        let src_stage = self.output_image_stage.get();
+        let src_access = self.output_image_access.get();
+
+        let barrier = vk::ImageMemoryBarrier2::default()
+            .src_stage_mask(src_stage)
+            .src_access_mask(src_access)
+            .dst_stage_mask(dst_stage)
+            .dst_access_mask(dst_access)
+            .old_layout(old_layout)
+            .new_layout(new_layout)
+            .image(self.output_image.image)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            });
+        let dependency_info =
+            vk::DependencyInfo::default().image_memory_barriers(std::slice::from_ref(&barrier));
+        device.cmd_pipeline_barrier2(cmd, &dependency_info);
+
+        self.output_image_layout.set(new_layout);
+        self.output_image_stage.set(dst_stage);
+        self.output_image_access.set(dst_access);
+    }
+
     /// Record commands to copy the output image to the readback buffer.
+    ///
+    /// # Safety
+    /// Command buffer must be in recording state, and the output image must already be in
+    /// `TRANSFER_SRC_OPTIMAL`.
     pub unsafe fn record_readback_from_transfer_src(
         &self,
         device: &ash::Device,

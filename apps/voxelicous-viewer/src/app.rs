@@ -696,21 +696,13 @@ impl Viewer {
 
         unsafe {
             // Transition output image for transfer
-            let barrier = vk::ImageMemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
-                .dst_stage_mask(vk::PipelineStageFlags2::TRANSFER)
-                .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)
-                .old_layout(vk::ImageLayout::GENERAL)
-                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-                .image(pipeline.output_image().image)
-                .subresource_range(vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: 1,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                });
+            pipeline.record_output_image_transition(
+                device,
+                cmd,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                vk::PipelineStageFlags2::TRANSFER,
+                vk::AccessFlags2::TRANSFER_READ,
+            );
 
             let swapchain_barrier = vk::ImageMemoryBarrier2::default()
                 .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
@@ -728,7 +720,7 @@ impl Viewer {
                     layer_count: 1,
                 });
 
-            let barriers = [barrier, swapchain_barrier];
+            let barriers = [swapchain_barrier];
             let dependency_info = vk::DependencyInfo::default().image_memory_barriers(&barriers);
             device.cmd_pipeline_barrier2(cmd, &dependency_info);
 
@@ -791,24 +783,13 @@ impl Viewer {
         let pipeline = self.pipeline.as_ref().expect("Pipeline should exist");
 
         unsafe {
-            let to_transfer_dst = vk::ImageMemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
-                .src_access_mask(vk::AccessFlags2::NONE)
-                .dst_stage_mask(vk::PipelineStageFlags2::TRANSFER)
-                .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                .old_layout(vk::ImageLayout::UNDEFINED)
-                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                .image(pipeline.output_image().image)
-                .subresource_range(vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: 1,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                });
-            let dependency_info = vk::DependencyInfo::default()
-                .image_memory_barriers(std::slice::from_ref(&to_transfer_dst));
-            device.cmd_pipeline_barrier2(cmd, &dependency_info);
+            pipeline.record_output_image_transition(
+                device,
+                cmd,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::PipelineStageFlags2::TRANSFER,
+                vk::AccessFlags2::TRANSFER_WRITE,
+            );
 
             let clear = vk::ClearColorValue {
                 float32: [0.0, 0.0, 0.0, 1.0],
@@ -828,24 +809,13 @@ impl Viewer {
                 std::slice::from_ref(&range),
             );
 
-            let to_transfer_src = vk::ImageMemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
-                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                .dst_stage_mask(vk::PipelineStageFlags2::TRANSFER)
-                .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)
-                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-                .image(pipeline.output_image().image)
-                .subresource_range(vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: 1,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                });
-            let dependency_info = vk::DependencyInfo::default()
-                .image_memory_barriers(std::slice::from_ref(&to_transfer_src));
-            device.cmd_pipeline_barrier2(cmd, &dependency_info);
+            pipeline.record_output_image_transition(
+                device,
+                cmd,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                vk::PipelineStageFlags2::TRANSFER,
+                vk::AccessFlags2::TRANSFER_READ,
+            );
         }
     }
 
