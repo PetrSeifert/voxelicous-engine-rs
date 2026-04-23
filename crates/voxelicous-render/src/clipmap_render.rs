@@ -8,7 +8,7 @@ use voxelicous_gpu::memory::{GpuAllocator, GpuBuffer};
 use voxelicous_gpu::DeferredDeletionQueue;
 use voxelicous_voxel::{
     BrickHeader, BrickId, ClipmapVoxelStore, CLIPMAP_LOD_COUNT, CLIPMAP_PAGE_GRID, PAGE_BRICKS,
-    PALETTE16_STRIDE, PALETTE32_STRIDE, RAW16_STRIDE,
+    PAGE_VOXELS_PER_AXIS, PALETTE16_STRIDE, PALETTE32_STRIDE, RAW16_STRIDE,
 };
 use voxelicous_world::{ClipmapDirtyState, ClipmapStreamingController};
 
@@ -36,8 +36,11 @@ pub struct GpuClipmapInfo {
     pub palette32_addr: u64,
     pub raw16_addr: u64,
     pub _pad0: [u64; 2],
+    /// Per-LOD world page coordinate containing the camera-relative render origin.
     pub origin: [[i32; 4]; CLIPMAP_LOD_COUNT],
+    /// x = LOD voxel size, yzw = render-origin offset inside that LOD's page.
     pub voxel_size: [[u32; 4]; CLIPMAP_LOD_COUNT],
+    /// Camera-relative LOD bounds used by the shader.
     pub lod_aabb_min: [[f32; 4]; CLIPMAP_LOD_COUNT],
     pub lod_aabb_max: [[f32; 4]; CLIPMAP_LOD_COUNT],
 }
@@ -68,6 +71,15 @@ fn entries_for_pool_size(pool_size: u64, stride: u64) -> usize {
     } else {
         pool_size.div_ceil(stride) as usize
     }
+}
+
+fn div_floor(value: i64, divisor: i64) -> i64 {
+    let mut q = value / divisor;
+    let r = value % divisor;
+    if r != 0 && ((r > 0) != (divisor > 0)) {
+        q -= 1;
+    }
+    q
 }
 
 struct FrameBuffers {
@@ -962,6 +974,7 @@ impl ClipmapRenderer {
     ) -> GpuClipmapInfo {
         let mut info = GpuClipmapInfo::zeroed();
         let frame = &self.frame_buffers[frame_index];
+        let render_origin = controller.camera_voxel();
 
         for lod in 0..CLIPMAP_LOD_COUNT {
             if let Some(buffer) = &frame.page_brick_buffers[lod] {
@@ -986,14 +999,40 @@ impl ClipmapRenderer {
             } else {
                 0.0
             };
+            let page_size = i64::from(voxel_size.max(1)) * PAGE_VOXELS_PER_AXIS as i64;
+            let render_page_origin = [
+                div_floor(render_origin.x, page_size),
+                div_floor(render_origin.y, page_size),
+                div_floor(render_origin.z, page_size),
+            ];
+            let render_page_offset = [
+                render_origin.x - render_page_origin[0] * page_size,
+                render_origin.y - render_page_origin[1] * page_size,
+                render_origin.z - render_page_origin[2] * page_size,
+            ];
+            let lod_min = [
+                (origin.x - render_origin.x) as f32,
+                (origin.y - render_origin.y) as f32,
+                (origin.z - render_origin.z) as f32,
+            ];
 
-            info.origin[lod] = [origin.x as i32, origin.y as i32, origin.z as i32, 0];
-            info.voxel_size[lod] = [voxel_size, 0, 0, 0];
-            info.lod_aabb_min[lod] = [origin.x as f32, origin.y as f32, origin.z as f32, 0.0];
+            info.origin[lod] = [
+                render_page_origin[0] as i32,
+                render_page_origin[1] as i32,
+                render_page_origin[2] as i32,
+                0,
+            ];
+            info.voxel_size[lod] = [
+                voxel_size,
+                render_page_offset[0] as u32,
+                render_page_offset[1] as u32,
+                render_page_offset[2] as u32,
+            ];
+            info.lod_aabb_min[lod] = [lod_min[0], lod_min[1], lod_min[2], 0.0];
             info.lod_aabb_max[lod] = [
-                origin.x as f32 + coverage,
-                origin.y as f32 + coverage,
-                origin.z as f32 + coverage,
+                lod_min[0] + coverage,
+                lod_min[1] + coverage,
+                lod_min[2] + coverage,
                 0.0,
             ];
         }

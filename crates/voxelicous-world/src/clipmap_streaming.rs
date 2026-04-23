@@ -322,6 +322,11 @@ impl ClipmapStreamingController {
             .unwrap_or(WorldCoord { x: 0, y: 0, z: 0 })
     }
 
+    /// Get the latest camera voxel used to center clipmap updates.
+    pub fn camera_voxel(&self) -> WorldCoord {
+        self.camera_voxel
+    }
+
     /// Get voxel size for a given LOD in base voxels.
     pub fn lod_voxel_size(&self, lod: usize) -> i64 {
         1i64 << lod

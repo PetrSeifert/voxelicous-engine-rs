@@ -215,6 +215,30 @@ uint wrapped_page_index(ivec3 page) {
     return uint(px + py * int(PAGE_GRID) + pz * int(PAGE_GRID * PAGE_GRID));
 }
 
+float lod_page_size(ClipmapInfoBuffer clipmap, uint lod) {
+    return float(clipmap.voxel_size[lod].x) * float(PAGE_VOXELS_AXIS);
+}
+
+ivec3 render_origin_page(ClipmapInfoBuffer clipmap, uint lod) {
+    return clipmap.origin[lod].xyz;
+}
+
+vec3 render_origin_page_offset(ClipmapInfoBuffer clipmap, uint lod) {
+    return vec3(clipmap.voxel_size[lod].yzw);
+}
+
+ivec3 page_at_render_position(ClipmapInfoBuffer clipmap, uint lod, vec3 render_pos) {
+    float page_size = lod_page_size(clipmap, lod);
+    vec3 offset = render_origin_page_offset(clipmap, lod);
+    return render_origin_page(clipmap, lod) + ivec3(floor((render_pos + offset) / page_size));
+}
+
+vec3 page_min_render_position(ClipmapInfoBuffer clipmap, uint lod, ivec3 page) {
+    float page_size = lod_page_size(clipmap, lod);
+    vec3 offset = render_origin_page_offset(clipmap, lod);
+    return vec3(page - render_origin_page(clipmap, lod)) * page_size - offset;
+}
+
 float min3(vec3 v) {
     return min(min(v.x, v.y), v.z);
 }
@@ -281,13 +305,12 @@ void advance_dda(
     }
 }
 
-bool is_page_missing_at_position(ClipmapInfoBuffer clipmap, uint lod, vec3 world_pos) {
+bool is_page_missing_at_position(ClipmapInfoBuffer clipmap, uint lod, vec3 render_pos) {
     if (lod >= LOD_COUNT || clipmap.voxel_size[lod].x == 0u) {
         return true;
     }
 
-    float page_size = float(clipmap.voxel_size[lod].x) * float(PAGE_VOXELS_AXIS);
-    ivec3 page = ivec3(floor(world_pos / page_size));
+    ivec3 page = page_at_render_position(clipmap, lod, render_pos);
     uint page_index = wrapped_page_index(page);
 
     PageCoordBuffer page_coords = PageCoordBuffer(clipmap.page_coord_addr[lod]);
@@ -417,7 +440,7 @@ RayHit trace_interval(
     step_budget_exhausted = false;
 
     float voxel_size = float(clipmap.voxel_size[lod].x);
-    float page_size = voxel_size * float(PAGE_VOXELS_AXIS);
+    float page_size = lod_page_size(clipmap, lod);
     float brick_size = voxel_size * float(BRICK_SIZE);
     float local_eps = max(DDA_EPS * 0.25, voxel_size * 1e-5);
     float interval_len = max(t_end - t_start, 0.0);
@@ -425,10 +448,10 @@ RayHit trace_interval(
 
     float t = t_start + start_nudge;
     vec3 start_pos = ray_origin + ray_dir * t;
-    ivec3 page = ivec3(floor(start_pos / page_size));
+    ivec3 page = page_at_render_position(clipmap, lod, start_pos);
     ivec3 step = ivec3(sign(ray_dir));
 
-    vec3 page_min = vec3(page) * page_size;
+    vec3 page_min = page_min_render_position(clipmap, lod, page);
     vec3 next_boundary = mix(page_min, page_min + vec3(page_size), greaterThan(step, ivec3(0)));
     vec3 t_max = safe_dda_t_max(t, next_boundary, start_pos, ray_dir);
     vec3 t_delta = safe_dda_t_delta(page_size, ray_dir);
@@ -455,7 +478,7 @@ RayHit trace_interval(
         if (slot_matches) {
             uvec2 occ = page_occ.data[page_index];
             if ((occ.x | occ.y) != 0u) {
-                vec3 page_origin = vec3(page) * page_size;
+                vec3 page_origin = page_min_render_position(clipmap, lod, page);
                 float brick_interval_len = max(t_page_end - t, 0.0);
                 float brick_start_nudge = min(local_eps, brick_interval_len * 0.25);
                 vec3 page_start = ray_origin + ray_dir * (t + brick_start_nudge);
@@ -885,7 +908,8 @@ vec3 biome_debug_color(RayHit hit, vec3 ray_dir, CelestialLighting lighting) {
     const float SEA_LEVEL = 60.0;
     const float SNOW_HINT = SEA_LEVEL + 44.0;
 
-    vec2 world = hit.position.xz;
+    vec3 world_pos = hit.position + floor(camera.position.xyz);
+    vec2 world = world_pos.xz;
     vec2 nxz = world / TERRAIN_SCALE;
     vec2 bxz = world / BIOME_SCALE;
 
@@ -911,7 +935,7 @@ vec3 biome_debug_color(RayHit hit, vec3 ray_dir, CelestialLighting lighting) {
     float desert_region = fbm_noise(bxz * 0.65 + vec2(7.1, -9.3), 31u);
     bool cold = temperature < -0.12;
     bool wet = moisture > 0.22;
-    bool high_elevation = hit.position.y >= (SNOW_HINT - 10.0);
+    bool high_elevation = world_pos.y >= (SNOW_HINT - 10.0);
     float heat = smoothstep(0.00, 0.45, temperature);
     float aridity = smoothstep(-0.08, 0.45, temperature - moisture * 0.95);
     float desert_zone = smoothstep(0.08, 0.55, desert_region);
@@ -994,7 +1018,8 @@ void main() {
     vec4 view_pos = camera.inverse_projection * clip;
     view_pos = vec4(view_pos.xyz / view_pos.w, 0.0);
 
-    vec3 ray_origin = camera.position.xyz;
+    // March in camera-relative coordinates so voxel/page boundaries stay precise far from world origin.
+    vec3 ray_origin = camera.position.xyz - floor(camera.position.xyz);
     vec3 ray_dir = normalize((camera.inverse_view * view_pos).xyz);
 
     RayHit hit = trace_clipmap(ray_origin, ray_dir, pc.max_steps);
